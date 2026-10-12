@@ -4095,7 +4095,7 @@ void MKEngine::reset() {
 
 int MKEngine::position() const { return p_->hctl.n; }
 
-int MKEngine::prefill(const std::vector<int> & tokens) {
+int MKEngine::prefill(const std::vector<int> & tokens, int ck_at) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
@@ -4110,13 +4110,25 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
     const std::vector<int> feed(seq.begin() + n0, seq.end());
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
+    bool ck_done = false;
     const char * mode = getenv("MK_PREFILL");
     const bool batched = !(mode && std::string(mode) == "mk");
     if (batched && feed.size() >= 2) {
         // all but the last token in batched kernels; the last one goes through the megakernel,
         // which produces the first output token and the MTP drafts
         const std::vector<int> head(feed.begin(), feed.end() - 1);
-        p_->pf_run(head, n0, nullptr);
+        const int split = ck_at - n0; // checkpoint inside the batched part: two pf_runs around it
+        if (split >= 1 && split < (int) head.size()) {
+            p_->pf_run(std::vector<int>(head.begin(), head.begin() + split), n0, nullptr);
+            c.dn_c = n0 + split;
+            c.mtp_valid = c.dn_c;
+            CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+            p_->ck_save();
+            ck_done = true;
+            p_->pf_run(std::vector<int>(head.begin() + split, head.end()), n0 + split, nullptr);
+        } else {
+            p_->pf_run(head, n0, nullptr);
+        }
         i = head.size();
         c.dn_c = n0 + (int) i;
         c.mtp_valid = c.dn_c;
@@ -4139,7 +4151,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
 #if MK_SPEC_LOG
     p_->slog_drafts();
 #endif
-    p_->ck_save();
+    if (!ck_done) p_->ck_save();
     seq.push_back(c.out[0]);
     return c.out[0];
 }

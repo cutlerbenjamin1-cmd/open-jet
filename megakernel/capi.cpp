@@ -102,6 +102,16 @@ int mk_prefill(void * hp, const int * toks, int n) {
     }
 }
 
+// mk_prefill with the rewind checkpoint saved at absolute position ck_at (inside this prompt) instead of its end
+int mk_prefill_ck(void * hp, const int * toks, int n, int ck_at) {
+    try {
+        return static_cast<Handle *>(hp)->eng->prefill(std::vector<int>(toks, toks + n), ck_at);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {
     try {

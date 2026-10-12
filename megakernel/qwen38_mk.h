@@ -25,7 +25,10 @@ class MKEngine {
     void reset();
     // Processes the prompt, or appends `tokens` to the sequence so far (prompt + emitted tokens,
     // e.g. the next user turn); returns the first generated token (greedy).
-    int prefill(const std::vector<int> & tokens);
+    // ck_at (absolute position inside the fed range): save the rewind checkpoint there instead of at the end of the
+    // prompt, e.g. at the start of the generation prompt, which a follow-up turn's template may render differently
+    // (thinking mode re-renders the previous turn as <think>\n\n</think>, one token before the end of the prompt).
+    int prefill(const std::vector<int> & tokens, int ck_at = -1);
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
     void set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed);

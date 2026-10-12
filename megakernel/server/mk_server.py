@@ -52,6 +52,7 @@ class Engine:
             "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float,
                                                ctypes.c_ulonglong]),
             "mk_prefill": (ctypes.c_int, [vp, ip, ctypes.c_int]),
+            "mk_prefill_ck": (ctypes.c_int, [vp, ip, ctypes.c_int, ctypes.c_int]),
             "mk_step": (ctypes.c_int, [vp, ip, ctypes.c_int]),
             "mk_reset": (None, [vp]),
             "mk_truncate": (ctypes.c_int, [vp, ctypes.c_int]),
@@ -104,9 +105,9 @@ class Engine:
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
 
-    def prefill(self, toks):
+    def prefill(self, toks, ck_at=-1):
         arr = (ctypes.c_int * len(toks))(*toks)
-        r = self.L.mk_prefill(self.h, arr, len(toks))
+        r = self.L.mk_prefill_ck(self.h, arr, len(toks), ck_at)
         if r < 0:
             raise self._err("prefill")
         return r
@@ -291,6 +292,8 @@ class Server:
         self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv])
         self.template = make_template(self.eng.chat_template())
+        im = self.eng.tokenize("<|im_start|>")
+        self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
         self.warm_up()
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
@@ -342,14 +345,22 @@ class Server:
                 break
             lcp += 1
         lcp = min(lcp, len(toks) - 1)  # at least one token is fed (it produces the next one)
+        # rewind checkpoint at the last <|im_start|> (the generation prompt): a follow-up turn re-renders this turn
+        # from there (thinking mode: <think>\n\n</think> instead of <think>\n), so it must not sit at the prompt's end
+        gen = -1
+        if self.im_start is not None:
+            for k in range(len(toks) - 1, -1, -1):
+                if toks[k] == self.im_start:
+                    gen = k
+                    break
         if seq and lcp >= eng.committed():
             eng.truncate(lcp)
-            return eng.prefill(toks[lcp:]), lcp
+            return eng.prefill(toks[lcp:], gen), lcp
         ck = eng.checkpoint_pos()
         if 0 < ck <= lcp and eng.rewind_to_checkpoint():
-            return eng.prefill(toks[ck:]), ck
+            return eng.prefill(toks[ck:], gen), ck
         eng.reset()
-        return eng.prefill(toks), 0
+        return eng.prefill(toks, gen), 0
 
     def sampling(self, body):
         temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
