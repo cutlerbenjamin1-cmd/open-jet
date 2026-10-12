@@ -2038,12 +2038,17 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
             }
             float r[TOPK_MAX], rs = 0.f;
             for (int j = 0; j < K; j++) rs += (r[j] = fmaxf(0.f, p[j] - dq_prob(q, __float_as_int(cd[j].y))));
-            float x = urand(P.seed, 2 * (n + i) + 1) * (rs > 0.f ? rs : 1.f);
-            int pick = __float_as_int(cd[0].y);
+            const float u = urand(P.seed, 2 * (n + i) + 1);
+            if (!(rs > 0.f)) { // rounding only; the row must not return the rejected d
+                tg[i] = cand_draw(cd, p, K, d, u);
+                return;
+            }
+            float x = u * rs;
+            int pick = -1;
             for (int j = 0; j < K; j++) {
-                if (rs > 0.f && r[j] <= 0.f) continue;
+                if (r[j] <= 0.f) continue;
                 pick = __float_as_int(cd[j].y);
-                x -= rs > 0.f ? r[j] : p[j];
+                x -= r[j];
                 if (x < 0.f) break;
             }
             tg[i] = pick;
