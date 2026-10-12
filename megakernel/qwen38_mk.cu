@@ -2348,20 +2348,25 @@ __global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * d
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
 // hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
-__global__ void pk_glu(const float * g, const float * u, __half * out, int ld) {
+__global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) {
+    // thread = 4 consecutive values (one float4 of g and u: a warp reads 512 contiguous bytes of each); within a
+    // 16-group, values 4 j .. 4 j + 3 go to hperm slots 2 j, 2 j + 1 and 8 + 2 j, 9 + 2 j (two 4-byte stores)
     const size_t t = blockIdx.x;
-    for (int q = threadIdx.x; q < ld / 16; q += blockDim.x) {
-        const float * gp = g + t * ld + 16 * q;
-        const float * up = u + t * ld + 16 * q;
-        __align__(16) __half hv[16];
+    const float4 * g4 = reinterpret_cast<const float4 *>(g + t * ld);
+    const float4 * u4 = reinterpret_cast<const float4 *>(u + t * ld);
+    __half * o = out + t * ld;
+    for (int k = threadIdx.x; k < ld / 4; k += blockDim.x) {
+        const float4 a = g4[k], b = u4[k];
+        const float gv[4] = {a.x, a.y, a.z, a.w}, uv[4] = {b.x, b.y, b.z, b.w};
+        __half hv[4];
 #pragma unroll
-        for (int e = 0; e < 16; e++) {
-            const float gv = gp[e], v = gv / (1.0f + expf(-gv)) * up[e];
-            hv[pf::hperm(e)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
+        for (int e = 0; e < 4; e++) {
+            const float v = gv[e] / (1.0f + expf(-gv[e])) * uv[e];
+            hv[e] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
         }
-        uint4 * dst = reinterpret_cast<uint4 *>(out + t * ld + 16 * q);
-        dst[0] = reinterpret_cast<const uint4 *>(hv)[0];
-        dst[1] = reinterpret_cast<const uint4 *>(hv)[1];
+        __half * og = o + 16 * (k >> 2) + 2 * (k & 3);
+        *reinterpret_cast<__half2 *>(og) = __halves2half2(hv[0], hv[1]);
+        *reinterpret_cast<__half2 *>(og + 8) = __halves2half2(hv[2], hv[3]);
     }
 }
 
