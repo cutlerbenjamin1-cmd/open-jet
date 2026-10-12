@@ -834,15 +834,6 @@ __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Ou
 }
 
 
-// Prefetch the first `bytes` of rows row0..row0+n-1 into L2 so the DRAM stream of a phase starts
-// while its activations are still being loaded into shared memory.
-__device__ __forceinline__ void pf_rows(const Mat & m, int row0, int n, int bytes) {
-    const int lane = threadIdx.x & 31;
-    for (int k = 0; k < n; k++) {
-        const uint8_t * p = m.w + (size_t) (row0 + k) * m.rb;
-        for (int off = lane * 128; off < bytes; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
-    }
-}
 
 // lanes 0-15 quantise 16-chunk c of row t, lanes 16-31 the same chunk of row t + 1 (if valid)
 __device__ __forceinline__ void q16_store(const QBuf & q, int t, int c, float v, bool valid) {
@@ -964,7 +955,6 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float * s_rs = misc(sm);
     float * s_res = misc(sm) + 8;
-    if (blockIdx.x < D / 32) pf_rows(W, 32 * blockIdx.x + 2 * warp, 2, W.rb / IT);
     if (threadIdx.x < 4 && blockIdx.x + threadIdx.x * gridDim.x < D / 32) pf_l2(wnext + 32 * (blockIdx.x + threadIdx.x * gridDim.x));
     auto epilogue = [&](int j, float (&a)[2][T]) {
         wsum_acc<T, 2>(a);
@@ -1063,10 +1053,6 @@ __device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
     const float * s_rs = misc(sm);
-    if (gwarp() < FF / 16) {
-        pf_rows(W.fg, 16 * gwarp(), 2, 576);
-        pf_rows(W.fu, 16 * gwarp(), 2, 576);
-    }
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const uint8_t * gw = W.fg.w;
     const uint8_t * uw = W.fu.w;
@@ -1155,10 +1141,6 @@ __device__ __noinline__ void ffn_gu_any(const LayerW & W, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
-    if (gwarp() < FF / 16) {
-        pf_rows(W.fg, 16 * gwarp(), 2, 576);
-        pf_rows(W.fu, 16 * gwarp(), 2, 576);
-    }
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     for (int j = gwarp(); j < FF / 16; j += nwarps()) {
         const LaneT<T> g = rows16_any<T>(W.fg, j);
@@ -1206,11 +1188,6 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
     float * s_rs = misc(sm);
-    {
-        const int gw = gwarp(), W_ = nwarps(), lo = AB_SPLIT * 2 * NVH;
-        const int first = lo + (((gw - lo) % W_) + W_) % W_;
-        if (first < lo + QKV / 2) pf_rows(W.qkv, 2 * (first - lo), 2, 1024);
-    }
     fill_xs<T>(cB.qn, 0, true, sx, s_rs);
     float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int n_ab = AB_SPLIT * 2 * NVH, n_qkv = QKV / 2, n_z = VD / 2;
@@ -1641,7 +1618,6 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     const int lane = threadIdx.x & 31;
     (void) lane;
     const SX sx = make_sx(sm, U_D);
-    if (gwarp() < QG / 2) pf_rows(W.q, 2 * gwarp(), 2, 576);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const int nq = QG / 2, nk = KVD / 2;
     gemv_pairs_any<T, 5>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
@@ -2131,16 +2107,6 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     float * m = misc(sm);
     // the draft head reads lm_head rows through cW.draft_ids (row r of head_d is lm_head row draft_ids[r])
     const int * ids = draft ? cW.draft_ids : nullptr;
-    if (ids) {
-        const int r0 = 2 * gwarp();
-        if (r0 < cW.head_d.N)
-            for (int k = 0; k < 2; k++) {
-                const uint8_t * p = cW.head.w + (size_t) __ldg(ids + r0 + k) * cW.head.rb;
-                for (int off = lane * 128; off < 896; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
-            }
-    } else {
-        pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
-    }
     fill_xs<TL>(cB.qn, t0, true, sx, m);
     float bv[TL];
     int bi[TL];
