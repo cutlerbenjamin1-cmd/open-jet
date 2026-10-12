@@ -177,7 +177,9 @@ appended to the conversation), `--score ids.txt` (teacher-forced agreement), `--
 divergence, perplexity and agreement against a reference file, see Correctness), `MK_PROFILE=1`
 (per-phase timing, including a "min-composed" estimate that filters out time-slicing by other GPU
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
-megakernel instead).
+megakernel instead), `MK_PF_CAP=n` (prefill chunk tokens), `MK_ATTN_PV16=0` / `MK_ATTN_SPLIT=0` (prefill
+attention with fp32-accumulated P V / without the tail split; with both, bit-identical to `MK_ATTN=1`, the
+original prefill attention kernel).
 
 ### The GGUF
 
@@ -297,7 +299,13 @@ processing the whole conversation as one fresh prompt.
   slice of the state in fp32 MMA accumulators, turning it (and K S, U) into fp16 MMA operands
   in registers with `movmatrix`; gates are carried as log g, so tiny or zero gates are exact.
   ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
-- **Attention**: causal flash attention over the KV cache on tensor cores.
+- **Attention**: causal flash attention over the KV cache on tensor cores (`prefill_attn.cuh`). A block
+  takes 16 query positions of one KV head (6 q heads x 16 rows); two warps per q head split S by key
+  positions and P V by head-dim halves, so 12 warps keep 64 fp32 accumulators each and K / V of the
+  next phase load during the MMAs. P V accumulates in fp16 per 32-position tile, then in fp32. The
+  q-tiles of the last, partial wave are split along the keys and merged. ~64 TFLOPS on a 3090 at
+  30K-100K context (`bench/attn_bench.cu`), 1.9-2.4x the previous kernel; prefill of a 101K-token
+  prompt went from 128 s to 90 s.
 
 ## Limitations
 
