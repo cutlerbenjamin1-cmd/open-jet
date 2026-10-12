@@ -3231,6 +3231,8 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int dev = 0, nsm = 0, occ = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
@@ -3241,12 +3243,20 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_ATTN")) attn_old = atoi(e) == 1;
         if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
         if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
+        // MK_ATTN_S8 (q8 cache, with PV16): 1 = int8 Q K^T, Q scales per 32-dim block (pk_attn8); 2 = per row; 0 = off
+        if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
+        if (attn_s8) {
+            int occ8 = 0;
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
+        }
         pf_ready = true;
     }
 
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
     bool attn_old = false, attn_split = true, attn_pv16 = true;
+    int attn_s8 = 1;
     void attn(int T, int n, int slot) {
         if (attn_old) {
             if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
@@ -3259,7 +3269,9 @@ struct MKEngine::Impl {
         if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
-            if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            if (attn_pv16 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
         } else {
             if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
