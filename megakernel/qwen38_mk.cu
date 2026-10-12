@@ -3319,8 +3319,11 @@ struct MKEngine::Impl {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
-            // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime
-            const bool q8 = kv_mode == 1 || (kv_mode < 0 && rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b);
+            // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime.
+            // A non-empty MK_KV picks the quantized cache in auto mode too.
+            const char * kv_spec = getenv("MK_KV");
+            const bool want_kv = kv_spec && kv_spec[0];
+            const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b));
             hb.kvq8 = q8;
             // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default) or q4 (kv_store_q4), e.g. "V*=4,K16=4r":
             // comma-separated <K|V|*><slot>=<8|4>[r], slot 0..15 = attention layer 4 slot + 3, 16 = MTP block, * or
@@ -3330,9 +3333,9 @@ struct MKEngine::Impl {
                 hb.kvb[0][s] = hb.kvb[1][s] = 8;
                 hb.kvr[s] = 0;
             }
-            if (const char * spec = getenv("MK_KV")) {
-                if (!q8) throw std::runtime_error("MK_KV needs the q8 KV cache (--kv q8)");
-                const std::string str = spec;
+            if (want_kv) {
+                if (!q8) throw std::runtime_error("MK_KV needs the q8 KV cache (--kv q8 or auto, not f16)");
+                const std::string str = kv_spec;
                 size_t i = 0;
                 while (i < str.size()) {
                     size_t j = str.find(',', i);
