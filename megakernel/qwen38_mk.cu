@@ -3502,10 +3502,11 @@ struct MKEngine::Impl {
         int cap = 2048;
         if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
         hp.cap = cap;
+        mem_mark("before prefill scratch");
         hp.x = dalloc<float>((size_t) cap * D);
         hp.xm = dalloc<float>((size_t) cap * D);
         hp.rs = dalloc<float>(cap);
-        hp.xh = dalloc<__half>((size_t) cap * FF);
+        hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
         hp.xh2 = dalloc<__half>((size_t) cap * FF);
         hp.y0 = dalloc<float>((size_t) cap * FF);
         hp.y1 = dalloc<float>((size_t) cap * FF);
