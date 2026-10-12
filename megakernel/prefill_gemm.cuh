@@ -96,11 +96,17 @@ template <> struct HT<TQ5K> { static constexpr int SR = 80, NS = 3; static const
 template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = 4; static constexpr bool SEP = false; };
 template <> struct HT<TQ80> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
-constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR, HWT = BN / (8 / HNWM), HNI = HWT / 8; // warp tiles
-constexpr int HM_X = BN * 128; // activation tile per stage: 128 tokens x 64 halves, 16 B chunks XOR-swizzled
-template <int TYPE> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + HM_X; }
-template <int TYPE> __host__ __device__ constexpr int hm_smem() { return HT<TYPE>::NS * hm_stage<TYPE>() + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0); }
-static_assert(BN * (BM + 4) * 4 <= hm_smem<TQ5K>() && BN * (BM + 4) * 4 <= hm_smem<TQ4K>(), "epilogue tile");
+constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps of 16 rows, each over all NB tokens
+// NB: tokens per CTA (BN = 128 or, for short prompts, 64 / 32; picked per GEMM by the host, see Impl::pf_nb).
+// Each output element is the same sequence of fp16 products and sums in any NB (the K order per row and token does
+// not depend on which other tokens share the CTA), so every NB gives bit-identical results.
+template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } // activation tile per stage: NB tokens x 64 halves, 16 B chunks XOR-swizzled
+template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
+// (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, measured no faster: notes/agent_ttft.md.)
+// At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
+template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_smem() {
+    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0);
+}
 
 __device__ __forceinline__ void hmma16(unsigned (&d)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
@@ -118,17 +124,20 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // GLU: W2 holds the up matrix (same type and shape as W = gate); the CTA computes 64 gate rows
 // (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16. Only for
 // types whose rows carry their own scales (Q6_K / Q8_0 read them through W alone).
-template <int TYPE, bool GLU = false>
+template <int TYPE, bool GLU = false, int NB = BN>
 __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
     static_assert(!GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "fused gate / up needs in-row scales");
+    static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
+    static_assert(NB * (BM + 4) * 4 <= hm_smem<TYPE, NB>(), "epilogue tile");
+    constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256;
     extern __shared__ __align__(16) uint8_t sm[];
     constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR, NSH = HT<TYPE>::NS;
-    constexpr int STG = hm_stage<TYPE>();
+    constexpr int STG = hm_stage<TYPE, NB>();
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int wm = warp % HNWM, wn = warp / HNWM; // warp tile: rows HWR wm .., tokens HWT wn ..
     const int ntt = gridDim.y;
     const int lin = blockIdx.y * gridDim.x + blockIdx.x;
-    const int row0 = (lin / ntt) * (GLU ? BM / 2 : BM), tok0 = (lin % ntt) * BN;
+    const int row0 = (lin / ntt) * (GLU ? BM / 2 : BM), tok0 = (lin % ntt) * NB;
     const unsigned sbase = (unsigned) __cvta_generic_to_shared(sm);
     uint2 * sws = reinterpret_cast<uint2 *>(sm + NSH * STG); // [2][2 j][BM] fp16 scale pairs
 
@@ -153,10 +162,10 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const uint8_t * esrc = reinterpret_cast<const uint8_t *>(W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd);
     const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
-    const __half * xsrc[4];
-    unsigned xdst[4];
+    const __half * xsrc[XIT];
+    unsigned xdst[XIT];
 #pragma unroll
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < XIT; k++) {
         const int i = tid + k * 256, t = i >> 3, c = i & 7;
         xsrc[k] = X + (size_t) (tok0 + t) * W.K + 8 * c;
         xdst[k] = SR * BM + t * 128 + ((c ^ (t & 7)) << 4);
@@ -182,7 +191,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
         }
 #pragma unroll
-        for (int k = 0; k < 4; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
+        for (int k = 0; k < XIT; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
     };
 
     // fp16 scales of stage st -> sws[st & 1][j][row] (thread = (row, j)):
@@ -435,7 +444,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     }
     __syncthreads();
     if constexpr (GLU) {
-        for (int i = tid; i < BN * 4; i += 256) { // (token, 16-group of the 64 outputs)
+        for (int i = tid; i < NB * 4; i += 256) { // (token, 16-group of the 64 outputs)
             const int tk = i >> 2, q = i & 3;
             if (tok0 + tk >= ntok) continue;
             const float * gp = se + tk * ELD + 16 * q;
@@ -451,7 +460,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         }
         return;
     }
-    for (int i = tid; i < BN * BM / 4; i += 256) {
+    for (int i = tid; i < NB * BM / 4; i += 256) {
         const int tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
         if (tok0 + tk >= ntok) continue;
         float4 v = *reinterpret_cast<const float4 *>(se + tk * ELD + c);

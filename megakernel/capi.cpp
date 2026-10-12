@@ -17,6 +17,27 @@ struct Handle {
     std::string err;
 };
 thread_local std::string g_err;
+
+// Runs an engine call; an exception becomes -1 with mk_last_error(). A CUDA failure (MKCudaError: the engine
+// threw instead of exiting) leaves the sequence state undefined, so the engine is reset: the next prompt is
+// prefilled in full. (Sticky CUDA errors never get here: the engine exits with code 4.)
+template <class F> int guarded(void * hp, F f) {
+    auto * h = static_cast<Handle *>(hp);
+    try {
+        return f(h->eng);
+    } catch (const MKCudaError & e) {
+        g_err = e.what();
+        try {
+            h->eng->reset();
+        } catch (const std::exception & e2) {
+            g_err += std::string(" (reset after it failed too: ") + e2.what() + ")";
+        }
+        return -1;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
 }
 
 extern "C" {
@@ -42,7 +63,7 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
 
 void mk_free(void * hp) {
     auto * h = static_cast<Handle *>(hp);
-    delete h->eng;
+    delete h->eng; // (the destructor does not throw)
     llama_model_free(h->lm);
     delete h;
 }
@@ -94,12 +115,7 @@ int mk_set_policy(void * hp, const char * spec) {
 
 // appends tokens to the sequence; returns the first generated token (negative on error)
 int mk_prefill(void * hp, const int * toks, int n) {
-    try {
-        return static_cast<Handle *>(hp)->eng->prefill(std::vector<int>(toks, toks + n));
-    } catch (const std::exception & e) {
-        g_err = e.what();
-        return -1;
-    }
+    return guarded(hp, [&](MKEngine * e) { return e->prefill(std::vector<int>(toks, toks + n)); });
 }
 
 // mk_prefill with the rewind checkpoint saved at absolute position ck_at (inside this prompt) instead of its end
@@ -114,19 +130,22 @@ int mk_prefill_ck(void * hp, const int * toks, int n, int ck_at) {
 
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {
-    try {
+    return guarded(hp, [&](MKEngine * e) {
         std::vector<int> v;
-        static_cast<Handle *>(hp)->eng->step(v);
+        e->step(v);
         const int n = std::min((int) v.size(), cap);
         for (int i = 0; i < n; i++) out[i] = v[i];
         return n;
-    } catch (const std::exception & e) {
-        g_err = e.what();
-        return -1;
-    }
+    });
 }
 
-void mk_reset(void * hp) { static_cast<Handle *>(hp)->eng->reset(); }
+// (an error is only visible through mk_last_error)
+void mk_reset(void * hp) {
+    guarded(hp, [](MKEngine * e) {
+        e->reset();
+        return 0;
+    });
+}
 
 int mk_truncate(void * hp, int len) {
     try {
@@ -149,7 +168,9 @@ int mk_sequence(void * hp, int * out, int cap) {
 
 int mk_committed(void * hp) { return static_cast<Handle *>(hp)->eng->committed(); }
 int mk_checkpoint_pos(void * hp) { return static_cast<Handle *>(hp)->eng->checkpoint_pos(); }
-int mk_rewind_to_checkpoint(void * hp) { return static_cast<Handle *>(hp)->eng->rewind_to_checkpoint() ? 0 : -1; }
+int mk_rewind_to_checkpoint(void * hp) {
+    return guarded(hp, [](MKEngine * e) { return e->rewind_to_checkpoint() ? 0 : -1; });
+}
 
 void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     const auto & s = static_cast<Handle *>(hp)->eng->stats;

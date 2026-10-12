@@ -27,7 +27,20 @@ static void usage() {
     exit(1);
 }
 
+static int run(int argc, char ** argv);
+
+// engine errors (bad arguments, a prompt over the context, non-sticky CUDA errors) end the run with a message and
+// exit code 1; sticky CUDA errors exit inside the engine with code 4, a watchdog timeout with code 3
 int main(int argc, char ** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "[mk] error: %s\n", e.what());
+        return 1;
+    }
+}
+
+static int run(int argc, char ** argv) {
     std::string model, prompt = "Write a Python function that checks whether a number is prime.";
     std::string draft_vocab;
     int n_predict = 256, n_draft = 2, ctx = 8192;

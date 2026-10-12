@@ -25,9 +25,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -47,14 +50,39 @@
 #define MK_KV_EMU 0
 #endif
 
+// A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
+// the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
+// a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered in-process: every later CUDA call fails
+// too, so the process exits with code 4 after the message (the launcher / user restarts it). The library used to
+// exit(1) on every error, which took the server down without an answer.
+[[noreturn]] static void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
+    char msg[768];
+    snprintf(msg, sizeof msg, "CUDA error %s at %s:%d: %s", expr, file, line, cudaGetErrorString(e));
+    fprintf(stderr, "%s\n", msg);
+    bool sticky = false;
+    switch (e) {
+        case cudaErrorIllegalAddress: case cudaErrorLaunchFailure: case cudaErrorHardwareStackError:
+        case cudaErrorIllegalInstruction: case cudaErrorMisalignedAddress: case cudaErrorInvalidAddressSpace:
+        case cudaErrorInvalidPc: case cudaErrorLaunchTimeout: case cudaErrorECCUncorrectable: case cudaErrorAssert:
+        case cudaErrorContextIsDestroyed:
+            sticky = true;
+            break;
+        default: // anything else is sticky if it survives clearing the last error
+            cudaGetLastError();
+            sticky = cudaGetLastError() != cudaSuccess;
+    }
+    if (sticky) {
+        fprintf(stderr, "[mk] the CUDA error is sticky (the CUDA context is unusable): exiting with code 4\n");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(4);
+    }
+    throw MKCudaError(msg);
+}
 #define CK(x)                                                                                   \
     do {                                                                                        \
-        cudaError_t e_ = (x);                                                                   \
-        if (e_ != cudaSuccess) {                                                                \
-            fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__,             \
-                    cudaGetErrorString(e_));                                                    \
-            exit(1);                                                                            \
-        }                                                                                       \
+        const cudaError_t e_ = (x);                                                             \
+        if (e_ != cudaSuccess) mk_cuda_fail(e_, #x, __FILE__, __LINE__);                        \
     } while (0)
 
 namespace {
@@ -2581,6 +2609,9 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
 
 #include "prefill.cuh"
 
+// MK_FAULT (tests of the error path only, see Impl::fault_*): a kernel that traps, i.e. a sticky error
+__global__ void pk_fault() { __trap(); }
+
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
 // hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
 __global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) {
@@ -2766,49 +2797,168 @@ struct MKEngine::Impl {
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
-    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore is one ~8 ms PCIe copy per
-    // prompt). MK_CK_DEVICE=1 keeps it in device memory.
+    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore moves 0.17 GB over PCIe,
+    // 8-13 ms). MK_CK_DEVICE=1 keeps it in device memory.
+    // Neither copy is on the critical path (F9). Save: a device-to-device snapshot into the idle batched-prefill
+    // scratch on stream 0 (~0.4 ms), then the device-to-host copy on the non-blocking stream ck_st, which runs
+    // under the first decode launch (the decode kernels never touch the prefill scratch). Restore: the host-to-device
+    // copy runs on ck_st in CK_NG groups of DeltaNet layers, issued once the next prefill has uploaded its tokens
+    // (ck_issue_restore: nothing on stream 0 then queues behind it on the copy engine); stream 0 waits for a group's event
+    // only before the first kernel that reads that group's state (pf_run: dn_prep of the group's first layer), so the
+    // copy overlaps the embedding / GEMMs of the layers before it. Same bytes, same order of use: bit-identical.
+    // If the scratch is too small for the snapshot (MK_PF_CAP below ~640), the save copies straight from the state
+    // and stream 0 waits for it before the state is next modified (still off the prompt's critical path).
     float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
     void * ck_host = nullptr;
     Ctl ck_ctl;
     int ck_pos = -1;
-    double ck_ms = 0; // last save / restore copy time (MK_MEMLOG)
-    void ck_save() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        if (!ck_dstate) {
-            const char * cd = getenv("MK_CK_DEVICE");
-            if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
-                ck_dstate = static_cast<float *>(ck_host);
-                ck_conv = ck_dstate + ns;
-                ck_hhist = ck_conv + nc;
-            } else {
-                cudaGetLastError();
-                ck_host = nullptr;
-                ck_dstate = dalloc<float>(ns, false);
-                ck_conv = dalloc<float>(nc, false);
-                ck_hhist = dalloc<float>(nh, false);
-            }
-            mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
+    double ck_ms = 0; // last save / restore enqueue time (MK_MEMLOG)
+    static constexpr size_t CK_NS = (size_t) 48 * NVH * 128 * 128, CK_NC = (size_t) 48 * CONV_RING * QKV, CK_NH = (size_t) H_RING * D;
+    static constexpr int CK_NG = 5;
+    static constexpr int ck_gb[CK_NG + 1] = {0, 1, 4, 12, 24, 48}; // restore group g: DeltaNet layers [ck_gb[g], ck_gb[g + 1])
+    cudaStream_t ck_st = nullptr;
+    cudaEvent_t ck_ev_src = nullptr, ck_ev_saved = nullptr, ck_ev_grp[CK_NG] = {};
+    bool ck_saving = false;      // a save's device-to-host copy may still be running on ck_st
+    bool ck_save_direct = false; // ... and it reads the live state (no snapshot): stream 0 must wait before modifying it
+    bool ck_rs_due = false;      // a restore whose copies are not issued yet (ck_issue_restore)
+    int ck_rs_next = CK_NG;      // first restore group stream 0 has not waited for (CK_NG: no restore pending)
+    struct CkChunk { char * dev; char * scr; char * host; size_t n; };
+    std::vector<CkChunk> ck_plan; // snapshot: state -> prefill scratch (stream 0) -> pinned host (ck_st)
+
+    // Allocated at construction: cudaHostAlloc of the 0.16 GB takes 0.1-0.5 s under WSL2, which used to land in the
+    // first prompt's time (inside the first ck_save).
+    void ck_alloc() {
+        const char * cd = getenv("MK_CK_DEVICE");
+        if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (CK_NS + CK_NC + CK_NH) * 4, cudaHostAllocDefault) == cudaSuccess) {
+            ck_dstate = static_cast<float *>(ck_host);
+            ck_conv = ck_dstate + CK_NS;
+            ck_hhist = ck_conv + CK_NC;
+            CK(cudaStreamCreateWithFlags(&ck_st, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&ck_ev_src, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ck_ev_saved, cudaEventDisableTiming));
+            for (auto & e : ck_ev_grp) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        } else {
+            cudaGetLastError();
+            ck_host = nullptr;
+            ck_dstate = dalloc<float>(CK_NS, false);
+            ck_conv = dalloc<float>(CK_NC, false);
+            ck_hhist = dalloc<float>(CK_NH, false);
         }
+        mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
+    }
+    // snapshot plan over the prefill scratch buffers (after pf_init); empty when they are too small
+    void ck_make_plan() {
+        ck_plan.clear();
+        if (!ck_host) return;
+        const size_t cap = hp.cap;
+        const std::pair<void *, size_t> scr[] = {
+            {hp.y0, cap * FF * 4}, {hp.y1, cap * FF * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
+            {hp.xm, cap * D * 4},  {hp.dq, cap * QKV * 2}, {hp.xh, cap * 2 * D * 2}, {hp.qh, cap * NH * HD * 2}};
+        const std::tuple<void *, void *, size_t> reg[] = {
+            {hb.dstate, ck_dstate, CK_NS * 4}, {hb.conv, ck_conv, CK_NC * 4}, {hb.h_hist, ck_hhist, CK_NH * 4}};
+        size_t si = 0, so = 0; // scratch buffer, offset in it
+        for (const auto & r : reg) {
+            size_t done = 0;
+            while (done < std::get<2>(r)) {
+                while (si < std::size(scr) && scr[si].second - so < 256) si++, so = 0;
+                if (si == std::size(scr)) {
+                    ck_plan.clear();
+                    return;
+                }
+                const size_t n = std::min(std::get<2>(r) - done, (scr[si].second - so) & ~(size_t) 255);
+                ck_plan.push_back({static_cast<char *>(std::get<0>(r)) + done, static_cast<char *>(scr[si].first) + so,
+                                   static_cast<char *>(std::get<1>(r)) + done, n});
+                done += n;
+                so += n;
+            }
+        }
+    }
+    // host: the last save's device-to-host copy has finished (the watchdog covers the wait)
+    void ck_wait_saved() {
+        if (!ck_saving) return;
+        wait_event(ck_ev_saved, "the checkpoint save", std::max(wd_limit, 120.0));
+        ck_saving = ck_save_direct = false;
+    }
+    // stream 0: before modifying the live state, wait for a save that reads it directly (no snapshot)
+    void ck_guard_state() {
+        if (!(ck_saving && ck_save_direct)) return;
+        CK(cudaStreamWaitEvent(0, ck_ev_saved, 0));
+        ck_save_direct = false;
+    }
+    // Issues a due restore's host-to-device copies on ck_st (5 groups, an event after each). Deferred from ck_restore
+    // to just after the next prefill's token upload: a host-to-device copy on stream 0 (ctl, token ids, draft
+    // vocabulary rows) queued behind the 0.17 GB on the copy engine would stall the host for the whole restore.
+    void ck_issue_restore() {
+        if (!ck_rs_due) return;
+        ck_rs_due = false;
+        ck_wait_saved(); // (the copy reads the host buffer)
+        // stream 0's earlier work on the state is complete before ck_st overwrites it
+        CK(cudaEventRecord(ck_ev_src, 0));
+        CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
+        CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyHostToDevice, ck_st)); // group 0
+        constexpr size_t SL = (size_t) NVH * 128 * 128, CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
+        for (int g = 0; g < CK_NG; g++) {
+            const size_t l0 = ck_gb[g], nl = ck_gb[g + 1] - ck_gb[g];
+            CK(cudaMemcpyAsync(hb.conv + l0 * CL, ck_conv + l0 * CL, nl * CL * 4, cudaMemcpyHostToDevice, ck_st));
+            CK(cudaMemcpyAsync(hb.dstate + l0 * SL, ck_dstate + l0 * SL, nl * SL * 4, cudaMemcpyHostToDevice, ck_st));
+            CK(cudaEventRecord(ck_ev_grp[g], ck_st));
+        }
+        ck_rs_next = 0;
+    }
+    // stream 0: wait for the restore groups up to the one holding DeltaNet layer dl (-1: all of them)
+    void ck_wait_restore(int dl = -1) {
+        ck_issue_restore();
+        if (ck_rs_next >= CK_NG || (dl >= 0 && dl < ck_gb[ck_rs_next])) return;
+        int g = CK_NG - 1;
+        if (dl >= 0)
+            while (ck_gb[g] > dl) g--;
+        CK(cudaStreamWaitEvent(0, ck_ev_grp[g], 0));
+        ck_rs_next = g + 1;
+    }
+    void ck_save() {
+        ck_wait_restore();
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpyAsync(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault, 0));
-        wait_device("the checkpoint save", std::max(wd_limit, 120.0));
-        CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        if (!ck_host) { // device checkpoint: stream-ordered device copies
+            CK(cudaMemcpyAsync(ck_dstate, hb.dstate, CK_NS * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(ck_conv, hb.conv, CK_NC * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, CK_NH * 4, cudaMemcpyDeviceToDevice, 0));
+        } else {
+            ck_wait_saved(); // the previous save still reading the scratch / writing the host buffer (normally long done)
+            for (const auto & c : ck_plan) CK(cudaMemcpyAsync(c.scr, c.dev, c.n, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaEventRecord(ck_ev_src, 0));
+            CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
+            if (!ck_plan.empty()) {
+                for (const auto & c : ck_plan) CK(cudaMemcpyAsync(c.host, c.scr, c.n, cudaMemcpyDeviceToHost, ck_st));
+            } else {
+                CK(cudaMemcpyAsync(ck_dstate, hb.dstate, CK_NS * 4, cudaMemcpyDeviceToHost, ck_st));
+                CK(cudaMemcpyAsync(ck_conv, hb.conv, CK_NC * 4, cudaMemcpyDeviceToHost, ck_st));
+                CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, CK_NH * 4, cudaMemcpyDeviceToHost, ck_st));
+                ck_save_direct = true;
+            }
+            CK(cudaEventRecord(ck_ev_saved, ck_st));
+            ck_saving = true;
+        }
+        ck_ctl = hctl; // prefill() read ctl back after its last launch: the host copy is the device's
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (memlog) fprintf(stderr, "[mk-mem] checkpoint save %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
+        if (memlog)
+            fprintf(stderr, "[mk-mem] checkpoint save enqueued in %.2f ms (%s)\n", ck_ms,
+                    !ck_host ? "device" : ck_plan.empty() ? "host, direct" : "host, via the prefill scratch");
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        ck_wait_restore();
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpyAsync(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault, 0));
-        wait_device("the checkpoint restore", std::max(wd_limit, 120.0));
+        if (!ck_host) {
+            ck_guard_state();
+            CK(cudaMemcpyAsync(hb.dstate, ck_dstate, CK_NS * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(hb.conv, ck_conv, CK_NC * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyDeviceToDevice, 0));
+        } else {
+            ck_wait_saved();
+            ck_rs_due = true; // issued by the next pf_run after its token upload, or by whatever touches the state first
+        }
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore enqueued in %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         hctl = ck_ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -2862,16 +3012,24 @@ struct MKEngine::Impl {
             return;
         }
         CK(cudaEventRecord(wd_ev, 0));
+        wait_event(wd_ev, what, limit);
+    }
+    // the same deadline for an event recorded elsewhere (the checkpoint copy stream)
+    void wait_event(cudaEvent_t ev, const char * what, double limit) {
+        if (limit <= 0.0) {
+            CK(cudaEventSynchronize(ev));
+            return;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         for (;;) {
-            const cudaError_t e = cudaEventQuery(wd_ev);
+            const cudaError_t e = cudaEventQuery(ev);
             if (e == cudaSuccess) return;
-            if (e != cudaErrorNotReady) CK(e);
+            if (e != cudaErrorNotReady) mk_cuda_fail(e, (std::string("(the GPU work of ") + what + ")").c_str(), __FILE__, __LINE__);
             const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (el > limit) {
                 const cudaError_t le = cudaPeekAtLastError();
                 fprintf(stderr,
-                        "[mk] watchdog: the GPU did not finish %s within %.0f s (mode %d, T %d, position %d, committed %d, "
+                        "[mk] watchdog: the GPU did not finish %s within %g s (mode %d, T %d, position %d, committed %d, "
                         "launches %ld, last CUDA error: %s). The device or its driver is stuck: exiting with code 3.\n",
                         what, limit, wd_mode, wd_T, hctl.n, hctl.dn_c, launches_seen, cudaGetErrorString(le));
                 fflush(stderr);
@@ -3148,6 +3306,18 @@ struct MKEngine::Impl {
         return q;
     }
 
+    // MK_FAULT=cuda:<n> | sticky:<n> (tests of the error path only): the n-th prefill (1-based) fails half-way
+    // through the batched layers, with a rejected CUDA call (non-sticky: an invalid memcpy direction; the state is
+    // left half-updated) or a trapping kernel (sticky: the context is lost)
+    int fault_kind = 0, fault_at = 0, fault_seen = 0;
+    bool fault_now = false;
+    void fault_inject() {
+        fault_now = false;
+        fprintf(stderr, "[mk] MK_FAULT: injecting a %s CUDA error\n", fault_kind == 1 ? "non-sticky" : "sticky");
+        if (fault_kind == 1) CK(cudaMemcpy(hp.h, hp.h, 4, (cudaMemcpyKind) 99));
+        else pk_fault<<<1, 1>>>();
+    }
+
     int n_draft_max;
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
     Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
@@ -3161,6 +3331,13 @@ struct MKEngine::Impl {
         CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
         if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
         if (const char * w = getenv("MK_WATCHDOG_SPIN")) wd_spin_s = atof(w);
+        if (const char * f = getenv("MK_FAULT")) {
+            const std::string s = f;
+            const size_t c = s.find(':');
+            fault_kind = s.compare(0, c, "cuda") == 0 ? 1 : s.compare(0, c, "sticky") == 0 ? 2 : 0;
+            fault_at = c == std::string::npos ? 1 : atoi(s.c_str() + c + 1);
+            if (!fault_kind || fault_at < 1) throw std::runtime_error("MK_FAULT: cuda:<n> or sticky:<n>");
+        }
         if (memlog) {
             CK(cudaFree(0));
             mem_mark("context");
@@ -3460,7 +3637,7 @@ struct MKEngine::Impl {
         hb.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
         hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
-        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
+        hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
@@ -3541,6 +3718,10 @@ struct MKEngine::Impl {
                     fa.numRegs, (size_t) fa.localSizeBytes, (size_t) fa.constSizeBytes, (size_t) fa.sharedSizeBytes, stk, heap, fifo, nsm,
                     prop.maxThreadsPerMultiProcessor);
         }
+        // the DeltaNet checkpoint and the batched-prefill scratch are allocated here, not inside the first prompt's time
+        ck_alloc();
+        pf_init();
+        ck_make_plan();
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
@@ -3588,10 +3769,22 @@ struct MKEngine::Impl {
 #if MK_SPEC_LOG
         if (slog) fclose(slog);
 #endif
-        print_profile();
-        mem_mark("at exit");
+        try { // (CK throws; a destructor must not)
+            print_profile();
+            mem_mark("at exit");
+            ck_wait_saved(); // a checkpoint copy may still read the scratch / write the host buffer
+            ck_wait_restore();
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[mk] teardown: %s\n", e.what());
+        }
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         cudaStreamSynchronize(0);
+        if (ck_st) {
+            cudaStreamSynchronize(ck_st);
+            cudaStreamDestroy(ck_st);
+            for (cudaEvent_t e : {ck_ev_src, ck_ev_saved}) cudaEventDestroy(e);
+            for (cudaEvent_t e : ck_ev_grp) cudaEventDestroy(e);
+        }
         if (embd_host) cudaFreeHost(embd_host);
         if (ck_host) cudaFreeHost(ck_host);
     }
@@ -3605,6 +3798,8 @@ struct MKEngine::Impl {
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
         void * args[] = {&L};
+        ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
+        ck_guard_state();
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
@@ -3762,15 +3957,20 @@ struct MKEngine::Impl {
         hp.amax = dalloc<int>(cap);
         mem_mark("prefill scratch");
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4NL>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4NL>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
+        mmh_attr<pf::TQ4K, false>();
+        mmh_attr<pf::TQ5K, false>();
+        mmh_attr<pf::TQ6K, false>();
+        mmh_attr<pf::TQ80, false>();
+        mmh_attr<pf::TIQ4, false>();
+        mmh_attr<pf::TIQ4NL, false>();
+        mmh_attr<pf::TQ4K, true>();
+        mmh_attr<pf::TQ5K, true>();
+        mmh_attr<pf::TIQ4, true>();
+        if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
+            pf_bn_force = atoi(e);
+            if (pf_bn_force != 0 && pf_bn_force != 32 && pf_bn_force != 64 && pf_bn_force != 128)
+                throw std::runtime_error("MK_PF_BN: 0, 32, 64 or 128");
+        }
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
@@ -3832,19 +4032,52 @@ struct MKEngine::Impl {
         if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, hp.y1);
     }
 
+    // GEMM token tile (pf::mmh NB): every NB gives bit-identical results, so this is a pure speed choice.
+    // At 128 a short prompt pads to 128 columns and the CTA is tensor-pipe bound on the padding (42 tokens: 2.1 us
+    // per 64-K stage, 86 of 128 columns wasted); 32 / 64 cut the MMA work and add CTAs.
+    // The choice is a small cost model over waves of CTAs (nrt row tiles x token tiles) on the nsm SMs, with the
+    // per-stage time of a lone CTA at NB = 32 / 64 / 128 (0.80 / 0.95 / 1.44, relative; the model's Q4_K .. Q8_0
+    // shapes, microbenchmark notes/ttft/gemm_nb.cu). NB 64 / 128 run one CTA per SM (shared memory), NB 32 two (a
+    // pair takes 1.77x as long as one CTA). It picks 32 for <= 32 tokens; up to 64 tokens 64, or 32 when the GEMM is
+    // narrow (40 row tiles x 2 token tiles still fit one wave); up to 128 tokens 128, or 64 when narrow; above that
+    // mostly 128. Chunks of more than 384 tokens always use 128 (the original kernel).
+    int pf_bn_force = 0; // MK_PF_BN
+    int pf_nb(int ntok, int nrt) const {
+        if (pf_bn_force) return pf_bn_force;
+        if (ntok > 384) return 128;
+        const int n32 = nrt * ((ntok + 31) / 32), n64 = nrt * ((ntok + 63) / 64), n128 = nrt * ((ntok + 127) / 128);
+        const double t32 = 0.80 * (n32 <= nsm ? 1.0 : 1.77 * ((n32 + 2 * nsm - 1) / (2 * nsm)));
+        const double t64 = 0.95 * ((n64 + nsm - 1) / nsm), t128 = 1.44 * ((n128 + nsm - 1) / nsm);
+        return t32 <= t64 && t32 <= t128 ? 32 : t64 <= t128 ? 64 : 128;
+    }
+    template <int TYPE, bool GLU> void mmh_attr() {
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 32>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 64>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 128>()));
+    }
+    // nrt row tiles (CTAs along N) x token tiles of pf_nb tokens
+    template <int TYPE, bool GLU>
+    void mmh_launch(int nrt, const pf::WMat & W, const __half * X, int ntok, const pf::Out & O, const uint8_t * W2 = nullptr) {
+        switch (pf_nb(ntok, nrt)) {
+            case 32: pf::mmh<TYPE, GLU, 32><<<dim3(nrt, (ntok + 31) / 32), 256, pf::hm_smem<TYPE, 32>()>>>(W, X, ntok, O, W2); break;
+            case 64: pf::mmh<TYPE, GLU, 64><<<dim3(nrt, (ntok + 63) / 64), 256, pf::hm_smem<TYPE, 64>()>>>(W, X, ntok, O, W2); break;
+            default: pf::mmh<TYPE, GLU, 128><<<dim3(nrt, (ntok + 127) / 128), 256, pf::hm_smem<TYPE, 128>()>>>(W, X, ntok, O, W2); break;
+        }
+    }
+
     // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
     void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr) {
         const pf::WMat W{m.w, m.d, m.type, m.K, m.N, m.rb, m.nd};
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
         const pf::Out O{y, ldy, mode, nullptr};
-        const dim3 grid(m.N / pf::BM, (ntok + pf::BN - 1) / pf::BN);
+        const int nrt = m.N / pf::BM;
         switch (m.type) {
-            case T_Q4K: pf::mmh<pf::TQ4K><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, X, ntok, O); break;
-            case T_Q5K: pf::mmh<pf::TQ5K><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, X, ntok, O); break;
-            case T_Q6K: pf::mmh<pf::TQ6K><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, X, ntok, O); break;
-            case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
-            case T_IQ4X: pf::mmh<pf::TIQ4><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, X, ntok, O); break;
-            case T_IQ4NL: pf::mmh<pf::TIQ4NL><<<grid, 256, pf::hm_smem<pf::TIQ4NL>()>>>(W, X, ntok, O); break;
+            case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
+            case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
+            case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O); break;
+            case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;
+            case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O); break;
+            case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }
@@ -3857,12 +4090,12 @@ struct MKEngine::Impl {
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
-        const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
+        const int nrt = g.N / (pf::BM / 2);
         if (glu_fused(g, u)) {
             switch (g.type) {
-                case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w); return;
-                case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w); return;
-                case T_IQ4X: pf::mmh<pf::TIQ4, true><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, hp.xh, ntok, O, u.w); return;
+                case T_Q4K: mmh_launch<pf::TQ4K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
+                case T_Q5K: mmh_launch<pf::TQ5K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
+                case T_IQ4X: mmh_launch<pf::TIQ4, true>(nrt, W, hp.xh, ntok, O, u.w); return;
                 default: break;
             }
         }
@@ -3951,16 +4184,18 @@ struct MKEngine::Impl {
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
                 int first = 0) {
         pf_init();
+        ck_wait_saved(); // the scratch may still be the source of the last checkpoint save
+        ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
-        if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
-        else CK(cudaMemcpy(hp.h, hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         for (int c0 = 0; c0 < N; c0 += cap) {
             const int T = std::min(cap, N - c0), n = n0 + c0;
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            ck_issue_restore(); // a due checkpoint restore streams in from here on (waited for per layer group below)
             pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
+                if (fault_now && L == NL / 2) fault_inject();
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.attn_norm); });
                 if (W.attn) {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
@@ -3972,6 +4207,7 @@ struct MKEngine::Impl {
                 } else {
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
                     pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
+                    ck_wait_restore(dl); // this layer's conv ring / state may still be arriving from the checkpoint
                     pf_time("dn_prep", [&] { pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A); pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl); });
                     pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl); });
                     pf_time("dn_out", [&] { pk_dn_out<<<T, 256>>>(W.snorm); });
@@ -4009,6 +4245,10 @@ struct MKEngine::Impl {
                 }
                 continue;
             }
+            if (c0 == 0) { // hp.h row 0: the hidden state before the chunk, read only by pk_mtp_in (after every restore wait)
+                if (n0 == 0) CK(cudaMemsetAsync(hp.h, 0, D * sizeof(float), 0));
+                else CK(cudaMemcpyAsync(hp.h, hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+            }
             pf_time("mtp", [&] {
                 pk_final_h<<<T, 256>>>(T, n);
                 pk_mtp_in<<<T, 256>>>();
@@ -4027,7 +4267,17 @@ struct MKEngine::Impl {
         pf_report();
     }
 
+    // cB.logits ([MAXT][VOCAB] fp32, 5 MB): only scoring launches (Launch::score == 2) write it
+    void logits_alloc() {
+        if (hb.logits) return;
+        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
+        CK(cudaMemcpyToSymbol(cB, &hb.logits, sizeof(hb.logits), offsetof(Bufs, logits)));
+        mem_mark("scoring logits");
+    }
+
     void reset() {
+        ck_wait_restore();
+        ck_guard_state();
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
@@ -4097,6 +4347,7 @@ int MKEngine::position() const { return p_->hctl.n; }
 
 int MKEngine::prefill(const std::vector<int> & tokens, int ck_at) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
+    if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     std::vector<int> & seq = p_->seq;
@@ -4213,6 +4464,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     const int N = (int) tokens.size();
     if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
     reset();
+    p_->logits_alloc();
     mk_from = std::min(std::max(mk_from, 0), N);
     if (mk_from > 0)
         p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
@@ -4279,6 +4531,7 @@ int MKEngine::step(std::vector<int> & out) {
 std::vector<float> MKEngine::last_hidden() {
     std::vector<float> h(D);
     const int pos = p_->hctl.dn_c - 1;
+    p_->ck_wait_restore();
     CK(cudaMemcpy(h.data(), p_->hb.h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
 }
