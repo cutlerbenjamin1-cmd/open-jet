@@ -50,14 +50,39 @@
 #define MK_KV_EMU 0
 #endif
 
+// A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
+// the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
+// a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered in-process: every later CUDA call fails
+// too, so the process exits with code 4 after the message (the launcher / user restarts it). The library used to
+// exit(1) on every error, which took the server down without an answer.
+[[noreturn]] static void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
+    char msg[768];
+    snprintf(msg, sizeof msg, "CUDA error %s at %s:%d: %s", expr, file, line, cudaGetErrorString(e));
+    fprintf(stderr, "%s\n", msg);
+    bool sticky = false;
+    switch (e) {
+        case cudaErrorIllegalAddress: case cudaErrorLaunchFailure: case cudaErrorHardwareStackError:
+        case cudaErrorIllegalInstruction: case cudaErrorMisalignedAddress: case cudaErrorInvalidAddressSpace:
+        case cudaErrorInvalidPc: case cudaErrorLaunchTimeout: case cudaErrorECCUncorrectable: case cudaErrorAssert:
+        case cudaErrorContextIsDestroyed:
+            sticky = true;
+            break;
+        default: // anything else is sticky if it survives clearing the last error
+            cudaGetLastError();
+            sticky = cudaGetLastError() != cudaSuccess;
+    }
+    if (sticky) {
+        fprintf(stderr, "[mk] the CUDA error is sticky (the CUDA context is unusable): exiting with code 4\n");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(4);
+    }
+    throw MKCudaError(msg);
+}
 #define CK(x)                                                                                   \
     do {                                                                                        \
-        cudaError_t e_ = (x);                                                                   \
-        if (e_ != cudaSuccess) {                                                                \
-            fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__,             \
-                    cudaGetErrorString(e_));                                                    \
-            exit(1);                                                                            \
-        }                                                                                       \
+        const cudaError_t e_ = (x);                                                             \
+        if (e_ != cudaSuccess) mk_cuda_fail(e_, #x, __FILE__, __LINE__);                        \
     } while (0)
 
 namespace {
@@ -2584,6 +2609,9 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
 
 #include "prefill.cuh"
 
+// MK_FAULT (tests of the error path only, see Impl::fault_*): a kernel that traps, i.e. a sticky error
+__global__ void pk_fault() { __trap(); }
+
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
 // hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
 __global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) {
@@ -3266,6 +3294,18 @@ struct MKEngine::Impl {
         return q;
     }
 
+    // MK_FAULT=cuda:<n> | sticky:<n> (tests of the error path only): the n-th prefill (1-based) fails half-way
+    // through the batched layers, with a rejected CUDA call (non-sticky: an invalid memcpy direction; the state is
+    // left half-updated) or a trapping kernel (sticky: the context is lost)
+    int fault_kind = 0, fault_at = 0, fault_seen = 0;
+    bool fault_now = false;
+    void fault_inject() {
+        fault_now = false;
+        fprintf(stderr, "[mk] MK_FAULT: injecting a %s CUDA error\n", fault_kind == 1 ? "non-sticky" : "sticky");
+        if (fault_kind == 1) CK(cudaMemcpy(hp.h, hp.h, 4, (cudaMemcpyKind) 99));
+        else pk_fault<<<1, 1>>>();
+    }
+
     int n_draft_max;
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
     Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
@@ -3279,6 +3319,13 @@ struct MKEngine::Impl {
         CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
         if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
         if (const char * w = getenv("MK_WATCHDOG_SPIN")) wd_spin_s = atof(w);
+        if (const char * f = getenv("MK_FAULT")) {
+            const std::string s = f;
+            const size_t c = s.find(':');
+            fault_kind = s.compare(0, c, "cuda") == 0 ? 1 : s.compare(0, c, "sticky") == 0 ? 2 : 0;
+            fault_at = c == std::string::npos ? 1 : atoi(s.c_str() + c + 1);
+            if (!fault_kind || fault_at < 1) throw std::runtime_error("MK_FAULT: cuda:<n> or sticky:<n>");
+        }
         if (memlog) {
             CK(cudaFree(0));
             mem_mark("context");
@@ -3710,10 +3757,14 @@ struct MKEngine::Impl {
 #if MK_SPEC_LOG
         if (slog) fclose(slog);
 #endif
-        print_profile();
-        mem_mark("at exit");
-        ck_wait_saved(); // a checkpoint copy may still read the scratch / write the host buffer
-        ck_wait_restore();
+        try { // (CK throws; a destructor must not)
+            print_profile();
+            mem_mark("at exit");
+            ck_wait_saved(); // a checkpoint copy may still read the scratch / write the host buffer
+            ck_wait_restore();
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[mk] teardown: %s\n", e.what());
+        }
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         cudaStreamSynchronize(0);
         if (ck_st) {
@@ -4093,6 +4144,7 @@ struct MKEngine::Impl {
             int dl = 0;
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
+                if (fault_now && L == NL / 2) fault_inject();
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.attn_norm); });
                 if (W.attn) {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
@@ -4236,6 +4288,7 @@ int MKEngine::position() const { return p_->hctl.n; }
 
 int MKEngine::prefill(const std::vector<int> & tokens) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
+    if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     std::vector<int> & seq = p_->seq;

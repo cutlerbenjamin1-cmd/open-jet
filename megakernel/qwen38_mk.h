@@ -2,8 +2,15 @@
 #pragma once
 
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+// A failed (non-sticky) CUDA call inside the engine. The engine's sequence state is then undefined: reset() it
+// before the next use (the C API does). Sticky errors (the CUDA context is lost) exit the process with code 4.
+struct MKCudaError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct MKStats {
     long cycles = 0;
