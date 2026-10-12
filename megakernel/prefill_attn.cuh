@@ -1,5 +1,5 @@
 // Prefill attention kernels.  Included from prefill.cuh inside qwen38_mk.cu's anonymous namespace (and by the
-// standalone microbenchmark notes/prefill/attn_bench.cu with a minimal environment).  Uses NH, NKV, HD, VD,
+// standalone microbenchmark bench/attn_bench.cu with a minimal environment).  Uses NH, NKV, HD, VD,
 // cB (kc, vc, ksc, vsc, ctx), cP (qh, y2), cp_async16, q8_to_f16, mma16816 and pf:: cpa_commit, cpa_wait,
 // ldsm_x4, hmma16, hmma16z, u2h.
 
@@ -182,19 +182,15 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
 // 128 j .. 128 j + 127, so o takes 64 registers instead of 128 and the 4 SMSPs get 3 warps each.  The pair
 // exchanges row maxima, P and partial row sums through shared memory in an order that reproduces
 // pk_attn's arithmetic exactly (bit-identical output without PV16).  Loads overlap compute: V of tile i
-// arrives during S of tile i, K of tile i + 1 during P V of tile i (q8: register prefetch converted to
-// fp16 in shared memory after the phase; fp16 cache: cp.async).
+// arrives during S of tile i, K of tile i + 1 during P V of tile i (q8: register prefetch, converted to
+// fp16 in shared memory between the MMAs of the phase; fp16 cache: cp.async).
 // PV16: P V of each tile accumulated in fp16 (full-rate tensor cores on GeForce), then added to the fp32
-// accumulators (not exact).
+// accumulators (not exact; no measurable KLD change).  The fp16 sum of a tile is at most 32 max|v|: overflow
+// would need |v| > 2047 (the largest |v| in the V cache over a 101k-token prompt is 111).
 // Work units: blockIdx.x < nfull: item blockIdx.x (q tile fastest, then kv head), all tiles, final output.
 // Units beyond nfull split each remaining item into S tile ranges whose partial (o, m, l) go to `part`
 // and are merged by pk_attn2_comb: the last wave of equal-sized items is otherwise mostly idle.
-#ifndef MK_A2_I2F
-#define MK_A2_I2F 0 // 1: q8 -> fp16 through q8_to_f16 (I2F) instead of the byte_perm path (same values)
-#endif
-#ifndef MK_A2_SCHED
-#define MK_A2_SCHED 1 // 1: q8 tile conversions interleaved with the MMA loops; 0: after them
-#endif
+// Microbenchmark: bench/attn_bench.cu.
 constexpr int A2_Q = 16, A2_K = 32, A2_LD = HD + 8, A2_NT = 384;
 constexpr int A2_XCH = 6 * 32 * (2 * 8 + 2 * 16 + 8); // per head pair: maxima, P fragments, partial sums
 constexpr int A2_SMEM = (6 * A2_Q + 2 * A2_K) * A2_LD * 2 + A2_XCH;
@@ -263,11 +259,7 @@ __device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
         __half2 h[4];
-#if MK_A2_I2F
-        q8_to_f16(r.q[k], __half2float(r.d[k]), h);
-#else
         a2_q8h(r.q[k], r.d[k], h);
-#endif
         *reinterpret_cast<int4 *>(dst + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
@@ -369,7 +361,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
             mma16816(s[0], a[0], a[1], a[2], a[3], b[0], b[1]);
             mma16816(s[1], a[0], a[1], a[2], a[3], b[2], b[3]);
             // V(it) -> sV (free since the barrier above) between the MMAs, late enough for the loads to have landed
-            if constexpr (Q8 && MK_A2_SCHED)
+            if constexpr (Q8)
                 if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2);
         }
         // causal mask, row maxima over the pair
@@ -441,7 +433,6 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
         m1 = mn1;
         const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth; // A fragments of positions 0-15 / 16-31
         if constexpr (Q8) {
-            if constexpr (!MK_A2_SCHED) a2_st_q8(rq, sV); // V(it): sV is free (barrier above)
             if (it + 1 < it1) a2_ld_q8(rq, Kq + (size_t) kn * HD, Ks + (size_t) kn * (HD / 32), npn);
         } else {
             pf::cpa_wait<0>(); // V(it)
@@ -471,7 +462,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                     mma16816(o[2 * j], A.x, A.y, A.z, A.w, b[0], b[1]);
                     mma16816(o[2 * j + 1], A.x, A.y, A.z, A.w, b[2], b[3]);
                     // K(it + 1) -> sK (free since the barrier above) late in the loop
-                    if constexpr (Q8 && MK_A2_SCHED)
+                    if constexpr (Q8)
                         if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1);
                 }
             }
@@ -496,13 +487,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                 o[2 * j + 1][1] = o[2 * j + 1][1] * al0 + w0.y;
                 o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
                 o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
-                if constexpr (Q8 && MK_A2_SCHED)
-                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4);
+                if constexpr (Q8)
+                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4); // K(it + 1) -> sK late in the loop
             }
         }
         if constexpr (Q8) {
             if (nxt) {
-                if constexpr (!MK_A2_SCHED) a2_st_q8(rq, sK); // K(it + 1): sK is free (barrier above)
                 a2_ld_q8(rq, Vq + (size_t) kn * HD, Vs + (size_t) kn * (HD / 32), npn);
             }
         }

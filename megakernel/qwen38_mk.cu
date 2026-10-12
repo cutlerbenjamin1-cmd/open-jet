@@ -2979,7 +2979,8 @@ struct MKEngine::Impl {
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
         a2_slots = nsm * occ;
-        // MK_ATTN=1: the original pk_attn; MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=1: fp16-accumulated P V
+        // MK_ATTN=1: the original pk_attn; MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=0: fp32-accumulated P V
+        // (pk_attn2 with both off is bit-identical to pk_attn)
         if (const char * e = getenv("MK_ATTN")) attn_old = atoi(e) == 1;
         if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
         if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
@@ -2988,7 +2989,7 @@ struct MKEngine::Impl {
 
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
-    bool attn_old = false, attn_split = true, attn_pv16 = false;
+    bool attn_old = false, attn_split = true, attn_pv16 = true;
     void attn(int T, int n, int slot) {
         if (attn_old) {
             if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
