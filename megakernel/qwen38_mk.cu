@@ -30,6 +30,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include "ggml.h"
 #include "gguf.h"
 #include "qwen38_mk.h"
@@ -2789,9 +2791,10 @@ struct MKEngine::Impl {
             mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
         }
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault));
-        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault));
-        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault));
+        CK(cudaMemcpyAsync(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault, 0));
+        CK(cudaMemcpyAsync(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault, 0));
+        CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault, 0));
+        wait_device("the checkpoint save", std::max(wd_limit, 120.0));
         CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog) fprintf(stderr, "[mk-mem] checkpoint save %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
@@ -2800,9 +2803,10 @@ struct MKEngine::Impl {
     void ck_restore() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault));
-        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault));
-        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault));
+        CK(cudaMemcpyAsync(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault, 0));
+        CK(cudaMemcpyAsync(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault, 0));
+        CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault, 0));
+        wait_device("the checkpoint restore", std::max(wd_limit, 120.0));
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         hctl = ck_ctl;
@@ -2841,6 +2845,41 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw.head_d.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
     Ctl hctl{};
+
+    // Watchdog. Every wait for the device in the run-time paths goes through wait_device(), which records an
+    // event and polls it with a deadline (MK_WATCHDOG: seconds per decode launch, default 60; prefill chunks and
+    // checkpoint copies get at least 120 s; 0 = the runtime's plain blocking waits). The CUDA runtime's own waits
+    // never time out: a GPU / driver fault the WSL2 guest is not told about (2026-10-12 04:43, nvlddmkm event 153
+    // on the Windows side, no error in the guest) left the host thread spinning for 33 minutes with an idle GPU.
+    // The watchdog turns that into a message and exit code 3. The first wd_spin_s of a wait spin (a decode launch
+    // finishes in 20-35 ms, so no latency is added); after that it sleeps between polls.
+    cudaEvent_t wd_ev = nullptr;
+    double wd_limit = 60.0, wd_spin_s = 0.25;
+    int wd_T = 0, wd_mode = -1;
+    void wait_device(const char * what, double limit) {
+        if (limit <= 0.0 || !wd_ev) {
+            CK(cudaStreamSynchronize(0));
+            return;
+        }
+        CK(cudaEventRecord(wd_ev, 0));
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            const cudaError_t e = cudaEventQuery(wd_ev);
+            if (e == cudaSuccess) return;
+            if (e != cudaErrorNotReady) CK(e);
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (el > limit) {
+                const cudaError_t le = cudaPeekAtLastError();
+                fprintf(stderr,
+                        "[mk] watchdog: the GPU did not finish %s within %.0f s (mode %d, T %d, position %d, committed %d, "
+                        "launches %ld, last CUDA error: %s). The device or its driver is stuck: exiting with code 3.\n",
+                        what, limit, wd_mode, wd_T, hctl.n, hctl.dn_c, launches_seen, cudaGetErrorString(le));
+                fflush(stderr);
+                _exit(3);
+            }
+            if (el > wd_spin_s) std::this_thread::sleep_for(std::chrono::microseconds(el > 2.0 ? 2000 : 100));
+        }
+    }
 
     // MK_MEMLOG=1: device memory accounting. Each mark prints the bytes dalloc'd since the previous mark
     // and the drop of cudaMemGetInfo's free memory over the same span (the difference is allocation
@@ -3119,6 +3158,9 @@ struct MKEngine::Impl {
         cudaDeviceProp prop;
         CK(cudaGetDeviceProperties(&prop, 0));
         nsm = prop.multiProcessorCount;
+        CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
+        if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
+        if (const char * w = getenv("MK_WATCHDOG_SPIN")) wd_spin_s = atof(w);
         if (memlog) {
             CK(cudaFree(0));
             mem_mark("context");
@@ -3566,7 +3608,11 @@ struct MKEngine::Impl {
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
-        if (memlog && launches_seen++ == 0) mem_mark("first mk_cycle launch");
+        wd_T = T;
+        wd_mode = mode;
+        wait_device(mode == MODE_DECODE ? "a decode launch" : "a prefill launch", wd_limit);
+        launches_seen++;
+        if (memlog && launches_seen == 1) mem_mark("first mk_cycle launch");
         if (profiling && mode == MODE_DECODE) {
             std::vector<unsigned long long> pr(4096 + 1024 * 128);
             CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
@@ -3937,6 +3983,9 @@ struct MKEngine::Impl {
                 pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : "gemm_ffn_gu2", [&] { gemm_glu(W.fg, W.fu, T); });
                 pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
             }
+            wd_T = T;
+            wd_mode = MODE_PREFILL;
+            wait_device("a prefill chunk", std::max(wd_limit, 120.0));
             if (pred || sink) {
                 pk_norm_quant<<<T, 256>>>(hp.x, hw.onorm);
                 std::vector<float> rows;
@@ -3973,7 +4022,7 @@ struct MKEngine::Impl {
             CK(cudaMemcpyAsync(hp.h, hp.h + (size_t) T * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         }
         CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
+        wait_device("the prefill tail", std::max(wd_limit, 120.0));
         if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
         pf_report();
     }
