@@ -3024,7 +3024,7 @@ struct MKEngine::Impl {
         for (;;) {
             const cudaError_t e = cudaEventQuery(ev);
             if (e == cudaSuccess) return;
-            if (e != cudaErrorNotReady) CK(e);
+            if (e != cudaErrorNotReady) mk_cuda_fail(e, (std::string("(the GPU work of ") + what + ")").c_str(), __FILE__, __LINE__);
             const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (el > limit) {
                 const cudaError_t le = cudaPeekAtLastError();
