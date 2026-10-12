@@ -180,7 +180,7 @@ users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill 
 megakernel instead), `MK_PF_CAP=n` (prefill chunk tokens), `MK_ATTN_PV16=0` / `MK_ATTN_SPLIT=0` (prefill
 attention with fp32-accumulated P V / without the tail split; with both, bit-identical to `MK_ATTN=1`, the
 original prefill attention kernel), `MK_ATTN_S8=0` (q8 cache: Q K^T on fp16 tensor cores instead of int8;
-`=2`: one Q scale per row instead of per 32 dims).
+`=2`: one Q scale per row instead of per 32 dims), `MK_MTP_Q4=0` (the MTP block in its stored types, see The GGUF).
 
 ### The GGUF
 
@@ -202,6 +202,13 @@ value (both formats store a small integer times the same fp16 `d` and an integer
 and the loader checks each re-encoded row bit for bit against ggml's dequantization of the original.
 A file with any other type is refused, naming the first tensor that does not match, and open-jet
 starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
+
+The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than
+Q4_K (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized
+to Q4_K at load (`ggml_quantize_chunk`, 1-3 s), so every MTP pass streams ~0.1 GB less (UD: -107 MiB of VRAM,
+greedy bench +1.5%). Only the drafts change: they are verified by the unchanged main model, so greedy output
+and the sampled output distribution stay exact; acceptance moved by under a point. `MK_MTP_Q4=0` keeps the
+stored types (`MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests).
 
 Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read in two
 passes over the shared activations in decode (`rows16`: one `__noinline__` function per weight type,

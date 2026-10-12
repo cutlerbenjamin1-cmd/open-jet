@@ -3117,6 +3117,23 @@ struct MKEngine::Impl {
     };
     int n_conv = 0;
     double conv_s = 0;
+    // MK_MTP_Q4: the MTP draft block's (blk.64 + nextn.eh_proj) matrices stored wider than Q4_K (Q5_K, Q6_K, Q8_0;
+    // UD-Q4_K_XL: all of them, Q4_K_M: eh, v, ffn_down) are re-quantised to Q4_K at load (ggml_quantize_chunk, no
+    // imatrix). Lossy, but only the drafts can change: they are verified by the exact main model, so the output (greedy
+    // ids, the sampled distribution) is unchanged and only acceptance moves. Each MTP pass streams ~0.1 GB less.
+    // 0 off, 1 on (default), ab: both copies on the device and the policy key mtpq=0|1 picks one (A/B tests).
+    int mtp_q4 = 1;
+    bool req_q4 = false; // want(): re-quantise the current tensor to Q4_K (set while the MTP block loads)
+    int n_req = 0;
+    double req_s = 0;
+    struct MtpW { LayerW L; Mat eh; };
+    MtpW mtp_set[2]{}; // MK_MTP_Q4=ab: [0] as stored in the file, [1] re-quantised
+    void set_mtp_q4(int on) {
+        if (mtp_q4 != 2) throw std::runtime_error("policy mtpq needs MK_MTP_Q4=ab");
+        hw.L[NL] = mtp_set[on ? 1 : 0].L;
+        hw.eh = mtp_set[on ? 1 : 0].eh;
+        CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
+    }
 
     Src want(const std::string & name, int to = -1) {
         const auto & t = file.get(name);
@@ -3126,11 +3143,12 @@ struct MKEngine::Impl {
         s.data = t.data;
         s.nbytes = t.nbytes;
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
-        const bool to_q6 = !to_f32 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
-        const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8"); // native IQ4_NL unless MK_IQ4NL_Q8
-        if (!to_f32 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
+        const bool to_q4 = !to_f32 && req_q4 && (t.type == gguf::Q5_K || t.type == gguf::Q6_K || t.type == gguf::Q8_0);
+        const bool to_q6 = !to_f32 && !to_q4 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
+        const bool to_q8 = !to_f32 && !to_q4 && t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8"); // native IQ4_NL unless MK_IQ4NL_Q8
+        if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
-        const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
+        const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q4 ? GGML_TYPE_Q4_K : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
         const int64_t K = (int64_t) t.ne[0];
         int64_t rows = 1;
         for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
@@ -3150,6 +3168,10 @@ struct MKEngine::Impl {
                 memcpy(out, f.data(), (size_t) K * 4);
                 return;
             }
+            if (to_q4) { // lossy by design (see mtp_q4)
+                ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out, 0, 1, K, nullptr);
+                return;
+            }
             if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
             else reencode_iq4nl_q80(src, out, K);
             g.resize((size_t) K);
@@ -3160,8 +3182,14 @@ struct MKEngine::Impl {
         s.type = (uint32_t) dst;
         s.data = s.own.data();
         s.nbytes = s.own.size();
-        n_conv++;
-        conv_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (to_q4) {
+            n_req++;
+            req_s += dt;
+        } else {
+            n_conv++;
+            conv_s += dt;
+        }
         return s;
     }
 
@@ -3371,9 +3399,15 @@ struct MKEngine::Impl {
                                      " (see README: the GGUF)");
         };
         auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL}); };
+        if (const char * e = getenv("MK_MTP_Q4")) {
+            if (!strcmp(e, "ab")) mtp_q4 = 2;
+            else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
+            else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
+        }
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
+            req_q4 = mtp && mtp_q4 != 0;
             L.attn = mtp || ((i + 1) % 4 == 0);
             L.attn_norm = up_f32(blk(i, "attn_norm.weight"), D);
             L.post_norm = up_f32(blk(i, "post_attention_norm.weight"), D);
@@ -3457,8 +3491,24 @@ struct MKEngine::Impl {
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
         mem_mark("weights: 64 layers + MTP");
+        req_q4 = mtp_q4 != 0;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+        req_q4 = false;
         needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
+        if (mtp_q4 == 2) { // A/B: the file's MTP matrices as well (the norms are shared)
+            mtp_set[1] = {hw.L[NL], hw.eh};
+            MtpW & a = mtp_set[0];
+            a.L = hw.L[NL];
+            a.L.q = up_mat(blk(NL, "attn_q.weight"), D, QG);
+            a.L.k = up_mat(blk(NL, "attn_k.weight"), D, KVD);
+            a.L.v = up_mat(blk(NL, "attn_v.weight"), D, KVD);
+            a.L.o = up_mat(blk(NL, "attn_output.weight"), VD, D);
+            a.L.fg = up_mat(blk(NL, "ffn_gate.weight"), D, FF);
+            a.L.fu = up_mat(blk(NL, "ffn_up.weight"), D, FF);
+            a.L.fd = up_mat(blk(NL, "ffn_down.weight"), FF, D);
+            a.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+            mem_mark("MTP block, file types (MK_MTP_Q4=ab)");
+        }
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
         hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
@@ -3522,6 +3572,9 @@ struct MKEngine::Impl {
         if (n_conv)
             fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0 with MK_IQ4NL_Q8; ssm_alpha / beta -> F32)\n",
                     n_conv, conv_s);
+        if (n_req)
+            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0: as stored%s)\n",
+                    n_req, req_s, mtp_q4 == 2 ? "; ab: both copies, policy mtpq=0|1" : "");
 
         hb.x = dalloc<float>(MAXT * D);
         hb.xm = dalloc<float>(MAXT * D);
@@ -4299,7 +4352,8 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
-// sampling); "" = defaults
+// sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
+// "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
     float dk[4] = {-1.f, -1.f, -1.f, -1.f}, sk[4] = {-1.f, -1.f, -1.f, -1.f}; // per-draft overrides
@@ -4322,6 +4376,7 @@ void MKEngine::set_policy(const std::string & spec) {
             (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
+        else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
         else throw std::runtime_error("policy: unknown key " + k);
     }
     for (int j = 0; j < 4; j++) {
