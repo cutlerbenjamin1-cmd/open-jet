@@ -2607,27 +2607,47 @@ struct MKEngine::Impl {
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
+    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore is one ~8 ms PCIe copy per
+    // prompt). MK_CK_DEVICE=1 keeps it in device memory.
     float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
+    void * ck_host = nullptr;
     Ctl ck_ctl;
     int ck_pos = -1;
+    double ck_ms = 0; // last save / restore copy time (MK_MEMLOG)
     void ck_save() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
         if (!ck_dstate) {
-            ck_dstate = dalloc<float>(ns, false);
-            ck_conv = dalloc<float>(nc, false);
-            ck_hhist = dalloc<float>(nh, false);
+            const char * cd = getenv("MK_CK_DEVICE");
+            if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
+                ck_dstate = static_cast<float *>(ck_host);
+                ck_conv = ck_dstate + ns;
+                ck_hhist = ck_conv + nc;
+            } else {
+                cudaGetLastError();
+                ck_host = nullptr;
+                ck_dstate = dalloc<float>(ns, false);
+                ck_conv = dalloc<float>(nc, false);
+                ck_hhist = dalloc<float>(nh, false);
+            }
+            mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
         }
-        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDeviceToDevice));
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault));
         CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint save %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDeviceToDevice));
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault));
+        ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         hctl = ck_ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
