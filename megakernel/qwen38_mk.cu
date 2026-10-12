@@ -2802,7 +2802,8 @@ struct MKEngine::Impl {
     // Neither copy is on the critical path (F9). Save: a device-to-device snapshot into the idle batched-prefill
     // scratch on stream 0 (~0.4 ms), then the device-to-host copy on the non-blocking stream ck_st, which runs
     // under the first decode launch (the decode kernels never touch the prefill scratch). Restore: the host-to-device
-    // copy runs on ck_st in CK_NG groups of DeltaNet layers; the next prefill's stream 0 waits for a group's event
+    // copy runs on ck_st in CK_NG groups of DeltaNet layers, issued once the next prefill has uploaded its tokens
+    // (ck_issue_restore: nothing on stream 0 then queues behind it on the copy engine); stream 0 waits for a group's event
     // only before the first kernel that reads that group's state (pf_run: dn_prep of the group's first layer), so the
     // copy overlaps the embedding / GEMMs of the layers before it. Same bytes, same order of use: bit-identical.
     // If the scratch is too small for the snapshot (MK_PF_CAP below ~640), the save copies straight from the state
@@ -2819,6 +2820,7 @@ struct MKEngine::Impl {
     cudaEvent_t ck_ev_src = nullptr, ck_ev_saved = nullptr, ck_ev_grp[CK_NG] = {};
     bool ck_saving = false;      // a save's device-to-host copy may still be running on ck_st
     bool ck_save_direct = false; // ... and it reads the live state (no snapshot): stream 0 must wait before modifying it
+    bool ck_rs_due = false;      // a restore whose copies are not issued yet (ck_issue_restore)
     int ck_rs_next = CK_NG;      // first restore group stream 0 has not waited for (CK_NG: no restore pending)
     struct CkChunk { char * dev; char * scr; char * host; size_t n; };
     std::vector<CkChunk> ck_plan; // snapshot: state -> prefill scratch (stream 0) -> pinned host (ck_st)
@@ -2883,8 +2885,29 @@ struct MKEngine::Impl {
         CK(cudaStreamWaitEvent(0, ck_ev_saved, 0));
         ck_save_direct = false;
     }
+    // Issues a due restore's host-to-device copies on ck_st (5 groups, an event after each). Deferred from ck_restore
+    // to just after the next prefill's token upload: a host-to-device copy on stream 0 (ctl, token ids, draft
+    // vocabulary rows) queued behind the 0.17 GB on the copy engine would stall the host for the whole restore.
+    void ck_issue_restore() {
+        if (!ck_rs_due) return;
+        ck_rs_due = false;
+        ck_wait_saved(); // (the copy reads the host buffer)
+        // stream 0's earlier work on the state is complete before ck_st overwrites it
+        CK(cudaEventRecord(ck_ev_src, 0));
+        CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
+        CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyHostToDevice, ck_st)); // group 0
+        constexpr size_t SL = (size_t) NVH * 128 * 128, CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
+        for (int g = 0; g < CK_NG; g++) {
+            const size_t l0 = ck_gb[g], nl = ck_gb[g + 1] - ck_gb[g];
+            CK(cudaMemcpyAsync(hb.conv + l0 * CL, ck_conv + l0 * CL, nl * CL * 4, cudaMemcpyHostToDevice, ck_st));
+            CK(cudaMemcpyAsync(hb.dstate + l0 * SL, ck_dstate + l0 * SL, nl * SL * 4, cudaMemcpyHostToDevice, ck_st));
+            CK(cudaEventRecord(ck_ev_grp[g], ck_st));
+        }
+        ck_rs_next = 0;
+    }
     // stream 0: wait for the restore groups up to the one holding DeltaNet layer dl (-1: all of them)
     void ck_wait_restore(int dl = -1) {
+        ck_issue_restore();
         if (ck_rs_next >= CK_NG || (dl >= 0 && dl < ck_gb[ck_rs_next])) return;
         int g = CK_NG - 1;
         if (dl >= 0)
@@ -2932,18 +2955,7 @@ struct MKEngine::Impl {
             CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyDeviceToDevice, 0));
         } else {
             ck_wait_saved();
-            // stream 0's earlier work on the state is complete before ck_st overwrites it
-            CK(cudaEventRecord(ck_ev_src, 0));
-            CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
-            CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyHostToDevice, ck_st)); // group 0
-            constexpr size_t SL = (size_t) NVH * 128 * 128, CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
-            for (int g = 0; g < CK_NG; g++) {
-                const size_t l0 = ck_gb[g], nl = ck_gb[g + 1] - ck_gb[g];
-                CK(cudaMemcpyAsync(hb.conv + l0 * CL, ck_conv + l0 * CL, nl * CL * 4, cudaMemcpyHostToDevice, ck_st));
-                CK(cudaMemcpyAsync(hb.dstate + l0 * SL, ck_dstate + l0 * SL, nl * SL * 4, cudaMemcpyHostToDevice, ck_st));
-                CK(cudaEventRecord(ck_ev_grp[g], ck_st));
-            }
-            ck_rs_next = 0;
+            ck_rs_due = true; // issued by the next pf_run after its token upload, or by whatever touches the state first
         }
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore enqueued in %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
@@ -4140,6 +4152,7 @@ struct MKEngine::Impl {
         for (int c0 = 0; c0 < N; c0 += cap) {
             const int T = std::min(cap, N - c0), n = n0 + c0;
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            ck_issue_restore(); // a due checkpoint restore streams in from here on (waited for per layer group below)
             pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
