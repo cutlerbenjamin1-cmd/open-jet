@@ -3271,9 +3271,10 @@ struct MKEngine::Impl {
     //   first part writes the state at P into a staging slot in hp.xm (idle until the chunk's MTP part), next to the
     //   conv ring at P (pk_ck_conv); a device-to-host copy on ck_sv moves the staging slot into the checkpoint while
     //   the next layers run. The h ring at P goes straight into the mapped host buffer (pk_ck_hist). Stream 0 waits
-    //   (on the device) only before reusing a staging slot and before the MTP part. A position on the chunk's 32-token
-    //   scan grid changes no arithmetic; another one (the exact ck_at of a chat turn) restarts the scan grid there,
-    //   like the earlier split into two pf_runs (bit-identical to it), but in one pass over the weights.
+    //   (on the device) only before reusing a staging slot and before the MTP part. The scan is split only at points
+    //   of its 32-token grid, which changes no arithmetic: saving a checkpoint never changes what the prefill computes.
+    //   A position off the grid (the exact ck_at of a chat turn) is saved by a side scan from the grid point before
+    //   it (the state a prefill ending there computes, as the earlier split into two pf_runs did).
     // - At the end of a prompt (ck_save_end, F9): a device-to-device snapshot into the idle batched-prefill scratch
     //   on stream 0 (~0.4 ms), then the device-to-host copy on ck_sv, which runs under the first decode launch.
     // - Restore: the host-to-device copy runs on ck_st in CK_NG groups of DeltaNet layers, issued once the next
@@ -3281,8 +3282,8 @@ struct MKEngine::Impl {
     //   engine); stream 0 waits for a group's event only before the first kernel that reads that group's state
     //   (pf_run: dn_prep of the group's first layer). Same bytes, same order of use: bit-identical.
     // If the scratch is too small for the end snapshot (MK_PF_CAP below ~640), the end save copies straight from the
-    // state and stream 0 waits for it before the state is next modified; below ~170 there is no staging slot either,
-    // and a checkpoint inside a prompt splits the prefill into two pf_runs around it (the earlier scheme).
+    // state and stream 0 waits for it before the state is next modified; below ~340 there are too few staging slots
+    // too, and a checkpoint inside a prompt splits the prefill into two pf_runs around it (the earlier scheme).
     static constexpr size_t CK_SL = (size_t) NVH * 128 * 128, CK_CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
     static constexpr size_t CK_NS = 48 * CK_SL, CK_NC = 48 * CK_CL, CK_NH = (size_t) H_RING * D;
     static constexpr int CK_NG = 5;
@@ -4874,21 +4875,38 @@ struct MKEngine::Impl {
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
                     pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
                     ck_wait_restore(dl); // this layer's conv ring / state may still be arriving from the checkpoint
-                    int sg[STG_MAX]; // staging slots of this layer's checkpoint pieces
+                    int sg[STG_MAX], ta = -1; // staging slots of this layer's checkpoint pieces (+ a side scan's input)
                     for (int j = 0; j < sn; j++) sg[j] = stg_take();
+                    for (int j = 0; j < sn; j++)
+                        if ((sp[j] - n) % 32 && sp[j] - n > 32) ta = stg_take();
                     pf_time("dn_prep", [&] {
                         pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A);
                         for (int j = 0; j < sn; j++) pk_ck_conv<<<CONV_RING, 256>>>(n, sp[j], dl, stg_conv(sg[j]));
                         pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl);
                     });
                     pf_time("dn_scan", [&] {
+                        // The scan is split only at points of its 32-token grid, which changes no arithmetic: the state
+                        // at an on-grid checkpoint goes to its staging slot on the way. An off-grid one (the exact
+                        // ck_at) is computed on the side: a scan of the rows from the grid point before it, from the
+                        // state there, into its staging slot (= what a prefill ending at it computes); the main scan
+                        // then rewrites those rows' y2.
                         float * live = hb.dstate + (size_t) dl * CK_SL;
                         const float * in = live;
-                        int t = 0; // split at each checkpoint: the state there -> staging slot -> the next part
+                        int t = 0;
                         for (int j = 0; j < sn; j++) {
-                            pk_dn_scan<<<dim3(NVH, 2), 256>>>(sp[j] - n - t, t, in, stg_state(sg[j]));
-                            in = stg_state(sg[j]);
-                            t = sp[j] - n;
+                            const int te = sp[j] - n, tg = te / 32 * 32;
+                            if (te == tg) {
+                                pk_dn_scan<<<dim3(NVH, 2), 256>>>(tg - t, t, in, stg_state(sg[j]));
+                                in = stg_state(sg[j]);
+                                t = tg;
+                                continue;
+                            }
+                            if (tg > t) {
+                                pk_dn_scan<<<dim3(NVH, 2), 256>>>(tg - t, t, in, stg_state(ta));
+                                in = stg_state(ta);
+                                t = tg;
+                            }
+                            pk_dn_scan<<<dim3(NVH, 2), 256>>>(te - tg, tg, in, stg_state(sg[j]));
                         }
                         pk_dn_scan<<<dim3(NVH, 2), 256>>>(T - t, t, in, live);
                     });
@@ -4965,9 +4983,9 @@ struct MKEngine::Impl {
     }
 
     // Checkpoint positions for a batched part n0 .. hend - 1 (pf_run chunks of hp.cap from n0): the requested P with
-    // n0 < P <= hend, `exact` as it is, every other one moved down to the DeltaNet scan's 32-token grid (from its
-    // chunk's start, or from `exact` after it in the same chunk), where splitting the scan changes no arithmetic;
-    // ascending, without duplicates or existing checkpoints, at most stg_n per chunk (dropping the earliest).
+    // n0 < P <= hend, `exact` as it is (saved by a side scan), every other one moved down onto the DeltaNet scan's
+    // 32-token grid from its chunk's start; ascending, without duplicates or existing checkpoints, at most stg_n per
+    // chunk (one less with `exact`, whose side scan may need a staging slot; dropping the earliest).
     std::vector<int> ck_positions(const std::vector<int> & cks, int exact, int n0, int hend) {
         const int cap = hp.cap;
         auto chunk = [&](int P) { return (P - n0 - 1) / cap; }; // the chunk P belongs to (n < P <= n + T)
@@ -4976,19 +4994,18 @@ struct MKEngine::Impl {
             if (P <= n0 || P > hend) continue;
             if (P != exact) {
                 const int cs = n0 + chunk(P) * cap;
-                const bool after = exact > cs && exact < P && chunk(exact) == chunk(P);
-                const int g0 = after ? exact : cs;
-                P = g0 + (P - g0) / 32 * 32;
+                P = cs + (P - cs) / 32 * 32;
                 if (P <= n0) continue;
             }
             if (ck_find(P) < 0) v.push_back(P);
         }
         std::sort(v.begin(), v.end());
         v.erase(std::unique(v.begin(), v.end()), v.end());
-        for (size_t i = 0; i < v.size();) { // per chunk: at most stg_n
+        for (size_t i = 0; i < v.size();) { // per chunk: at most stg_n staging slots
             size_t j = i;
             while (j < v.size() && chunk(v[j]) == chunk(v[i])) j++;
-            int extra = (int) (j - i) - stg_n;
+            const bool ex = std::find(v.begin() + i, v.begin() + j, exact) != v.begin() + j;
+            int extra = (int) (j - i) + (ex ? 1 : 0) - stg_n;
             for (size_t k = i; k < j && extra > 0;)
                 if (v[k] != exact) v.erase(v.begin() + k), j--, extra--;
                 else k++;
@@ -5006,7 +5023,8 @@ struct MKEngine::Impl {
     }
 
     void reset() {
-        ck_wait_restore();
+        ck_rs_slot = -1;   // (a restore not issued yet is moot)
+        ck_wait_restore(); // (an issued one still writes the state)
         ck_guard_state();
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
@@ -5106,7 +5124,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         const std::vector<int> head(feed.begin(), feed.end() - 1);
         const int hend = n0 + (int) head.size(); // the batched part: positions n0 .. hend - 1
         end_save = !(ck_exact > n0 && ck_exact < hend);
-        if (p_->stg_n == 0) { // no staging slot (MK_PF_CAP below ~170): two pf_runs around ck_exact, the other positions ignored
+        if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
             if (!end_save) {
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr);
                 c.dn_c = ck_exact;

@@ -39,8 +39,8 @@ class MKEngine {
     // prefill() saving checkpoints at the absolute positions cks (inside this prompt) into the checkpoint pool:
     // MK_CK_SLOTS (default 8) checkpoints of 0.17 GB of pinned host memory each, evicted by coverage when full
     // (older ones thin out, recent ones stay dense). ck_exact (or -1) is kept at its exact position; the others move
-    // down by up to 31 tokens onto the batched prefill's scan grid, where saving changes no arithmetic. Unless
-    // ck_exact is inside the batched part, a checkpoint at the end of the prompt is saved too (as prefill()).
+    // down by up to 31 tokens onto the batched prefill's scan grid. Saving changes nothing the prefill computes.
+    // Unless ck_exact is inside the batched part, a checkpoint at the end of the prompt is saved too (as prefill()).
     int prefill(const std::vector<int> & tokens, const std::vector<int> & cks, int ck_exact);
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
