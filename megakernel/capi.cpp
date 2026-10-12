@@ -120,12 +120,15 @@ int mk_prefill(void * hp, const int * toks, int n) {
 
 // mk_prefill with the rewind checkpoint saved at absolute position ck_at (inside this prompt) instead of its end
 int mk_prefill_ck(void * hp, const int * toks, int n, int ck_at) {
-    try {
-        return static_cast<Handle *>(hp)->eng->prefill(std::vector<int>(toks, toks + n), ck_at);
-    } catch (const std::exception & e) {
-        g_err = e.what();
-        return -1;
-    }
+    return guarded(hp, [&](MKEngine * e) { return e->prefill(std::vector<int>(toks, toks + n), ck_at); });
+}
+
+// mk_prefill with checkpoints at the absolute positions cks[0..ncks) (ck_exact: the one kept exact, or -1;
+// MKEngine::prefill(tokens, cks, ck_exact))
+int mk_prefill_cks(void * hp, const int * toks, int n, const int * cks, int ncks, int ck_exact) {
+    return guarded(hp, [&](MKEngine * e) {
+        return e->prefill(std::vector<int>(toks, toks + n), std::vector<int>(cks, cks + std::max(ncks, 0)), ck_exact);
+    });
 }
 
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
@@ -170,6 +173,17 @@ int mk_committed(void * hp) { return static_cast<Handle *>(hp)->eng->committed()
 int mk_checkpoint_pos(void * hp) { return static_cast<Handle *>(hp)->eng->checkpoint_pos(); }
 int mk_rewind_to_checkpoint(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->rewind_to_checkpoint() ? 0 : -1; });
+}
+// positions of the checkpoints (ascending, up to cap); returns their count
+int mk_checkpoints(void * hp, int * out, int cap) {
+    const auto v = static_cast<Handle *>(hp)->eng->checkpoints();
+    if (out)
+        for (int i = 0; i < std::min((int) v.size(), cap); i++) out[i] = v[i];
+    return (int) v.size();
+}
+// restores the checkpoint at pos: 0, or -1 (none there)
+int mk_rewind_to(void * hp, int pos) {
+    return guarded(hp, [&](MKEngine * e) { return e->rewind_to(pos) ? 0 : -1; });
 }
 
 void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
