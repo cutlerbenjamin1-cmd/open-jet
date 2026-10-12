@@ -2016,6 +2016,87 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
     return true;
 }
 
+// Merging sorted top-32 lists (the sampled lm_head's per-warp and per-block candidate lists).  Inserting lists one
+// after the other with topk_insert keeps, of all entries, the best 32 under the order (value descending, then
+// insertion order): an entry goes behind equal values already there and does not displace an equal 32nd.  So the
+// insertion order can be replaced by an explicit sequence key s (list index * 32 + rank in the list) and the lists
+// merged in any order with a comparison on (value, s): the result is identical, entry for entry, to the sequential
+// merge.  Unfilled slots are (-inf, -1) and rank below every real entry (whose logits are > -inf: topk_insert never
+// takes -inf or NaN); they are interchangeable, so their keys do not matter.
+__device__ __forceinline__ bool tk_before(float av, int as, float bv, int bs) { return av > bv || (av == bv && as < bs); }
+
+// (v, id, s): this warp's sorted list (lane = rank); merged with the sorted list (bv, bid, bs) into the best 32 of
+// both, sorted: reversing b and keeping the better of each pair gives a bitonic sequence holding the best 32, which
+// a 5-step bitonic merge sorts.
+__device__ __forceinline__ void tk_merge(float & v, int & id, int & s, float bv, int bid, int bs) {
+    const int lane = threadIdx.x & 31;
+    {
+        const float rv = __shfl_sync(0xffffffffu, bv, 31 - lane);
+        const int ri = __shfl_sync(0xffffffffu, bid, 31 - lane);
+        const int rs = __shfl_sync(0xffffffffu, bs, 31 - lane);
+        if (tk_before(rv, rs, v, s)) { v = rv; id = ri; s = rs; }
+    }
+#pragma unroll
+    for (int k = 16; k >= 1; k >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, k);
+        const int oi = __shfl_xor_sync(0xffffffffu, id, k);
+        const int os = __shfl_xor_sync(0xffffffffu, s, k);
+        if (((lane & k) == 0) == tk_before(ov, os, v, s)) { v = ov; id = oi; s = os; } // low lane keeps the better
+    }
+}
+
+// shared-memory lists [TL][16][32] (values tv, ids ti, sequence keys ts) -> list 0 of each row holds the best 32 of
+// its 16 lists (pairwise tree, the merges of a level spread over all warps). Ends with a barrier.
+template <int TL>
+__device__ __noinline__ void tk_tree16(float * tv, int * ti, int * ts) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll 1
+    for (int d = 1; d < 16; d *= 2) {
+        const int per = 8 / d; // merges per row at this level
+#pragma unroll 1
+        for (int q = warp; q < TL * per; q += NW) {
+            const int t = q / per, l = (q % per) * 2 * d;
+            const int a = (t * 16 + l) * 32 + lane, b = a + d * 32;
+            float v = tv[a];
+            int id = ti[a], s = ts[a];
+            tk_merge(v, id, s, tv[b], ti[b], ts[b]);
+            tv[a] = v;
+            ti[a] = id;
+            ts[a] = s;
+        }
+        __syncthreads();
+    }
+}
+// warp w of the last block: block lists w, w + NW, ... of row t (cB.blk_best) merged into shared-memory list (t, w)
+// (6 loads in flight per batch; out of line: own registers)
+__device__ __noinline__ void tk_grid_chain(int t, float * tv, int * ti, int * ts) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, G = gridDim.x;
+    float v = -INFINITY;
+    int id = -1, s = 0;
+#pragma unroll 1
+    for (int k0 = warp; k0 < G; k0 += 6 * NW) {
+        float2 e[6];
+#pragma unroll
+        for (int i = 0; i < 6; i++) {
+            const int k = k0 + i * NW;
+            e[i] = k < G ? __ldcg(&cB.blk_best[((size_t) k * MAXT + t) * TOPK_MAX + lane]) : make_float2(-INFINITY, __int_as_float(-1));
+        }
+#pragma unroll
+        for (int i = 0; i < 6; i++) {
+            const int k = k0 + i * NW;
+            if (k < G) tk_merge(v, id, s, e[i].x, __float_as_int(e[i].y), k * 32 + lane);
+        }
+    }
+    const int a = (t * 16 + warp) * 32 + lane;
+    tv[a] = v;
+    ti[a] = id;
+    ts[a] = s;
+}
+constexpr int SM_CAND = 32768; // sampled lm_head: the final candidate rows [MAXT][32] (value, id) in shared memory,
+constexpr int SM_DQ = SM_CAND + MAXT * 32 * 8; // and the drafts' proposals q' staged for sample_targets
+constexpr int SM_LSE = SM_DQ + MAXT * 32 * 8;   // the draft lm_head's per-block (max, sum of exp), [gridDim.x]
+static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + 128 * 8 <= SM_MISC, "top-k merge shared memory");
+
 // lm_head over TL rows (qn rows t0..t0+TL-1) with greedy argmax; returns true in the single
 // block that finished last, which holds the reduced argmax in s_tok.  TOPK: additionally keeps the
 // TOPK_MAX best logits of each row in cand (default cB.cand; for sampling).  FULL: additionally stores
@@ -2098,22 +2179,25 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             m[LM_WLSE + 2 * warp + 1] = lm_s;
         }
     }
+    // TOPK: lists [TL][16][32] in shared memory for the merges (the activations are no longer needed)
+    float * const tkv = reinterpret_cast<float *>(sm);
+    int * const tki = reinterpret_cast<int *>(sm) + TL * 512;
+    int * const tks = reinterpret_cast<int *>(sm) + 2 * TL * 512;
     if constexpr (TOPK) {
-        // merge the warps' lists (shared memory, the activations are no longer needed), then the blocks'
+        // merge the warps' lists into the block's (the order of a sequential merge over warps 0..15: tk_merge)
         __syncthreads();
-        float2 * wl = reinterpret_cast<float2 *>(sm); // [NW][TL][32]
 #pragma unroll
-        for (int t = 0; t < TL; t++) wl[(warp * TL + t) * 32 + lane] = make_float2(bv[t], __int_as_float(bi[t]));
+        for (int t = 0; t < TL; t++) {
+            const int a = (t * 16 + warp) * 32 + lane;
+            tkv[a] = bv[t];
+            tki[a] = bi[t];
+            tks[a] = warp * 32 + lane;
+        }
         __syncthreads();
-        if (warp < TL) {
-            float v = -INFINITY;
-            int id = -1;
-            for (int w = 0; w < NW; w++)
-                for (int j = 0; j < 32; j++) {
-                    const float2 e = wl[(w * TL + warp) * 32 + j];
-                    if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
-                }
-            cB.blk_best[((size_t) blockIdx.x * MAXT + warp) * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
+        tk_tree16<TL>(tkv, tki, tks);
+        for (int q = tid; q < TL * 32; q += NT) {
+            const int t = q >> 5, a = t * 512 + (q & 31);
+            cB.blk_best[((size_t) blockIdx.x * MAXT + t) * TOPK_MAX + (q & 31)] = make_float2(tkv[a], __int_as_float(tki[a]));
         }
     } else {
         float * wv = m + 16;                                    // [NW][MAXT]
@@ -2152,44 +2236,62 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     __syncthreads();
     if (!s_last[0]) return false;
     __threadfence();
-    if constexpr (LSE) {
+    if constexpr (LSE) { // the blocks' (max, sum of exp) -> shared memory in one parallel load; the sum stays in block order
+        float2 * const sl = reinterpret_cast<float2 *>(sm + SM_LSE);
+        for (int k = tid; k < (int) gridDim.x; k += NT) sl[k] = __ldcg(&cB.blk_lse[k]);
+        __syncthreads();
         if (tid == NT - 1) {
             float M = -INFINITY, S = 0.f;
-            for (int k = 0; k < (int) gridDim.x; k++) M = fmaxf(M, __ldcg(&cB.blk_lse[k]).x);
+            for (int k = 0; k < (int) gridDim.x; k++) M = fmaxf(M, sl[k].x);
             for (int k = 0; k < (int) gridDim.x; k++) {
-                const float2 e = __ldcg(&cB.blk_lse[k]);
+                const float2 e = sl[k];
                 S += e.y * __expf(e.x - M);
             }
             m[LM_LSE] = M + __logf(S);
         }
     }
     if constexpr (TOPK) {
+        // merge the blocks' lists (the order of a sequential merge over blocks 0..G-1): warp w merges lists
+        // w, w + 16, ... of each row, then a tree over the 16 warps' lists
+#pragma unroll 1
+        for (int t = 0; t < TL; t++) tk_grid_chain(t, tkv, tki, tks);
+        // main head: the drafts' q' (previous launch) for sample_targets, staged while the merge runs
+        if (!draft)
+            for (int q = tid; q < (TL - 1) * TOPK_MAX; q += NT) reinterpret_cast<float2 *>(sm + SM_DQ)[q] = __ldcg(cB.dq + q);
+        __syncthreads();
+        tk_tree16<TL>(tkv, tki, tks);
         if (warp < TL) {
-            float v = -INFINITY;
-            int id = -1;
-            for (int k = 0; k < (int) gridDim.x; k++)
-                for (int j = 0; j < 32; j++) {
-                    const float2 e = __ldcg(&cB.blk_best[((size_t) k * MAXT + warp) * TOPK_MAX + j]);
-                    if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
-                }
+            const float v = tkv[warp * 512 + lane];
+            int id = tki[warp * 512 + lane];
             if (draft && cW.draft_ids && id >= 0) id = cW.draft_ids[id];
             (cand ? cand : cB.cand)[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
+            reinterpret_cast<float2 *>(sm + SM_CAND)[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
             const int best = __shfl_sync(0xffffffffu, id, 0);
             if (lane == 0) {
                 s_tok[warp] = best;
                 if (LSE) m[LM_BEST] = v;
             }
         }
-    } else if (tid < TL) {
+    } else if (warp < TL) {
+        // the blocks' best of row `warp`: "larger value, then smaller id" is a total order (NaN never wins), so a warp
+        // reduction finds the same entry as the sequential scan over blocks
         float b = -INFINITY;
         int ix = 0;
-        for (int k = 0; k < (int) gridDim.x; k++) {
-            const float2 e = __ldcg(&cB.blk_best[k * MAXT + tid]);
+        for (int k = lane; k < (int) gridDim.x; k += 32) {
+            const float2 e = __ldcg(&cB.blk_best[k * MAXT + warp]);
             const int id = __float_as_int(e.y);
             if (e.x > b || (e.x == b && id < ix)) { b = e.x; ix = id; }
         }
-        s_tok[tid] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
-        if (LSE) m[LM_BEST] = b * m[0];
+#pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffffu, b, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, ix, o);
+            if (ob > b || (ob == b && oi < ix)) { b = ob; ix = oi; }
+        }
+        if (lane == 0) {
+            s_tok[warp] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
+            if (LSE) m[LM_BEST] = b * m[0];
+        }
     }
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
@@ -2289,17 +2391,18 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
 // rejection drawn from the residual norm(max(0, p_i - q'_i)).  Either way the output is distributed
 // exactly as p, and the rows after a rejection are dropped.  Rows with no draft to verify (the bonus
 // row, the last prompt row) are drawn from p_i.  tg then drives the greedy acceptance logic of
-// main_control unchanged.
-__device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
+// main_control unchanged.  cand: the rows' candidates (cB.cand, here the shared-memory copy lm_head leaves at
+// SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
+__device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
     for (int i = 0; i < tl; i++) {
-        const float2 * cd = cB.cand + i * TOPK_MAX;
+        const float2 * cd = cand + i * TOPK_MAX;
         const int K = cand_probs(cd, P, p);
         if (P.mode == MODE_DECODE && i < T - 1 && c->dsmp) {
             const int d = c->tok[i + 1];
-            const float2 * q = cB.dq + i * TOPK_MAX;
+            const float2 * q = dq + i * TOPK_MAX;
             float pd = 0.f;
             for (int j = 0; j < K; j++)
                 if (__float_as_int(cd[j].y) == d) pd += p[j];
@@ -2442,7 +2545,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     if (am_last && threadIdx.x == 0) {
         int tg[MAXT];
         for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
-        if (sampling) sample_targets(P, T, tl, tg);
+        if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
+            sample_targets(P, T, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
         main_control(P.mode, P.last, T, P.score ? s_tok + T - 1 : tg);
         __threadfence();
@@ -2527,7 +2631,9 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
 #endif
             const float f = P.gate_chain ? chain : conf;
-            c->tok[1 + k] = P.spec_smp ? draft_sample(P, tl, cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
+            // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
+            c->tok[1 + k] = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
+                                                      (unsigned long long) c->mtp_P + 1 + k)
                                        : s_tok[0];
             c->dsmp = P.spec_smp;
             c->dconf[k] = conf;
