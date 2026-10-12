@@ -9,7 +9,9 @@ in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_tem
 via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
 `tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
 conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
-only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
+only the rest is prefilled. When the new prompt diverges inside what the engine already processed, it
+rewinds to the last DeltaNet checkpoint at or before the divergence (saved during earlier prefills: at each
+generation prompt, each message start and every --ck-every tokens; a pool of MK_CK_SLOTS, default 8).
 GET /health, GET /v1/models.  One request at a time.
 """
 import argparse
@@ -61,9 +63,19 @@ class Engine:
             "mk_checkpoint_pos": (ctypes.c_int, [vp]),
             "mk_rewind_to_checkpoint": (ctypes.c_int, [vp]),
         }
+        opt = {  # checkpoint pool (libraries before it: one checkpoint)
+            "mk_prefill_cks": (ctypes.c_int, [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]),
+            "mk_checkpoints": (ctypes.c_int, [vp, ip, ctypes.c_int]),
+            "mk_rewind_to": (ctypes.c_int, [vp, ctypes.c_int]),
+        }
         for name, (res, args) in sig.items():
             f = getattr(L, name)
             f.restype, f.argtypes = res, args
+        self.pool = all(hasattr(L, name) for name in opt)
+        if self.pool:
+            for name, (res, args) in opt.items():
+                f = getattr(L, name)
+                f.restype, f.argtypes = res, args
         self.h = L.mk_new(model.encode(), ctx, n_draft, draft_vocab.encode() if draft_vocab else None, kv_mode)
         if not self.h:
             raise RuntimeError(L.mk_last_error().decode())
@@ -105,9 +117,14 @@ class Engine:
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
 
-    def prefill(self, toks, ck_at=-1):
+    def prefill(self, toks, ck_at=-1, cks=()):
+        """cks: more checkpoint positions (absolute; the engine moves them onto its scan grid), ck_at stays exact"""
         arr = (ctypes.c_int * len(toks))(*toks)
-        r = self.L.mk_prefill_ck(self.h, arr, len(toks), ck_at)
+        if self.pool and cks:
+            ca = (ctypes.c_int * len(cks))(*cks)
+            r = self.L.mk_prefill_cks(self.h, arr, len(toks), ca, len(cks), ck_at)
+        else:
+            r = self.L.mk_prefill_ck(self.h, arr, len(toks), ck_at)
         if r < 0:
             raise self._err("prefill")
         return r
@@ -140,6 +157,20 @@ class Engine:
 
     def rewind_to_checkpoint(self):
         return self.L.mk_rewind_to_checkpoint(self.h) == 0
+
+    def checkpoints(self):
+        if not self.pool:
+            ck = self.checkpoint_pos()
+            return [ck] if ck >= 0 else []
+        n = self.L.mk_checkpoints(self.h, None, 0)
+        out = (ctypes.c_int * max(n, 1))()
+        self.L.mk_checkpoints(self.h, out, n)
+        return list(out[:n])
+
+    def rewind_to(self, pos):
+        if not self.pool:
+            return pos == self.checkpoint_pos() and self.rewind_to_checkpoint()
+        return self.L.mk_rewind_to(self.h, pos) == 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -335,6 +366,17 @@ class Server:
         thinking = text.endswith("<think>\n")
         return text, thinking
 
+    def ck_positions(self, toks, start):
+        """checkpoints for a prefill of toks[start:] besides the generation prompt: each message start and every
+        --ck-every tokens (absolute positions; the engine keeps the most useful ones in its pool)"""
+        cks = set()
+        every = self.args.ck_every
+        if every > 0:
+            cks.update(range((start // every + 1) * every, len(toks) - 1, every))
+        if self.args.ck_msgs and self.im_start is not None:
+            cks.update(k for k in range(start + 1, len(toks) - 1) if toks[k] == self.im_start)
+        return sorted(cks)
+
     def load_prompt(self, toks):
         """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count)"""
         eng = self.eng
@@ -355,12 +397,13 @@ class Server:
                     break
         if seq and lcp >= eng.committed():
             eng.truncate(lcp)
-            return eng.prefill(toks[lcp:], gen), lcp
-        ck = eng.checkpoint_pos()
-        if 0 < ck <= lcp and eng.rewind_to_checkpoint():
-            return eng.prefill(toks[ck:], gen), ck
+            return eng.prefill(toks[lcp:], gen, self.ck_positions(toks, lcp)), lcp
+        # the last checkpoint at or before the divergence
+        ck = max((p for p in eng.checkpoints() if 0 < p <= lcp), default=0)
+        if ck and eng.rewind_to(ck):
+            return eng.prefill(toks[ck:], gen, self.ck_positions(toks, ck)), ck
         eng.reset()
-        return eng.prefill(toks, gen), 0
+        return eng.prefill(toks, gen, self.ck_positions(toks, 0)), 0
 
     def sampling(self, body):
         temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
@@ -556,6 +599,9 @@ def main():
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libqwen38mk.so"))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
+    ap.add_argument("--ck-every", type=int, default=4096,
+                    help="DeltaNet checkpoint every N prompt tokens (0: off); see MK_CK_SLOTS for the pool size")
+    ap.add_argument("--ck-msgs", type=int, default=1, help="DeltaNet checkpoint at each message start (1/0)")
     args = ap.parse_args()
     srv = Server(args)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))

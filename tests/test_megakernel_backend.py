@@ -248,5 +248,90 @@ class MegakernelServerParsingTests(unittest.TestCase):
             self.mk.normalize_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])
 
 
+
+class _FakeEngine:
+    """MKEngine's sequence / checkpoint semantics, without a GPU"""
+
+    def __init__(self):
+        self.seq, self.dn_c, self.cks, self.calls = [], 0, [], []
+
+    def sequence(self):
+        return list(self.seq)
+
+    def committed(self):
+        return self.dn_c
+
+    def checkpoints(self):
+        return sorted(self.cks)
+
+    def truncate(self, n):
+        self.seq = self.seq[:n]
+
+    def reset(self):
+        self.seq, self.dn_c, self.cks = [], 0, []
+        self.calls.append(("reset",))
+
+    def rewind_to(self, pos):
+        if pos not in self.cks:
+            return False
+        self.seq, self.dn_c = self.seq[:pos], pos
+        self.cks = [c for c in self.cks if c <= pos]
+        self.calls.append(("rewind", pos))
+        return True
+
+    def prefill(self, toks, ck_at=-1, cks=()):
+        n0 = len(self.seq)
+        self.seq += toks
+        self.cks += [c for c in [*cks, ck_at] if n0 < c < len(self.seq)]
+        self.dn_c = len(self.seq)
+        self.calls.append(("prefill", n0, len(toks), ck_at, tuple(cks)))
+        self.seq.append(7)  # the first generated token
+        return 7
+
+
+class MegakernelPromptReuseTests(unittest.TestCase):
+    IM = 1  # <|im_start|>
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = _load_mk_server()
+
+    def _server(self, every=8):
+        srv = object.__new__(self.mk.Server)
+        srv.eng, srv.im_start = _FakeEngine(), self.IM
+        srv.args = mock.Mock(ck_every=every, ck_msgs=1)
+        return srv
+
+    def test_checkpoints_at_message_starts_the_generation_prompt_and_every_n_tokens(self) -> None:
+        srv = self._server()
+        toks = [self.IM, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, self.IM, 5, 5, self.IM, 9, 9]
+        self.assertEqual(srv.load_prompt(toks), (7, 0))
+        self.assertEqual(srv.eng.calls, [("reset",), ("prefill", 0, len(toks), 15, (8, 12, 15, 16))])
+
+    def test_a_divergence_rewinds_to_the_last_checkpoint_before_it(self) -> None:
+        srv = self._server()
+        first = [self.IM, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, self.IM, 5, 5, self.IM, 9, 9]
+        srv.load_prompt(first)
+        srv.eng.dn_c = len(srv.eng.seq) + 5  # decoding went on
+        second = first[:14] + [6, 6, self.IM, 9, 9]  # diverges at 14: checkpoints 8, 12 are before it
+        self.assertEqual(srv.load_prompt(second), (7, 12))
+        self.assertEqual(srv.eng.calls[-2:], [("rewind", 12), ("prefill", 12, len(second) - 12, 16, (16,))])
+
+    def test_an_extension_of_the_sequence_is_appended_without_a_rewind(self) -> None:
+        srv = self._server(every=0)
+        first = [self.IM, 5, 5, self.IM, 9]
+        srv.load_prompt(first)
+        second = srv.eng.sequence() + [self.IM, 6, self.IM, 9]
+        self.assertEqual(srv.load_prompt(second), (7, len(first) + 1))
+        self.assertEqual(srv.eng.calls[-1], ("prefill", len(first) + 1, 4, len(second) - 2, (len(second) - 2,)))
+
+    def test_no_checkpoint_before_the_divergence_means_a_full_prefill(self) -> None:
+        srv = self._server(every=0)
+        srv.load_prompt([self.IM, 5, 5, self.IM, 9])
+        srv.eng.dn_c += 3
+        self.assertEqual(srv.load_prompt([self.IM, 6, 6, self.IM, 9]), (7, 0))
+        self.assertEqual(srv.eng.calls[-2][0], "reset")
+
+
 if __name__ == "__main__":
     unittest.main()
