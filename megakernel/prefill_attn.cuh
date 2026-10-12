@@ -566,59 +566,35 @@ __global__ void __launch_bounds__(256) pk_attn2_comb(int T, int nfull, int S, co
 // accumulation) straight from the cache's int8 K: no K conversion, half the S operand bytes, and int8 MMAs at 4x
 // the rate of pk_attn2's fp32-accumulated fp16 MMAs.  Q is quantized in the prologue per (row, 32-dim block) like
 // q8_0 (QROW: one scale per row) and stays in registers as int8 A fragments.  Each block's int32 partial is
-// scaled by q scale x k scale in fp32; the IMMA accumulates onto A8_BIAS (= 1.5 * 2^23 as fp32), so the int ->
-// float conversion is one FADD (|partial| <= 32 * 127 * 127 < 2^22).
-// With Q out of shared memory, the raw q8 K / V tiles (and V scales) stream through an A8_NS-stage cp.async ring
-// (prefetch distance A8_NS - 1 tiles; pk_attn2 prefetches one tile through registers).  K scales go through a
-// register to an fp32 [block][position] table; V is converted to fp16 (as pk_attn2) during S.  Not exact (Q
-// quantization).  Same work units, split and partials as pk_attn2 (pk_attn2_comb merges).
-#ifndef MK_A8_NS
-#define MK_A8_NS 3
-#endif
-constexpr int A8_NS = MK_A8_NS;      // ring stages
+// converted (I2FP) and scaled by q scale x k scale in fp32 (8 partials per score at HD 256; log2 e is folded into
+// the q scales and P = exp2(s - m)).
+// With Q out of shared memory, the raw q8 K / V tiles (and V scales) stream through a 3-stage cp.async ring; K scales
+// go through a register into an fp32 [block][position] table.  V(it + 1) is converted to fp16 during tile it into
+// the other half of a double-buffered fp16 V tile, so there is one block barrier per tile (pk_attn2: two).
+// Not exact (Q quantization; no measurable KLD change).  Same work units, split and partials as pk_attn2
+// (pk_attn2_comb merges; partials carry m in natural-log units).  Microbenchmark: bench/attn_bench.cu.
+constexpr int A8_NS = 3;             // ring stages (tile it + 1 must have landed at tile it's barrier)
 constexpr int A8_KLD = HD + 16;      // int8 K row stride (bytes): the 8 rows of an ldmatrix hit distinct banks
 constexpr int A8_KB = A2_K * A8_KLD; // K tile
 constexpr int A8_KSB = 8 * A2_K * 4; // K scales, fp32 [8 blocks][32 positions]
 constexpr int A8_VB = A2_K * HD;     // V tile (int8)
 constexpr int A8_VSB = A2_K * 8 * 2; // V scales, fp16 [32 positions][8 blocks] (cache layout)
 constexpr int A8_STG = A8_KB + A8_KSB + A8_VB + A8_VSB;
-#ifndef MK_A8_SV2
-#define MK_A8_SV2 1 // fp16 V tile double-buffered: V(it + 1) is converted during tile it, one block barrier per tile
-#endif
-constexpr int A8_NSV = MK_A8_SV2 ? 2 : 1;
-static_assert(!MK_A8_SV2 || A8_NS >= 3, "SV2 converts V(it + 1) during tile it: needs tile it + 1 landed at tile it's barrier");
-constexpr int A8_SMEM = A8_NS * A8_STG + A8_NSV * A2_K * A2_LD * 2 + A2_XCH;
+constexpr int A8_SMEM = A8_NS * A8_STG + 2 * A2_K * A2_LD * 2 + A2_XCH; // + 2 fp16 V tiles + exchange
 static_assert(A8_SMEM <= 99 * 1024, "pk_attn8 shared memory");
-constexpr int A8_BIAS = 0x4B400000;
-#ifndef MK_A8_CVT
-#define MK_A8_CVT 1
-#endif
-// int32 partial -> float: 0: the IMMA accumulates onto A8_BIAS (4 register moves per IMMA), one FADD;
-// 1: C = 0, cvt.rn.f32.s32; 2: C = 0, IADD + FADD (exact for |d| < 2^22)
+// int32 accumulation from zero; the int32 -> fp32 conversion compiles to I2FP.F32.S32 (full rate on sm_86, unlike I2F)
 __device__ __forceinline__ void a8_imma(int (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-#if MK_A8_CVT == 0
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(A8_BIAS));
-#else
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
-#endif
 }
-__device__ __forceinline__ float a8_i2f(int d) {
-#if MK_A8_CVT == 0
-    return __int_as_float(d) - 12582912.f;
-#elif MK_A8_CVT == 1
-    return __int2float_rn(d);
-#else
-    return __int_as_float(d + A8_BIAS) - 12582912.f;
-#endif
-}
+__device__ __forceinline__ float a8_i2f(int d) { return __int2float_rn(d); }
 
-// cp.async of tile rows kb .. kb + np - 1 (K, V and V scales) into ring stage st, rows >= np zeroed; one commit group
-__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np) {
-    for (int i = threadIdx.x; i < 33 * A2_K; i += A2_NT) { // 512 K chunks, 512 V chunks, 32 V scale rows of 16 B
+// chunk k (of 3) of this thread's cp.async share of tile rows kb .. kb + np - 1 (K, V and V scales) into ring stage
+// st, rows >= np zeroed.  Chunk kinds are warp-uniform (i = tid + 384 k: K < 512 <= V < 1024 <= V scales < 1056).
+__device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int k) {
+    const int i = threadIdx.x + A2_NT * k;
+    if (i < 33 * A2_K) {
         int p, off;
         const void * src;
         if (i < 16 * A2_K) {
@@ -638,6 +614,10 @@ __device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const 
         if (p < np) cp_async16(st + off, src);
         else *reinterpret_cast<int4 *>(st + off) = make_int4(0, 0, 0, 0);
     }
+}
+__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np) {
+#pragma unroll
+    for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k);
     pf::cpa_commit();
 }
 // K scales of tile rows kb ..: thread t < 256 loads position t >> 3, block t & 7; a8_st_ks stores it transposed as fp32
@@ -661,11 +641,13 @@ __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k) 
     }
 }
 
+// scores in log2 units: log2 e is folded into the Q scales, P = exp2(s - m)
+constexpr float A8_L2E = 1.4426950408889634f;
 template <bool QROW>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part) {
     extern __shared__ __align__(16) uint8_t asm_[];
-    __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [A8_NSV][32][A2_LD] fp16
-    float2 * xmax = reinterpret_cast<float2 *>(sV0 + A8_NSV * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
+    __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
+    float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
     uint4 * xp = reinterpret_cast<uint4 *>(xmax + 6 * 2 * 32);       // [6][2][32] P fragments
     float2 * xsum = reinterpret_cast<float2 *>(xp + 6 * 2 * 32);     // [6][32] half 0's partial row sums
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
@@ -742,8 +724,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                     ldq(b, rr, v);
                     am[rr] = qmax(v, am[rr]);
                 }
-            qs[0][0] = am[0] * (1.f / 127.f);
-            qs[0][1] = am[1] * (1.f / 127.f);
+            qs[0][0] = am[0] * (A8_L2E / 127.f);
+            qs[0][1] = am[1] * (A8_L2E / 127.f);
         }
 #pragma unroll
         for (int b = 0; b < 8; b++)
@@ -754,7 +736,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 float a = am[rr];
                 if constexpr (!QROW) {
                     a = qmax(v, 0.f);
-                    qs[b][rr] = a * (1.f / 127.f);
+                    qs[b][rr] = a * (A8_L2E / 127.f);
                 }
                 const float inv = a > 0.f ? 127.f / a : 0.f;
                 int w[8]; // low byte of 1.5 * 2^23 + round(v / scale) = the int8 value
@@ -765,14 +747,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             }
     }
 
-#if MK_A8_SV2
-    if (it0 < it1) { // V(it0) -> fp16
+    if (it0 < it1) { // V(it0) -> fp16 (later tiles: V(it + 1) during tile it)
         pf::cpa_wait<A8_NS - 2>();
         __syncthreads();
 #pragma unroll
         for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k);
     }
-#endif
     float o[16][4];
 #pragma unroll
     for (int j = 0; j < 16; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
@@ -789,21 +769,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
 
     for (int it = it0; it < it1; it++) {
         const int kb = it * A2_K;
-#if MK_A8_SV2
         pf::cpa_wait<0>(); // own copies of tiles it and it + 1
         __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
         __half * sVc = sV0 + ((it + 1) & 1) * A2_K * A2_LD; // V(it + 1) is converted into it during this tile
         const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
         const uint8_t * stv = asm_ + ((it + 1) % A8_NS) * A8_STG;
         const bool cvn = it + 1 < it1;
-#else
-        pf::cpa_wait<A8_NS - 2>(); // own copies of tile it
-        __syncthreads();           // everyone's copies of tile it landed; every warp is done with tile it - 1
-        __half * sVc = sV0;
-        const unsigned va = va0;
-        const uint8_t * stv = asm_ + (it % A8_NS) * A8_STG;
-        constexpr bool cvn = true;
-#endif
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + (ia % A8_NS) * A8_STG;
         float ksn = 0.f;
@@ -850,7 +821,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 s[1][2] = fmaf(a8_i2f(d1[2]), q1 * k1.x, s[1][2]);
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
-            // V(it) (SV2: V(it + 1)) -> fp16 (buffer free since the barrier above) between the MMAs
+            // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
             if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1);
         }
         if constexpr (QROW) {
@@ -886,15 +857,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             mx1 = fmaxf(mx1, t.y);
         }
         const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
-        const float al0 = mn0 == -INFINITY ? 1.f : expf(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : expf(m1 - mn1);
+        const float al0 = mn0 == -INFINITY ? 1.f : exp2f(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : exp2f(m1 - mn1);
         float x0[2], x1[2];
         unsigned pa[2][2];
 #pragma unroll
         for (int ni = 0; ni < 2; ni++) {
-            const float p0 = mn0 == -INFINITY ? 0.f : expf(s[ni][0] - mn0);
-            const float p1 = mn0 == -INFINITY ? 0.f : expf(s[ni][1] - mn0);
-            const float p2 = mn1 == -INFINITY ? 0.f : expf(s[ni][2] - mn1);
-            const float p3 = mn1 == -INFINITY ? 0.f : expf(s[ni][3] - mn1);
+            const float p0 = mn0 == -INFINITY ? 0.f : exp2f(s[ni][0] - mn0);
+            const float p1 = mn0 == -INFINITY ? 0.f : exp2f(s[ni][1] - mn0);
+            const float p2 = mn1 == -INFINITY ? 0.f : exp2f(s[ni][2] - mn1);
+            const float p3 = mn1 == -INFINITY ? 0.f : exp2f(s[ni][3] - mn1);
             x0[ni] = p0 + p1;
             x1[ni] = p2 + p3;
             __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
@@ -930,9 +901,6 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         m0 = mn0;
         m1 = mn1;
         const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth;
-#if !MK_A8_SV2
-        __syncthreads(); // sV = V(it)
-#endif
         // O += P V for this warp's 128 dims (fp16-accumulated per tile, as pk_attn2's PV16)
         {
             const unsigned A0[4] = {P0.x, P0.y, P0.z, P0.w}, A1[4] = {P1.x, P1.y, P1.z, P1.w};
@@ -988,8 +956,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         }
         if (hf && t4 == 0) {
             float2 * ml = reinterpret_cast<float2 *>(pp + 6 * A2_Q * HD);
-            ml[r0] = make_float2(m0, l0);
-            ml[r0 + 8] = make_float2(m1, l1);
+            ml[r0] = make_float2(m0 * (1.f / A8_L2E), l0); // natural-log units for pk_attn2_comb
+            ml[r0 + 8] = make_float2(m1 * (1.f / A8_L2E), l1);
         }
     }
 }
+

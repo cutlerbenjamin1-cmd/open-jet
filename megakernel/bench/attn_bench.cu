@@ -1,9 +1,13 @@
 // Correctness + throughput of the prefill attention kernels (prefill_attn.cuh) on a random q8 (or fp16) KV
-// cache: the original pk_attn against pk_attn2 (exact, + tail split, + split and fp16 P.V).
+// cache: the original pk_attn against pk_attn2 (exact, + tail split, + split and fp16 P.V) and pk_attn8 (int8
+// Q K^T, q8 cache only; Q scales per 32-dim block / per row).
 //   nvcc -O3 -arch=sm_86 -std=c++17 -Xptxas -dlcm=cg attn_bench.cu -o attn_bench
 //   ./attn_bench <ctx> <reps> [f16] <T:n0> ...      e.g. ./attn_bench 101100 3 1024:30000 1024:100000
 // Per config (T queries at positions n0 .., one layer): ms per launch (min of reps), achieved TFLOPS (causal
-// FLOPs), and per variant the number of outputs that differ from pk_attn (0 for exact pk_attn2) and max |diff|.
+// FLOPs), and per variant the number of outputs that differ from pk_attn (0 for exact pk_attn2), max |diff| and the
+// relative rms difference.  AB_VARS=<digits> selects variants (0 old, 1 new, 2 split, 3 split + PV16, 4 s8, 5 s8row;
+// default all); TRUEREF=1 (q8) also reports each variant's relative rms error against pk_attn on the unquantized
+// fp16 cache (the q8 cache's own error is the "old" line).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -82,6 +86,7 @@ __device__ __forceinline__ __half2 u2h(unsigned u) { return *reinterpret_cast<__
 #include "../prefill_attn.cuh"
 
 int g_slots = 0;
+void *g_kcf = nullptr, *g_vcf = nullptr;
 float * g_part = nullptr;
 size_t g_part_floats = 0;
 
@@ -97,6 +102,12 @@ void launch(int variant, bool q8, int T, int n0) {
     int nfull = N, S = 1;
     if (variant >= 2) a2_plan(T, n0, g_slots, g_part_floats, nfull, S);
     const int grid = nfull + (N - nfull) * S;
+    if (variant >= 4) {
+        if (variant == 4) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n0, slot, nfull, S, g_part);
+        else pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n0, slot, nfull, S, g_part);
+        if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, g_part);
+        return;
+    }
     const bool pv16 = variant == 3;
     if (q8 && !pv16) pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n0, slot, nfull, S, g_part);
     else if (q8) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n0, slot, nfull, S, g_part);
@@ -129,6 +140,8 @@ int main(int argc, char ** argv) {
     CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
     CK(cudaFuncSetAttribute(pk_attn2<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
     CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+    CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     int nsm = 0, occ = 0;
     CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
@@ -156,6 +169,12 @@ int main(int argc, char ** argv) {
                     sc[r * (HD / 32) + b] = __float2half(am / 127.f);
                 }
             void * d;
+            if (q8 && getenv("TRUEREF")) { // unquantized fp16 copy for the true reference
+                void * f;
+                CK(cudaMalloc(&f, rows * HD * 2));
+                CK(cudaMemcpy(f, hv.data(), rows * HD * 2, cudaMemcpyHostToDevice));
+                (which ? g_vcf : g_kcf) = f;
+            }
             if (q8) {
                 CK(cudaMalloc(&d, rows * HD));
                 CK(cudaMemcpy(d, q.data(), rows * HD, cudaMemcpyHostToDevice));
@@ -190,7 +209,7 @@ int main(int argc, char ** argv) {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    const char * names[4] = {"old", "new", "new+split", "new+split+pv16"};
+    const char * names[6] = {"old", "new", "new+split", "new+split+pv16", "s8+split", "s8row+split"};
     for (auto [T, n0] : cfg) {
         const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV;
         int nfull = N, S = 1;
@@ -199,8 +218,20 @@ int main(int argc, char ** argv) {
         double flop = 0;
         for (int t = 0; t < T; t++) flop += 4.0 * HD * NH * (double) (n0 + t + 1);
         printf("T %d n0 %d: items %d, plan nfull %d split S %d\n", T, n0, N, nfull, S);
-        std::vector<float> ref((size_t) T * VD), out((size_t) T * VD);
-        for (int v = 0; v < 4; v++) {
+        std::vector<float> ref((size_t) T * VD), out((size_t) T * VD), tref;
+        if (g_kcf) { // true reference: original kernel on the unquantized fp16 cache
+            Bufs bf{g_kcf, g_vcf, nullptr, nullptr, 0, ctx};
+            CK(cudaMemcpyToSymbol(cB, &bf, sizeof bf));
+            pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, 0);
+            CK(cudaDeviceSynchronize());
+            tref.resize((size_t) T * VD);
+            CK(cudaMemcpy(tref.data(), y2, tref.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpyToSymbol(cB, &b, sizeof b));
+        }
+        const char * vsel = getenv("AB_VARS") ? getenv("AB_VARS") : "0123";
+        for (int v = 0; v < 6; v++) {
+            if (!strchr(vsel, '0' + v)) continue;
+            if (v >= 4 && !q8) continue; // pk_attn8 reads the q8 cache
             CK(cudaMemset(y2, 0xff, (size_t) T * VD * 4)); // NaN
             launch(v, q8, T, n0);
             CK(cudaDeviceSynchronize());
@@ -217,16 +248,24 @@ int main(int argc, char ** argv) {
                 best = std::min(best, ms);
             }
             printf("  %-15s %9.3f ms  %6.2f TFLOPS", names[v], best, flop / best / 1e9);
+            if (!tref.empty()) {
+                const std::vector<float> & o = v == 0 ? ref : out;
+                double sd = 0, sr = 0;
+                for (size_t i = 0; i < o.size(); i++) { sd += (double) (o[i] - tref[i]) * (o[i] - tref[i]); sr += (double) tref[i] * tref[i]; }
+                printf("  vs-fp16-cache rel-rms %.4g", std::sqrt(sd / sr));
+            }
             if (v > 0) {
                 size_t nbits = 0, nnan = 0;
-                double md = 0, mref = 0;
+                double md = 0, mref = 0, sd = 0, sr = 0;
                 for (size_t i = 0; i < out.size(); i++) {
                     if (std::isnan(out[i])) { nnan++; continue; }
                     if (memcmp(&out[i], &ref[i], 4)) nbits++;
                     md = std::max(md, (double) std::fabs(out[i] - ref[i]));
+                    sd += (double) (out[i] - ref[i]) * (out[i] - ref[i]);
+                    sr += (double) ref[i] * ref[i];
                     mref = std::max(mref, (double) std::fabs(ref[i]));
                 }
-                printf("  differing %zu / %zu, NaN %zu, max|d| %.3g (max|ref| %.3g)", nbits, out.size(), nnan, md, mref);
+                printf("  differing %zu / %zu, NaN %zu, max|d| %.3g (max|ref| %.3g) rel-rms %.3g", nbits, out.size(), nnan, md, mref, sr > 0 ? std::sqrt(sd / sr) : 0.0);
             }
             printf("\n");
         }

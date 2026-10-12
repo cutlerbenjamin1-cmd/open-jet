@@ -3298,11 +3298,14 @@ struct MKEngine::Impl {
 
     // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh: one fused GEMM when gate and
     // up share a type with in-row scales, else two GEMMs into y0 / y1 and pk_glu
+    static bool glu_fused(const Mat & g, const Mat & u) {
+        return g.type == u.type && g.rb == u.rb && (g.type == T_Q4K || g.type == T_Q5K || g.type == T_IQ4X);
+    }
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
-        if (g.type == u.type && g.rb == u.rb) {
+        if (glu_fused(g, u)) {
             switch (g.type) {
                 case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w); return;
                 case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w); return;
@@ -3322,7 +3325,7 @@ struct MKEngine::Impl {
     template <class F> void pf_time(const char * cat, F f) {
         if (!pf_prof) { f(); return; }
         // MK_PF_PROFILE=2: idempotent kernels are timed alone (5 repeats, min)
-        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_dn_in", "gemm_attn_qkv"};
+        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_ffn_gu2", "gemm_dn_in", "gemm_attn_qkv"};
         if (getenv("MK_PF_PROFILE")[0] == '2' && std::any_of(std::begin(idem), std::end(idem), [&](const char * c) { return !strcmp(c, cat); })) {
             float best = 1e30f;
             for (int r = 0; r < 5; r++) {
@@ -3423,7 +3426,8 @@ struct MKEngine::Impl {
                     dl++;
                 }
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.post_norm); });
-                pf_time("gemm_ffn_gu", [&] { gemm_glu(W.fg, W.fu, T); });
+                // (profile: gate / up pairs that run as two GEMMs + pk_glu are reported as gemm_ffn_gu2)
+                pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : "gemm_ffn_gu2", [&] { gemm_glu(W.fg, W.fu, T); });
                 pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
             }
             if (pred || sink) {
