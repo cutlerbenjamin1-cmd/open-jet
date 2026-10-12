@@ -1,0 +1,572 @@
+// Prefill attention kernels.  Included from prefill.cuh inside qwen38_mk.cu's anonymous namespace (and by the
+// standalone microbenchmark notes/prefill/attn_bench.cu with a minimal environment).  Uses NH, NKV, HD, VD,
+// cB (kc, vc, ksc, vsc, ctx), cP (qh, y2), cp_async16, q8_to_f16, mma16816 and pf:: cpa_commit, cpa_wait,
+// ldsm_x4, hmma16, hmma16z, u2h.
+
+// Causal flash attention over the cache for the chunk's queries.  CTA = (16 query positions, kv
+// head); warp = one of the 6 query heads of the group (16 rows).  K / V tiles of 32 positions in
+// shared memory, S = Q K^T and O += P V on tensor cores (fp16 operands, fp32 accumulation).
+constexpr int AT_Q = 16, AT_K = 32, AT_LD = HD + 8;
+constexpr int AT_SMEM = (6 * AT_Q + 2 * AT_K) * AT_LD * 2; // Q, K/V tile
+template <bool Q8>
+__global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
+    extern __shared__ __align__(16) uint8_t asm_[];
+    __half * sQ = reinterpret_cast<__half *>(asm_); // [96][AT_LD]
+    __half * sK = sQ + 6 * AT_Q * AT_LD;            // [32][AT_LD]
+    __half * sV = sK + AT_K * AT_LD;                // [32][AT_LD]
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
+    const int t0 = blockIdx.x * AT_Q, g = blockIdx.y;
+    const size_t ctx = cB.ctx;
+    const size_t row0 = ((size_t) slot * NKV + g) * ctx;
+    const __half * Kc = static_cast<const __half *>(cB.kc) + row0 * HD;
+    const __half * Vc = static_cast<const __half *>(cB.vc) + row0 * HD;
+    const int nq = min(AT_Q, T - t0);
+    for (int i = tid; i < 6 * AT_Q * 32; i += 192) { // 96 rows x 32 chunks of 16 B
+        const int r = i >> 5, c = i & 31, hq = r / AT_Q, tt = r % AT_Q;
+        __half * d = sQ + r * AT_LD + 8 * c;
+        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH + g * 6 + hq) * HD + 8 * c);
+        else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+    }
+    pf::cpa_commit();
+    const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f; // rows g8, g8 + 8
+    const int qr0 = qpos0 + g8, qr1 = qpos0 + g8 + 8;
+    const __half * qa = sQ + (warp * AT_Q + g8) * AT_LD + 2 * t4;
+    for (int kb = 0; kb <= pmax; kb += AT_K) {
+        const int np = min(AT_K, pmax + 1 - kb);
+        if constexpr (Q8) { // q8 K/V tile -> fp16 in shared memory (all loads issued before the first conversion)
+            constexpr int PER = (2 * AT_K * 32 + 191) / 192;
+            uint2 q[PER];
+            float d[PER];
+#pragma unroll
+            for (int k = 0; k < PER; k++) {
+                const int i = tid + 192 * k, which = i / (AT_K * 32), r = (i >> 5) % AT_K, c = i & 31;
+                q[k] = make_uint2(0, 0);
+                d[k] = 0.f;
+                if (i < 2 * AT_K * 32 && r < np) {
+                    const size_t row = row0 + kb + r;
+                    q[k] = __ldg(reinterpret_cast<const uint2 *>(static_cast<const int8_t *>(which ? cB.vc : cB.kc) + row * HD) + c);
+                    d[k] = __half2float((which ? cB.vsc : cB.ksc)[row * (HD / 32) + (c >> 2)]);
+                }
+            }
+            pf::cpa_wait<0>(); // Q rows (first tile)
+#pragma unroll
+            for (int k = 0; k < PER; k++) {
+                const int i = tid + 192 * k, which = i / (AT_K * 32), r = (i >> 5) % AT_K, c = i & 31;
+                if (i >= 2 * AT_K * 32) break;
+                __half2 h[4];
+                q8_to_f16(q[k], d[k], h);
+                *reinterpret_cast<int4 *>((which ? sV : sK) + r * AT_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
+            }
+        } else {
+            for (int i = tid; i < AT_K * 32; i += 192) {
+                const int p = i >> 5, c = i & 31;
+                if (p < np) {
+                    cp_async16(sK + p * AT_LD + 8 * c, Kc + (size_t) (kb + p) * HD + 8 * c);
+                    cp_async16(sV + p * AT_LD + 8 * c, Vc + (size_t) (kb + p) * HD + 8 * c);
+                } else {
+                    *reinterpret_cast<int4 *>(sK + p * AT_LD + 8 * c) = make_int4(0, 0, 0, 0);
+                    *reinterpret_cast<int4 *>(sV + p * AT_LD + 8 * c) = make_int4(0, 0, 0, 0);
+                }
+            }
+            pf::cpa_commit();
+            pf::cpa_wait<0>();
+        }
+        __syncthreads();
+        float s[4][4];
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
+#pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++) {
+            const unsigned a0 = *reinterpret_cast<const unsigned *>(qa + 16 * ks);
+            const unsigned a1 = *reinterpret_cast<const unsigned *>(qa + 8 * AT_LD + 16 * ks);
+            const unsigned a2 = *reinterpret_cast<const unsigned *>(qa + 16 * ks + 8);
+            const unsigned a3 = *reinterpret_cast<const unsigned *>(qa + 8 * AT_LD + 16 * ks + 8);
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) {
+                const __half * kp = sK + (8 * ni + g8) * AT_LD + 2 * t4 + 16 * ks;
+                mma16816(s[ni], a0, a1, a2, a3, *reinterpret_cast<const unsigned *>(kp),
+                         *reinterpret_cast<const unsigned *>(kp + 8));
+            }
+        }
+        // causal mask + online softmax (rows g8 and g8 + 8; a row's 4 lanes share it)
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++) {
+            const int p = kb + 8 * ni + 2 * t4;
+            if (p > qr0) s[ni][0] = -INFINITY;
+            if (p + 1 > qr0) s[ni][1] = -INFINITY;
+            if (p > qr1) s[ni][2] = -INFINITY;
+            if (p + 1 > qr1) s[ni][3] = -INFINITY;
+            mx0 = fmaxf(mx0, fmaxf(s[ni][0], s[ni][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[ni][2], s[ni][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = mn0 == -INFINITY ? 1.f : expf(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : expf(m1 - mn1);
+        float ps0 = 0.f, ps1 = 0.f;
+        unsigned pa[4][2]; // P as fp16 pairs: [n8 tile][row g8 / g8 + 8]
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++) {
+            const float p0 = mn0 == -INFINITY ? 0.f : expf(s[ni][0] - mn0);
+            const float p1 = mn0 == -INFINITY ? 0.f : expf(s[ni][1] - mn0);
+            const float p2 = mn1 == -INFINITY ? 0.f : expf(s[ni][2] - mn1);
+            const float p3 = mn1 == -INFINITY ? 0.f : expf(s[ni][3] - mn1);
+            ps0 += p0 + p1;
+            ps1 += p2 + p3;
+            __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
+            pa[ni][0] = *reinterpret_cast<unsigned *>(&h01);
+            pa[ni][1] = *reinterpret_cast<unsigned *>(&h23);
+        }
+        ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
+        ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
+        ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
+        ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
+        l0 = l0 * al0 + ps0;
+        l1 = l1 * al1 + ps1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            o[i][0] *= al0;
+            o[i][1] *= al0;
+            o[i][2] *= al1;
+            o[i][3] *= al1;
+        }
+        // O += P V: k = positions (2 steps of 16), n = 32 tiles of 8 dims
+#pragma unroll
+        for (int ks = 0; ks < AT_K / 16; ks++) {
+            const unsigned a0 = pa[2 * ks][0], a1 = pa[2 * ks][1], a2 = pa[2 * ks + 1][0], a3 = pa[2 * ks + 1][1];
+#pragma unroll
+            for (int dt2 = 0; dt2 < 16; dt2++) { // two 8-dim tiles per ldmatrix.x4
+                const __half * vb = sV + (16 * ks + (lane & 15)) * AT_LD + 16 * dt2 + (lane >> 4) * 8;
+                unsigned b0, b1, b2, b3;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                             : "r"((unsigned) __cvta_generic_to_shared(vb)));
+                mma16816(o[2 * dt2], a0, a1, a2, a3, b0, b1);
+                mma16816(o[2 * dt2 + 1], a0, a1, a2, a3, b2, b3);
+            }
+        }
+        __syncthreads();
+    }
+    const float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
+    const int hq = g * 6 + warp;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+        const int d = 8 * i + 2 * t4;
+        if (g8 < nq) {
+            float * dst = cP.y2 + (size_t) (t0 + g8) * VD + hq * HD + d;
+            dst[0] = o[i][0] * il0;
+            dst[1] = o[i][1] * il0;
+        }
+        if (g8 + 8 < nq) {
+            float * dst = cP.y2 + (size_t) (t0 + g8 + 8) * VD + hq * HD + d;
+            dst[0] = o[i][2] * il1;
+            dst[1] = o[i][3] * il1;
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// pk_attn2: the same causal flash attention, restructured for sm_86.
+// CTA = 16 query positions x one kv head (6 q heads x 16 rows), as pk_attn, but 12 warps: warps 2 h and
+// 2 h + 1 serve q head h.  For each 32-position K / V tile, warp half j computes S for positions
+// 16 j .. 16 j + 15 (each element the same k = 256 MMA chain as pk_attn) and O += P V for head dims
+// 128 j .. 128 j + 127, so o takes 64 registers instead of 128 and the 4 SMSPs get 3 warps each.  The pair
+// exchanges row maxima, P and partial row sums through shared memory in an order that reproduces
+// pk_attn's arithmetic exactly (bit-identical output without PV16).  Loads overlap compute: V of tile i
+// arrives during S of tile i, K of tile i + 1 during P V of tile i (q8: register prefetch converted to
+// fp16 in shared memory after the phase; fp16 cache: cp.async).
+// PV16: P V of each tile accumulated in fp16 (full-rate tensor cores on GeForce), then added to the fp32
+// accumulators (not exact).
+// Work units: blockIdx.x < nfull: item blockIdx.x (q tile fastest, then kv head), all tiles, final output.
+// Units beyond nfull split each remaining item into S tile ranges whose partial (o, m, l) go to `part`
+// and are merged by pk_attn2_comb: the last wave of equal-sized items is otherwise mostly idle.
+#ifndef MK_A2_I2F
+#define MK_A2_I2F 0 // 1: q8 -> fp16 through q8_to_f16 (I2F) instead of the byte_perm path (same values)
+#endif
+#ifndef MK_A2_SCHED
+#define MK_A2_SCHED 1 // 1: q8 tile conversions interleaved with the MMA loops; 0: after them
+#endif
+constexpr int A2_Q = 16, A2_K = 32, A2_LD = HD + 8, A2_NT = 384;
+constexpr int A2_XCH = 6 * 32 * (2 * 8 + 2 * 16 + 8); // per head pair: maxima, P fragments, partial sums
+constexpr int A2_SMEM = (6 * A2_Q + 2 * A2_K) * A2_LD * 2 + A2_XCH;
+constexpr int A2_PART = 6 * A2_Q * HD + 2 * 6 * A2_Q; // floats per partial: o [96][HD], then (m, l) [96]
+static_assert(A2_SMEM <= 99 * 1024, "pk_attn2 shared memory");
+
+// Host: work split for a chunk of T queries at n0 on `slots` resident CTAs.  The items of the last, partial
+// wave (the highest q tiles of the last kv heads) are split into S tile ranges when that shortens the tail;
+// S = 1 / nfull = all items: no split.  part_floats: capacity of the partials buffer.
+inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, int & S) {
+    const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV, rem = slots > 0 ? N % slots : 0;
+    nfull = N;
+    S = 1;
+    if (rem == 0) return;
+    const int qt = (N - rem) % nqt; // smallest tail item
+    const int ntile_min = (n0 + qt * A2_Q + std::min(A2_Q, T - qt * A2_Q) - 1) / A2_K + 1;
+    const int smax = std::min(std::min(32, ntile_min / 2), (int) std::min<size_t>(1024, part_floats / ((size_t) A2_PART * rem)));
+    double best = 1.0; // tail length in item times
+    for (int s = 2; s <= smax; s++) {
+        const double t = (double) ((rem * s + slots - 1) / slots) / s;
+        if (t < best - 0.02) {
+            best = t;
+            S = s;
+        }
+    }
+    if (S > 1) nfull = N - rem;
+}
+
+__device__ __forceinline__ void a2_pair_sync(int hq) { asm volatile("bar.sync %0, 64;" ::"r"(1 + hq) : "memory"); }
+
+__device__ __forceinline__ void a2_ldsm_t(unsigned (&r)[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// q8 K or V tile in registers: 32 rows x 32 chunks of 8 values, chunk i = tid + A2_NT k
+struct A2Q8 {
+    uint2 q[3];
+    __half d[3];
+};
+__device__ __forceinline__ void a2_ld_q8(A2Q8 & r, const int8_t * rows, const __half * sc, int np) {
+#pragma unroll
+    for (int k = 0; k < 3; k++) {
+        const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
+        r.q[k] = make_uint2(0, 0);
+        r.d[k] = __ushort_as_half(0);
+        if (i < A2_K * 32 && p < np) {
+            r.q[k] = __ldg(reinterpret_cast<const uint2 *>(rows + (size_t) p * HD) + c);
+            r.d[k] = sc[(size_t) p * (HD / 32) + (c >> 2)];
+        }
+    }
+}
+// 8 q8 values + fp16 scale -> 4 fp16 pairs, bit-identical to q8_to_f16: 0x6400 | (q ^ 0x80) is 1152 + q exactly,
+// and d * q is rounded once to fp16 either way (exact in fp32 there).  No I2F (quarter rate on sm_86).
+__device__ __forceinline__ void a2_q8h(uint2 q, __half d, __half2 (&h)[4]) {
+    const unsigned x = q.x ^ 0x80808080u, y = q.y ^ 0x80808080u;
+    const __half2 off = __half2half2(__ushort_as_half(0x6480)), dd = __half2half2(d);
+    h[0] = __hmul2(__hsub2(pf::u2h(__byte_perm(x, 0x64646464u, 0x4140)), off), dd);
+    h[1] = __hmul2(__hsub2(pf::u2h(__byte_perm(x, 0x64646464u, 0x4342)), off), dd);
+    h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(y, 0x64646464u, 0x4140)), off), dd);
+    h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(y, 0x64646464u, 0x4342)), off), dd);
+}
+// chunk k of the tile -> fp16 rows in shared memory
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k) {
+    const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
+    if (i < A2_K * 32) {
+        __half2 h[4];
+#if MK_A2_I2F
+        q8_to_f16(r.q[k], __half2float(r.d[k]), h);
+#else
+        a2_q8h(r.q[k], r.d[k], h);
+#endif
+        *reinterpret_cast<int4 *>(dst + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
+    }
+}
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst) {
+#pragma unroll
+    for (int k = 0; k < 3; k++) a2_st_q8(r, dst, k);
+}
+// fp16 K or V tile -> shared memory (cp.async, one commit group); rows >= np zeroed
+__device__ __forceinline__ void a2_cp_f16(__half * dst, const __half * src, int np) {
+    for (int i = threadIdx.x; i < A2_K * 32; i += A2_NT) {
+        const int p = i >> 5, c = i & 31;
+        if (p < np) cp_async16(dst + p * A2_LD + 8 * c, src + (size_t) p * HD + 8 * c);
+        else *reinterpret_cast<int4 *>(dst + p * A2_LD + 8 * c) = make_int4(0, 0, 0, 0);
+    }
+    pf::cpa_commit();
+}
+
+template <bool Q8, bool PV16>
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, int nfull, int S, float * __restrict__ part) {
+    extern __shared__ __align__(16) uint8_t asm_[];
+    __half * sQ = reinterpret_cast<__half *>(asm_); // [96][A2_LD]
+    __half * sK = sQ + 6 * A2_Q * A2_LD;            // [32][A2_LD]
+    __half * sV = sK + A2_K * A2_LD;                // [32][A2_LD]
+    float2 * xmax = reinterpret_cast<float2 *>(sV + A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
+    uint4 * xp = reinterpret_cast<uint4 *>(xmax + 6 * 2 * 32);     // [6][2][32] P fragments
+    float2 * xsum = reinterpret_cast<float2 *>(xp + 6 * 2 * 32);   // [6][32] half 0's partial row sums
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
+    const int hq = warp >> 1, hf = warp & 1;
+    // work unit -> (q tile, kv head, tile range)
+    const int nqt = (T + A2_Q - 1) / A2_Q;
+    int item = blockIdx.x, seg = 0, nseg = 1;
+    if (item >= nfull) {
+        const int v = item - nfull;
+        item = nfull + v / S;
+        seg = v % S;
+        nseg = S;
+    }
+    const int qt = item % nqt, g = item / nqt;
+    const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
+    const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
+    const int ntile = pmax / A2_K + 1;
+    const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
+    const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
+    const int8_t * Kq = static_cast<const int8_t *>(cB.kc) + row0 * HD;
+    const int8_t * Vq = static_cast<const int8_t *>(cB.vc) + row0 * HD;
+    const __half * Kh = static_cast<const __half *>(cB.kc) + row0 * HD;
+    const __half * Vh = static_cast<const __half *>(cB.vc) + row0 * HD;
+    const __half * Ks = cB.ksc + row0 * (HD / 32);
+    const __half * Vs = cB.vsc + row0 * (HD / 32);
+
+    for (int i = tid; i < 6 * A2_Q * 32; i += A2_NT) { // 96 rows x 32 chunks of 16 B
+        const int r = i >> 5, c = i & 31, h = r / A2_Q, tt = r % A2_Q;
+        __half * d = sQ + r * A2_LD + 8 * c;
+        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH + g * 6 + h) * HD + 8 * c);
+        else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+    }
+    pf::cpa_commit();
+    A2Q8 rq; // q8: V of the current tile, or K of the next one, in flight
+    if (it0 < it1) {
+        const int kb = it0 * A2_K, np = min(A2_K, pmax + 1 - kb);
+        if constexpr (Q8) {
+            a2_ld_q8(rq, Kq + (size_t) kb * HD, Ks + (size_t) kb * (HD / 32), np);
+            a2_st_q8(rq, sK);
+            a2_ld_q8(rq, Vq + (size_t) kb * HD, Vs + (size_t) kb * (HD / 32), np);
+        } else {
+            a2_cp_f16(sK, Kh + (size_t) kb * HD, np);
+        }
+    }
+
+    float o[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f; // rows g8, g8 + 8 (l: kept by half 1)
+    const int qr0 = qpos0 + g8, qr1 = qpos0 + g8 + 8;
+    const unsigned qa = (unsigned) __cvta_generic_to_shared(sQ + (hq * A2_Q + (lane & 15)) * A2_LD + (lane >> 4) * 8);
+    const unsigned ka = (unsigned) __cvta_generic_to_shared(sK + (16 * hf + ((lane >> 4) << 3) + (lane & 7)) * A2_LD + ((lane >> 3) & 1) * 8);
+    const unsigned va = (unsigned) __cvta_generic_to_shared(sV + (lane & 15) * A2_LD + 128 * hf + (lane >> 4) * 8);
+    float2 * mx_own = xmax + (2 * hq + hf) * 32 + lane;
+    const float2 * mx_oth = xmax + (2 * hq + (hf ^ 1)) * 32 + lane;
+    uint4 * p_own = xp + (2 * hq + hf) * 32 + lane;
+    const uint4 * p_oth = xp + (2 * hq + (hf ^ 1)) * 32 + lane;
+    float2 * xs = xsum + hq * 32 + lane;
+
+    for (int it = it0; it < it1; it++) {
+        const int kb = it * A2_K;
+        const int kn = kb + A2_K, npn = min(A2_K, pmax + 1 - kn); // next tile
+        pf::cpa_wait<0>(); // Q (first tile); fp16: K of this tile
+        __syncthreads();   // sK = K(it); every warp is done with P V of it - 1, so sV is free
+        if constexpr (!Q8) a2_cp_f16(sV, Vh + (size_t) kb * HD, min(A2_K, pmax + 1 - kb));
+        // S = Q K^T for this warp's 16 positions (n8 tiles ni = 2 hf, 2 hf + 1 of pk_attn)
+        float s[2][4];
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
+#pragma unroll
+        for (int ks = 0; ks < HD / 16; ks++) {
+            unsigned a[4], b[4];
+            pf::ldsm_x4(a, qa + 32 * ks);
+            pf::ldsm_x4(b, ka + 32 * ks);
+            mma16816(s[0], a[0], a[1], a[2], a[3], b[0], b[1]);
+            mma16816(s[1], a[0], a[1], a[2], a[3], b[2], b[3]);
+            // V(it) -> sV (free since the barrier above) between the MMAs, late enough for the loads to have landed
+            if constexpr (Q8 && MK_A2_SCHED)
+                if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2);
+        }
+        // causal mask, row maxima over the pair
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) {
+            const int p = kb + 16 * hf + 8 * ni + 2 * t4;
+            if (p > qr0) s[ni][0] = -INFINITY;
+            if (p + 1 > qr0) s[ni][1] = -INFINITY;
+            if (p > qr1) s[ni][2] = -INFINITY;
+            if (p + 1 > qr1) s[ni][3] = -INFINITY;
+            mx0 = fmaxf(mx0, fmaxf(s[ni][0], s[ni][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[ni][2], s[ni][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        *mx_own = make_float2(mx0, mx1);
+        a2_pair_sync(hq);
+        {
+            const float2 t = *mx_oth;
+            mx0 = fmaxf(mx0, t.x);
+            mx1 = fmaxf(mx1, t.y);
+        }
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = mn0 == -INFINITY ? 1.f : expf(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : expf(m1 - mn1);
+        float x0[2], x1[2]; // per n8 tile: p0 + p1 (row g8), p2 + p3 (row g8 + 8)
+        unsigned pa[2][2];
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) {
+            const float p0 = mn0 == -INFINITY ? 0.f : expf(s[ni][0] - mn0);
+            const float p1 = mn0 == -INFINITY ? 0.f : expf(s[ni][1] - mn0);
+            const float p2 = mn1 == -INFINITY ? 0.f : expf(s[ni][2] - mn1);
+            const float p3 = mn1 == -INFINITY ? 0.f : expf(s[ni][3] - mn1);
+            x0[ni] = p0 + p1;
+            x1[ni] = p2 + p3;
+            __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
+            pa[ni][0] = *reinterpret_cast<unsigned *>(&h01);
+            pa[ni][1] = *reinterpret_cast<unsigned *>(&h23);
+        }
+        const uint4 pown = make_uint4(pa[0][0], pa[0][1], pa[1][0], pa[1][1]);
+        *p_own = pown;
+        if (hf == 0) { // pk_attn's per-thread row sums run over n8 tiles 0, 1, 2, 3 in order: half 0 starts them
+            float ps0 = 0.f, ps1 = 0.f;
+            ps0 += x0[0];
+            ps0 += x0[1];
+            ps1 += x1[0];
+            ps1 += x1[1];
+            *xs = make_float2(ps0, ps1);
+        }
+        a2_pair_sync(hq);
+        const uint4 poth = *p_oth;
+        if (hf == 1) { // ... and half 1 finishes them
+            const float2 t = *xs;
+            float ps0 = t.x, ps1 = t.y;
+            ps0 += x0[0];
+            ps0 += x0[1];
+            ps1 += x1[0];
+            ps1 += x1[1];
+            ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
+            ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
+            ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
+            ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
+            l0 = l0 * al0 + ps0;
+            l1 = l1 * al1 + ps1;
+        }
+        m0 = mn0;
+        m1 = mn1;
+        const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth; // A fragments of positions 0-15 / 16-31
+        if constexpr (Q8) {
+            if constexpr (!MK_A2_SCHED) a2_st_q8(rq, sV); // V(it): sV is free (barrier above)
+            if (it + 1 < it1) a2_ld_q8(rq, Kq + (size_t) kn * HD, Ks + (size_t) kn * (HD / 32), npn);
+        } else {
+            pf::cpa_wait<0>(); // V(it)
+        }
+        __syncthreads(); // sV = V(it); every warp is done with S, so sK is free
+        if constexpr (!Q8)
+            if (it + 1 < it1) a2_cp_f16(sK, Kh + (size_t) kn * HD, npn);
+        // O += P V for this warp's 128 dims: n8 tiles 16 hf + 0 .. 15
+        const bool nxt = it + 1 < it1;
+        if constexpr (!PV16) {
+            if (!__all_sync(0xffffffffu, al0 == 1.f && al1 == 1.f)) { // o * 1 == o: skipping is exact
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    o[j][0] *= al0;
+                    o[j][1] *= al0;
+                    o[j][2] *= al1;
+                    o[j][3] *= al1;
+                }
+            }
+#pragma unroll
+            for (int ks = 0; ks < 2; ks++) {
+                const uint4 A = ks ? P1 : P0;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    unsigned b[4];
+                    a2_ldsm_t(b, va + ks * 16 * A2_LD * 2 + 32 * j);
+                    mma16816(o[2 * j], A.x, A.y, A.z, A.w, b[0], b[1]);
+                    mma16816(o[2 * j + 1], A.x, A.y, A.z, A.w, b[2], b[3]);
+                    // K(it + 1) -> sK (free since the barrier above) late in the loop
+                    if constexpr (Q8 && MK_A2_SCHED)
+                        if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1);
+                }
+            }
+        } else {
+            const unsigned A0[4] = {P0.x, P0.y, P0.z, P0.w}, A1[4] = {P1.x, P1.y, P1.z, P1.w};
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned b[4], h0[2], h1[2];
+                a2_ldsm_t(b, va + 32 * j);
+                pf::hmma16z(h0, A0, b[0], b[1]);
+                pf::hmma16z(h1, A0, b[2], b[3]);
+                a2_ldsm_t(b, va + 16 * A2_LD * 2 + 32 * j);
+                pf::hmma16(h0, A1, b[0], b[1]);
+                pf::hmma16(h1, A1, b[2], b[3]);
+                const float2 u0 = __half22float2(pf::u2h(h0[0])), u1 = __half22float2(pf::u2h(h0[1]));
+                const float2 w0 = __half22float2(pf::u2h(h1[0])), w1 = __half22float2(pf::u2h(h1[1]));
+                o[2 * j][0] = o[2 * j][0] * al0 + u0.x;
+                o[2 * j][1] = o[2 * j][1] * al0 + u0.y;
+                o[2 * j][2] = o[2 * j][2] * al1 + u1.x;
+                o[2 * j][3] = o[2 * j][3] * al1 + u1.y;
+                o[2 * j + 1][0] = o[2 * j + 1][0] * al0 + w0.x;
+                o[2 * j + 1][1] = o[2 * j + 1][1] * al0 + w0.y;
+                o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
+                o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
+                if constexpr (Q8 && MK_A2_SCHED)
+                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4);
+            }
+        }
+        if constexpr (Q8) {
+            if (nxt) {
+                if constexpr (!MK_A2_SCHED) a2_st_q8(rq, sK); // K(it + 1): sK is free (barrier above)
+                a2_ld_q8(rq, Vq + (size_t) kn * HD, Vs + (size_t) kn * (HD / 32), npn);
+            }
+        }
+    }
+    pf::cpa_wait<0>();
+    // row sums: half 1 -> half 0 (the maxima slot is no longer read)
+    if (hf) *mx_own = make_float2(l0, l1);
+    a2_pair_sync(hq);
+    if (!hf) {
+        const float2 t = *mx_oth;
+        l0 = t.x;
+        l1 = t.y;
+    }
+    const int head = g * 6 + hq;
+    if (nseg == 1) {
+        const float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int d = 128 * hf + 8 * j + 2 * t4;
+            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
+            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
+        }
+    } else {
+        float * pp = part + (size_t) (blockIdx.x - nfull) * A2_PART;
+        const int r0 = hq * A2_Q + g8;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int d = 128 * hf + 8 * j + 2 * t4;
+            *reinterpret_cast<float2 *>(pp + (size_t) r0 * HD + d) = make_float2(o[j][0], o[j][1]);
+            *reinterpret_cast<float2 *>(pp + (size_t) (r0 + 8) * HD + d) = make_float2(o[j][2], o[j][3]);
+        }
+        if (hf && t4 == 0) {
+            float2 * ml = reinterpret_cast<float2 *>(pp + 6 * A2_Q * HD);
+            ml[r0] = make_float2(m0, l0);
+            ml[r0 + 8] = make_float2(m1, l1);
+        }
+    }
+}
+
+// merge the S partials of each split item (block = item nfull + blockIdx.x) into y2
+__global__ void __launch_bounds__(256) pk_attn2_comb(int T, int nfull, int S, const float * __restrict__ part) {
+    const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
+    const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
+    const float * P = part + (size_t) blockIdx.x * S * A2_PART;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = warp; r < 6 * A2_Q; r += 8) {
+        const int h = r / A2_Q, tt = r % A2_Q;
+        if (tt >= nq) continue;
+        float m = -INFINITY;
+        for (int s = 0; s < S; s++) m = fmaxf(m, P[(size_t) s * A2_PART + 6 * A2_Q * HD + 2 * r]);
+        float L = 0.f, acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int s = 0; s < S; s++) {
+            const float * ps = P + (size_t) s * A2_PART;
+            const float ms = ps[6 * A2_Q * HD + 2 * r], ls = ps[6 * A2_Q * HD + 2 * r + 1];
+            const float w = ms == -INFINITY ? 0.f : expf(ms - m);
+            L += w * ls;
+            const float4 a = *reinterpret_cast<const float4 *>(ps + (size_t) r * HD + 8 * lane);
+            const float4 b = *reinterpret_cast<const float4 *>(ps + (size_t) r * HD + 8 * lane + 4);
+            acc[0] += w * a.x; acc[1] += w * a.y; acc[2] += w * a.z; acc[3] += w * a.w;
+            acc[4] += w * b.x; acc[5] += w * b.y; acc[6] += w * b.z; acc[7] += w * b.w;
+        }
+        const float il = L > 0.f ? 1.f / L : 0.f;
+        float * dst = cP.y2 + (size_t) (t0 + tt) * VD + (g * 6 + h) * HD + 8 * lane;
+        *reinterpret_cast<float4 *>(dst) = make_float4(acc[0] * il, acc[1] * il, acc[2] * il, acc[3] * il);
+        *reinterpret_cast<float4 *>(dst + 4) = make_float4(acc[4] * il, acc[5] * il, acc[6] * il, acc[7] * il);
+    }
+}
