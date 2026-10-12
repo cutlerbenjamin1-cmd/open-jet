@@ -40,7 +40,7 @@ template <> struct WT<TQ4K> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TIQ4> { static constexpr int BLK = 136, NCH = 3; }; // in 272 B pairs, see mmh's load
 template <> struct WT<TIQ4NL> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 5; };
-template <> struct WT<TQ6K> { static constexpr int BLK = 224, NCH = 3; };
+template <> struct WT<TQ6K> { static constexpr int BLK = 192, NCH = 3; }; // + the meta stream (W.d), see load
 template <> struct WT<TQ80> { static constexpr int BLK = 256, NCH = 4; };
 
 template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, int & inc) {
@@ -149,7 +149,8 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         wq[k] = c != 0;
         wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
     }
-    const uint8_t * esrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb + 192;
+    // Q6_K: the row's meta stream (pairs of blocks: sc even | sc odd | d even | d odd, 36 B)
+    const uint8_t * esrc = reinterpret_cast<const uint8_t *>(W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd);
     const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     const __half * xsrc[4];
@@ -172,8 +173,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                 else
                     cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
             }
-        if constexpr (TYPE == TQ6K) {
-            if (tid < BM) cpa8(s + edst, esrc + sb * BLK + 8 * p);
+        if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
+            if (tid < BM) {
+                cpa4(s + edst, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
+                cpa4(s + edst + 4, esrc + (sb >> 1) * 36 + 32);
+            }
         } else if constexpr (TYPE == TQ80) {
             if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
         }
@@ -213,7 +217,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         } else if constexpr (TYPE == TQ6K) {
             uint8_t * mrow = const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
             const int2 meta = *reinterpret_cast<const int2 *>(mrow);
-            const float d = __half2float(__ushort_as_half((unsigned short) (meta.y & 0xffff)));
+            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) meta.y >> (16 * ((st >> 2) & 1)))));
             const unsigned sp = (unsigned) meta.x >> (16 * j);
             *reinterpret_cast<__half2 *>(mrow + 8 + 4 * j) =
                 __floats2half2_rn(d * (float) (int8_t) (sp & 0xff), d * (float) (int8_t) ((sp >> 8) & 0xff));
