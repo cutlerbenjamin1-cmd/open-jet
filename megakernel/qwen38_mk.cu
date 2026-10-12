@@ -2773,23 +2773,26 @@ struct MKEngine::Impl {
     Ctl ck_ctl;
     int ck_pos = -1;
     double ck_ms = 0; // last save / restore copy time (MK_MEMLOG)
+    // Allocated at construction: cudaHostAlloc of the 0.16 GB takes 0.1-0.5 s under WSL2, which used to land in the
+    // first prompt's time (inside the first ck_save).
+    void ck_alloc() {
+        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        const char * cd = getenv("MK_CK_DEVICE");
+        if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
+            ck_dstate = static_cast<float *>(ck_host);
+            ck_conv = ck_dstate + ns;
+            ck_hhist = ck_conv + nc;
+        } else {
+            cudaGetLastError();
+            ck_host = nullptr;
+            ck_dstate = dalloc<float>(ns, false);
+            ck_conv = dalloc<float>(nc, false);
+            ck_hhist = dalloc<float>(nh, false);
+        }
+        mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
+    }
     void ck_save() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        if (!ck_dstate) {
-            const char * cd = getenv("MK_CK_DEVICE");
-            if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
-                ck_dstate = static_cast<float *>(ck_host);
-                ck_conv = ck_dstate + ns;
-                ck_hhist = ck_conv + nc;
-            } else {
-                cudaGetLastError();
-                ck_host = nullptr;
-                ck_dstate = dalloc<float>(ns, false);
-                ck_conv = dalloc<float>(nc, false);
-                ck_hhist = dalloc<float>(nh, false);
-            }
-            mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
-        }
         const auto t0 = std::chrono::steady_clock::now();
         CK(cudaMemcpyAsync(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault, 0));
         CK(cudaMemcpyAsync(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault, 0));
@@ -3541,6 +3544,9 @@ struct MKEngine::Impl {
                     fa.numRegs, (size_t) fa.localSizeBytes, (size_t) fa.constSizeBytes, (size_t) fa.sharedSizeBytes, stk, heap, fifo, nsm,
                     prop.maxThreadsPerMultiProcessor);
         }
+        // the DeltaNet checkpoint and the batched-prefill scratch are allocated here, not inside the first prompt's time
+        ck_alloc();
+        pf_init();
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
