@@ -91,7 +91,8 @@ __global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const fl
 // delta-net alpha / beta: ab[c][t][r] = rs[t] * sum_{k in split c} Wab[r][k] x[t][k] (attn_norm folded
 // into Wab).  Block = 64 tokens x 96 rows x one of AB_SPLITS K-splits; thread = 4 tokens x 6 rows.
 constexpr int AB_SPLITS = 8, AB_KS = D / AB_SPLITS;
-__global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
+// Q8_0 alpha / beta (abq != nullptr): weights (q * d) * attn_norm formed while filling sw, the folded fp32 values
+__global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) {
     __shared__ float sx[32][64 + 4];
     __shared__ float sw[32][96 + 4];
     const int tid = threadIdx.x, tg = tid & 15, rg = tid >> 4; // tokens 4 tg .. , rows 6 rg ..
@@ -110,7 +111,18 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
         }
         for (int i = tid; i < 96 * 8; i += 256) {
             const int rr = i >> 3, kk = (i & 7) * 4;
-            const float4 v = __ldg(reinterpret_cast<const float4 *>(Wab + (size_t) rr * D + k0 + kk));
+            float4 v;
+            if (abq) {
+                const int qw = __ldg(reinterpret_cast<const int *>(abq + (size_t) rr * D + k0 + kk));
+                const float d = __half2float(abd[(size_t) rr * (D / 32) + ((k0 + kk) >> 5)]);
+                const float4 f = __ldg(reinterpret_cast<const float4 *>(fn + k0 + kk));
+                v.x = ((float) (int8_t) (qw) * d) * f.x;
+                v.y = ((float) (int8_t) (qw >> 8) * d) * f.y;
+                v.z = ((float) (int8_t) (qw >> 16) * d) * f.z;
+                v.w = ((float) (int8_t) (qw >> 24) * d) * f.w;
+            } else {
+                v = __ldg(reinterpret_cast<const float4 *>(Wab + (size_t) rr * D + k0 + kk));
+            }
             sw[kk][rr] = v.x; sw[kk + 1][rr] = v.y; sw[kk + 2][rr] = v.z; sw[kk + 3][rr] = v.w;
         }
         __syncthreads();
@@ -478,6 +490,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
+            if (it < NH && cB.kvq8 && cB.kvr[slot]) fwht256(v); // the slot's K is stored rotated (MK_KV "4r")
         }
         const float sc = it < NH ? 0.0625f : 1.0f;
         __half2 hv[4];
@@ -487,7 +500,12 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
             *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         } else {
             const size_t row = ((size_t) slot * NKV + (it - NH) % NKV) * ctx + pos;
-            if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
+#if MK_KV_EMU
+            if (cB.kvq8 && cB.kvemu[isv][slot])
+                kv_store_emu(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v, cB.kvemu[isv][slot]);
+            else
+#endif
+            if (cB.kvq8) kv_store(isv, slot, (size_t) ((it - NH) % NKV) * ctx + pos, v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
     }

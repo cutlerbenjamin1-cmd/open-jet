@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -37,6 +38,11 @@
 // cycle appends a JSON line (drafts + their MTP top logits, verify rows, outcome). Analysis only.
 #ifndef MK_SPEC_LOG
 #define MK_SPEC_LOG 0
+#endif
+// MK_KV_EMU=1 (accuracy experiments): MK_KV_EMU_SPEC rounds chosen K / V cache slots to a lower-bit grid (kv_store_emu)
+// while keeping the q8 layout, so lower-bit KV formats can be scored per layer before the kernels support them.
+#ifndef MK_KV_EMU
+#define MK_KV_EMU 0
 #endif
 
 #define CK(x)                                                                                   \
@@ -92,7 +98,7 @@ constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (A
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN ? SM_MISC + 2048 : SM_ATTN);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
-enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4X = 23 };
+enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4NL = 20, T_IQ4X = 23 };
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
 
 struct Mat {
@@ -106,7 +112,9 @@ struct LayerW {
     const float *attn_norm, *post_norm;
     // gated delta net
     Mat qkv, gate, sout;
-    const float *ab, *conv, *dt, *A, *snorm;
+    const float *ab, *conv, *dt, *A, *snorm; // ab: alpha | beta rows, fp32 with attn_norm folded in, or (UD, Q8_0):
+    const int8_t * abq;                      // int8 rows [2 NVH][D] + fp16 scales per 32 (abd): w = (q * d) * attn_norm
+    const __half * abd;
     // gated attention
     Mat q, k, v, o;
     const float *qn, *kn;
@@ -162,6 +170,13 @@ struct Bufs {
     void *kc, *vc;     // KV cache [slot][kv head][ctx][HD]: fp16, or int8 (q8_0) when kvq8 ...
     __half *ksc, *vsc; // ... with one fp16 scale per 32 values: [slot][kv head][ctx][HD / 32]
     int kvq8;
+    // kvq8: per attention slot (16 layers + MTP) and K / V (MK_KV): kvb bits per value, 8 (q8_0) or 4 (q4: q4_0
+    // rounding, 16 levels, low nibbles of a lane's word = values 0..3), kvp its values [kv head][ctx][HD * bits / 8]
+    // (slots packed one after the other in kc / vc), kvs its scales [kv head][ctx][HD / 32] (= ksc / vsc + slot offset)
+    int8_t * kvp[2][N_ATT_SLOTS];
+    __half * kvs[2][N_ATT_SLOTS];
+    int kvb[2][N_ATT_SLOTS];
+    int kvr[N_ATT_SLOTS]; // K stored Hadamard-rotated (MK_KV "4r"): the queries get the same orthonormal 256-point rotation
     float * apart;
     float2 * aml;
     float *h_hist, *hm;
@@ -177,6 +192,9 @@ struct Bufs {
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
     int ctx;
+#if MK_KV_EMU
+    int kvemu[2][N_ATT_SLOTS]; // per slot, K / V: 0 plain q8, else the kv_store_emu mode (MK_KV_EMU_SPEC)
+#endif
 };
 
 __constant__ ModelW cW;
@@ -547,31 +565,37 @@ __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const S
     }
 }
 
-// repacked Q6_K block (224 B): qlo[128] (q4k-style nibbles) | qhi[64] (8 B per unit) |
-// meta[32]: for each 64-group p: sc[4p..4p+3], d (fp16), 2 pad bytes  -> one 8-byte load per unit
-constexpr int Q6_BLK = 224;
+// repacked Q6_K, 210 B per 256 weights like the GGUF block, in two streams per row:
+//   rows (Mat::w, Q6_BLK = 192 B per block): qlo[128] (q4k-style nibbles) | qhi[64] (8 B per unit);
+//   meta (Mat::d, 18 B per block, in pairs of blocks: sc[16] even | sc[16] odd | d even | d odd, 36 B).
+// A unit reads its 4 scales sc[4p..4p+3] and the pair's two d (one 4-byte load each).
+constexpr int Q6_BLK = 192, Q6_META = 18;
 template <int T, int IT, int R>
-__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
+__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+                                         float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
         int4 q[R];
-        int2 hb[R], meta[R];
+        int2 hb[R];
+        int sc4[R], dd[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
             const uint8_t * blk = rp[k] + b * Q6_BLK;
+            const uint8_t * mp = reinterpret_cast<const uint8_t *>(dp[k]) + (b >> 1) * (2 * Q6_META);
             q[k] = ldw4(blk + 32 * p + 16 * hh);
             hb[k] = ldw2(blk + 128 + 8 * (u & 7));
-            meta[k] = ldw2(blk + 192 + 8 * p);
+            sc4[k] = ldw1(mp + 16 * (b & 1) + 4 * p);
+            dd[k] = ldw1(mp + 32);
         }
         int A[R][4], B[R][4];
         float fA[R], gA[R], fB[R], gB[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
-            const float d = __half2float(__ushort_as_half((unsigned short) (meta[k].y & 0xffff)));
-            fA[k] = d * (float) (int8_t) (meta[k].x >> (8 * hh));
-            fB[k] = d * (float) (int8_t) (meta[k].x >> (16 + 8 * hh));
+            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) dd[k] >> (16 * (b & 1)))));
+            fA[k] = d * (float) (int8_t) (sc4[k] >> (8 * hh));
+            fB[k] = d * (float) (int8_t) (sc4[k] >> (16 + 8 * hh));
             gA[k] = 32.0f * fA[k];
             gB[k] = 32.0f * fB[k];
             const unsigned hx = (unsigned) hb[k].x, hy = (unsigned) hb[k].y;
@@ -648,30 +672,31 @@ __device__ __forceinline__ void accR0(const SX & s, int u, const int (&A)[R][4],
     }
 }
 
-// IQ4_XS re-laid-out at load into Q4_K-shaped 144-byte blocks (repack_iq4xs): 16-byte header
-// (fp16 d | 2 pad | int8 ls - 32 of the eight 32-weight sub-blocks | 4 pad), then the 128 index
-// bytes in Q4_K order.  A weight is d * (ls - 32) * kvalues_iq4nl[index].
+// IQ4_XS re-laid-out at load in pairs of 256-weight blocks, 272 B per pair (repack_iq4xs): the two GGUF block
+// headers (fp16 d | u16 scales_h | u8 scales_l[4]), then each block's 128 index bytes in Q4_K order.
+// A weight is d * (ls - 32) * kvalues_iq4nl[index], ls the 6-bit scale of its 32-weight sub-block.
 template <int T, int IT, int R>
 __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
-        int4 h[R], q[R];
+        int2 h[R];
+        int4 q[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
-            const uint8_t * blk = rp[k] + b * 144;
-            h[k] = ldw4(blk);
-            q[k] = ldw4(blk + 16 + 32 * p + 16 * hh);
+            const uint8_t * pr = rp[k] + (b >> 1) * 272;
+            h[k] = ldw2(pr + 8 * (b & 1));
+            q[k] = ldw4(pr + 16 + 128 * (b & 1) + 32 * p + 16 * hh);
         }
         int A[R][4], B[R][4];
         float fA[R], fB[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
             const float d = __half2float(__ushort_as_half((unsigned short) (h[k].x & 0xffff)));
-            const int sw = (p < 2 ? h[k].y : h[k].z) >> ((p & 1) * 16);
-            fA[k] = d * (float) (int8_t) sw;
-            fB[k] = d * (float) (int8_t) (sw >> 8);
+            const unsigned sl = ((unsigned) h[k].y >> (8 * p)) & 0xffu, sh = ((unsigned) h[k].x >> (16 + 4 * p)) & 0xfu;
+            fA[k] = d * (float) ((int) ((sl & 0xfu) | ((sh & 3u) << 4)) - 32);
+            fB[k] = d * (float) ((int) ((sl >> 4) | ((sh >> 2) << 4)) - 32);
             iq4_lut(q[k].x, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][0], B[k][0]);
             iq4_lut(q[k].y, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][1], B[k][1]);
             iq4_lut(q[k].z, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][2], B[k][2]);
@@ -681,11 +706,45 @@ __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const 
     }
 }
 
+// IQ4_NL re-laid-out at load into 144-byte blocks of 256 weights (repack_iq4nl): the fp16 scales d of the eight
+// 32-weight blocks, then the 128 index bytes in Q4_K order (as IQ4_XS).  A weight is d * kvalues_iq4nl[index].
+// Same integer products and the same float arithmetic (accR with zero mins) as the Q8_0 path these tensors were
+// re-encoded for before, so the results are bit-identical to it at 0.53x the bytes.
+template <int T, int IT, int R>
+__device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
+    for (int i = 0; i < IT; i++) {
+        const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
+        int4 q[R];
+        int dd[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const uint8_t * blk = rp[k] + b * 144;
+            dd[k] = ldw1(blk + 4 * p);
+            q[k] = ldw4(blk + 16 + 32 * p + 16 * hh);
+        }
+        int A[R][4], B[R][4];
+        float fA[R], gA[R], fB[R], gB[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const float2 df = __half22float2(*reinterpret_cast<const __half2 *>(&dd[k]));
+            fA[k] = df.x; fB[k] = df.y; gA[k] = 0.f; gB[k] = 0.f;
+            iq4_lut(q[k].x, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][0], B[k][0]);
+            iq4_lut(q[k].y, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][1], B[k][1]);
+            iq4_lut(q[k].z, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][2], B[k][2]);
+            iq4_lut(q[k].w, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][3], B[k][3]);
+        }
+        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+    }
+}
+
 // rows row0 .. row0+R-1 of m, weight type fixed at compile time
 // u0: first unit of a K-slice (multiple of 32) when the activations in s hold only that slice
 template <int TYPE>
 __device__ __forceinline__ int unit_bytes(int u0) {
-    return TYPE == T_Q4K || TYPE == T_IQ4X ? (u0 >> 3) * 144
+    return TYPE == T_Q4K || TYPE == T_IQ4NL ? (u0 >> 3) * 144
+         : TYPE == T_IQ4X                 ? (u0 >> 3) * 136 // u0 is a multiple of 32 units: whole block pairs
          : TYPE == T_Q5K                  ? (u0 >> 3) * 176
          : TYPE == T_Q6K                  ? (u0 >> 3) * Q6_BLK
                                           : 32 * u0;
@@ -696,8 +755,9 @@ __device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __h
                                        float (&acc)[R][T]) {
     if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
     else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, dp, s, acc);
     else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_IQ4NL) rows_iq4nl<T, IT, R>(rp, s, acc);
     else rows_q80<T, IT, R>(rp, dp, s, acc);
 }
 template <int T, int IT, int R, int TYPE>
@@ -707,7 +767,7 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
 #pragma unroll
     for (int k = 0; k < R; k++) {
         rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0);
-        dp[k] = m.d + (size_t) (row0 + k) * m.nd + u0;
+        dp[k] = m.d + (size_t) (row0 + k) * m.nd + (TYPE == T_Q6K ? (u0 >> 3) * (Q6_META / 2) : u0); // Q6_K: meta, Q8_0: d
     }
     rows_t<T, IT, R, TYPE>(rp, dp, s, acc);
 }
@@ -738,6 +798,7 @@ __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Ou
         case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
         case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
+        case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
     }
 }
@@ -943,6 +1004,7 @@ __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float 
         case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
         case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
+        case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
     }
 }
@@ -1033,6 +1095,7 @@ __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
         case T_Q5K: return rows16<T, T_Q5K>(m, j);
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
         case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
+        case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);
         default: return rows16<T, T_IQ4X>(m, j);
     }
 }
@@ -1107,16 +1170,36 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     // row split into AB_SPLIT K-chunks so these heavier items do not form a tail
     for (int it = gwarp(); it < n_ab; it += nwarps()) {
         const int row = it % (2 * NVH), ch = it / (2 * NVH);
-        const float * wr = W.ab + (size_t) row * D;
         float acc[T];
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = 0.f;
-        for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
-            const float4 w = ldw4f(wr + k);
+        if (W.abq) { // Q8_0 rows: the folded fp32 weights (q * d) * attn_norm, formed on the fly (same values)
+            const int8_t * qr = W.abq + (size_t) row * D;
+            const __half * dr = W.abd + (size_t) row * (D / 32);
+            for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                const int qw = ldw1(qr + k);
+                const float d = __half2float(dr[k >> 5]);
+                const float4 fn = __ldg(reinterpret_cast<const float4 *>(W.attn_norm + k));
+                float4 w;
+                w.x = ((float) (int8_t) (qw) * d) * fn.x;
+                w.y = ((float) (int8_t) (qw >> 8) * d) * fn.y;
+                w.z = ((float) (int8_t) (qw >> 16) * d) * fn.z;
+                w.w = ((float) (int8_t) (qw >> 24) * d) * fn.w;
 #pragma unroll
-            for (int t = 0; t < T; t++) {
-                const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
-                acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                for (int t = 0; t < T; t++) {
+                    const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                    acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                }
+            }
+        } else {
+            const float * wr = W.ab + (size_t) row * D;
+            for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                const float4 w = ldw4f(wr + k);
+#pragma unroll
+                for (int t = 0; t < T; t++) {
+                    const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                    acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                }
             }
         }
 #pragma unroll
@@ -1328,6 +1411,108 @@ __device__ __forceinline__ void kv_store_q8(int8_t * q, __half * sc, const float
     if ((lane & 3) == 0) sc[lane >> 2] = __float2half_rn(am / 127.0f);
 }
 
+// q4 store of one KV row (row = HD / 2 bytes), q4_0 rounding: per 32-value block d = (the value of largest
+// magnitude) / -8, nibble = min(15, (int) (x / d + 8.5)), value = (nibble - 8) d. Lane holds values 8 lane .. + 7 and
+// writes one word: low nibbles = values 0..3, high nibbles = values 4..7. Ties of |x| go to the larger x (the same
+// in all 4 lanes of a block). Bit-identical to MK_KV_EMU mode "4a".
+__device__ __forceinline__ void kv_store_q4(int8_t * q, __half * sc, const float (&v)[8]) {
+    const int lane = threadIdx.x & 31;
+    float am = 0.f, sv = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        if (fabsf(v[k]) > am || (fabsf(v[k]) == am && v[k] > sv)) { am = fabsf(v[k]); sv = v[k]; }
+#pragma unroll
+    for (int m = 1; m <= 2; m <<= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, m), os = __shfl_xor_sync(0xffffffffu, sv, m);
+        if (oa > am || (oa == am && os > sv)) { am = oa; sv = os; }
+    }
+    const float d = sv / -8.0f, id = d != 0.f ? 1.0f / d : 0.f;
+    unsigned w = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++) w |= (unsigned) min(15, (int) (v[k] * id + 8.5f)) << (k < 4 ? 8 * k : 8 * (k - 4) + 4);
+    *reinterpret_cast<unsigned *>(q + lane * 4) = w;
+    if ((lane & 3) == 0) sc[lane >> 2] = __float2half_rn(d);
+}
+
+// 256-point fast Walsh-Hadamard transform of one row, 8 values per lane (scaled by 1/16: orthonormal, its own inverse)
+__device__ __forceinline__ void fwht256(float (&v)[8]) {
+#pragma unroll
+    for (int m = 1; m < 8; m <<= 1)
+#pragma unroll
+        for (int k = 0; k < 8; k++)
+            if (!(k & m)) {
+                const float a = v[k], b = v[k | m];
+                v[k] = a + b;
+                v[k | m] = a - b;
+            }
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1)
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[k], m);
+            v[k] = (lane & m) ? o - v[k] : v[k] + o;
+        }
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] *= 0.0625f;
+}
+
+// one K (w = 0) or V (w = 1) row of attention slot `slot` in its MK_KV format; row = kv head * ctx + position
+__device__ __forceinline__ void kv_store(int w, int slot, size_t row, const float (&vin)[8]) {
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = vin[k];
+    if (w == 0 && cB.kvr[slot]) fwht256(v);
+    if (cB.kvb[w][slot] == 4) kv_store_q4(cB.kvp[w][slot] + row * (HD / 2), cB.kvs[w][slot] + row * (HD / 32), v);
+    else kv_store_q8(cB.kvp[w][slot] + row * HD, cB.kvs[w][slot] + row * (HD / 32), v);
+}
+
+#if MK_KV_EMU
+
+// A K / V row rounded to a lower-bit grid with one fp16 scale per 32 values (the format a real low-bit cache would
+// store), written in the q8 layout. mode: bits (2..8) | 16: Hadamard-rotated first (the dequantized row is rotated
+// back and stored as ordinary q8, which adds q8 rounding) | 32: q4_0-style scale d = (signed max) / -2^(b-1) with
+// 2^b levels (else symmetric: d = max |x| / (2^(b-1) - 1)).
+__device__ __forceinline__ void kv_store_emu(int8_t * q, __half * sc, const float (&vin)[8], int mode) {
+    const int lane = threadIdx.x & 31, bits = mode & 15;
+    const bool rot = mode & 16, q40 = mode & 32;
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = vin[k];
+    if (rot) fwht256(v);
+    float am = 0.f, sv = 0.f; // largest |x| of the 32-value block and that x (ties: the larger x, same in all 4 lanes)
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        if (fabsf(v[k]) > am || (fabsf(v[k]) == am && v[k] > sv)) { am = fabsf(v[k]); sv = v[k]; }
+#pragma unroll
+    for (int m = 1; m <= 2; m <<= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, m), os = __shfl_xor_sync(0xffffffffu, sv, m);
+        if (oa > am || (oa == am && os > sv)) { am = oa; sv = os; }
+    }
+    const int h = 1 << (bits - 1);
+    const float d = q40 ? sv / (float) -h : am / (float) (h - 1);
+    const float id = d != 0.f ? 1.0f / d : 0.f;
+    const __half dh = __float2half_rn(d);
+    int qi[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        qi[k] = q40 ? min(2 * h - 1, (int) (v[k] * id + ((float) h + 0.5f))) - h : max(1 - h, min(h - 1, __float2int_rn(v[k] * id)));
+    if (!rot) {
+        unsigned w[2] = {0u, 0u};
+#pragma unroll
+        for (int k = 0; k < 8; k++) w[k >> 2] |= ((unsigned) qi[k] & 0xffu) << (8 * (k & 3));
+        *reinterpret_cast<uint2 *>(q + lane * 8) = make_uint2(w[0], w[1]);
+        if ((lane & 3) == 0) sc[lane >> 2] = dh;
+        return;
+    }
+    const float df = __half2float(dh);
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = df * (float) qi[k];
+    fwht256(v);
+    kv_store_q8(q, sc, v);
+}
+#endif
+
 // fp16 store of one KV row (same lane layout)
 __device__ __forceinline__ void kv_store_f16(__half * dst, const float (&v)[8]) {
     __half2 h[4];
@@ -1346,27 +1531,44 @@ __device__ __forceinline__ void q8_to_f16(uint2 q, float d, __half2 (&h)[4]) {
     }
 }
 
-// staged q8 K/V rows (KVQ_ROW bytes: values, then scales) -> fp16 rows of stride ld; rows x 2 tensors
-__device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK, __half * dV, int rows, int ld) {
+// 8 q4 values (one word in kv_store_q4's nibble order) + scale -> 4 fp16 pairs, the q8_to_f16 arithmetic
+__device__ __forceinline__ void q4_to_f16(unsigned w, float d, __half2 (&h)[4]) {
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int j0 = 2 * k, j1 = 2 * k + 1;
+        const int a = (int) ((w >> (j0 < 4 ? 8 * j0 : 8 * (j0 - 4) + 4)) & 0xfu) - 8;
+        const int b = (int) ((w >> (j1 < 4 ? 8 * j1 : 8 * (j1 - 4) + 4)) & 0xfu) - 8;
+        h[k] = __floats2half2_rn(d * (float) a, d * (float) b);
+    }
+}
+
+// staged q8 / q4 K/V rows (KVQ_ROW bytes: values, then scales at 256) -> fp16 rows of stride ld; rows x 2 tensors
+__device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK, __half * dV, int rows, int ld, bool kq4, bool vq4) {
     for (int i = threadIdx.x; i < 2 * rows * 32; i += blockDim.x) {
         const int which = i / (rows * 32), r = (i >> 5) % rows, c = i & 31;
         const uint8_t * row = src + (size_t) (which * rows + r) * KVQ_ROW;
+        const float d = __half2float(reinterpret_cast<const __half *>(row + 256)[c >> 2]);
         __half2 h[4];
-        q8_to_f16(*reinterpret_cast<const uint2 *>(row + 8 * c), __half2float(reinterpret_cast<const __half *>(row + 256)[c >> 2]), h);
+        if (which ? vq4 : kq4) q4_to_f16(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
+        else q8_to_f16(*reinterpret_cast<const uint2 *>(row + 8 * c), d, h);
         *reinterpret_cast<int4 *>((which ? dV : dK) + (size_t) r * ld + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
 
-// async copy of q8 K/V rows r < np (positions row0 + r) into the staging layout (rows >= np: zero scales)
-__device__ __forceinline__ void kv_stage(uint8_t * dst, size_t row0, int rows, int np) {
-    const int8_t * Kq = static_cast<const int8_t *>(cB.kc), * Vq = static_cast<const int8_t *>(cB.vc);
+// async copy of q8 / q4 K/V rows r < np (slot rows row0 + r) into the staging layout (rows >= np: zero scales)
+__device__ __forceinline__ void kv_stage(uint8_t * dst, const int8_t * Kq, const int8_t * Vq, const __half * Ks, const __half * Vs,
+                                         size_t row0, int rows, int np, bool kq4, bool vq4) {
     for (int i = threadIdx.x; i < 2 * rows * 17; i += blockDim.x) {
         const int which = i / (rows * 17), r = (i / 17) % rows, c = i % 17;
         uint8_t * d = dst + (size_t) (which * rows + r) * KVQ_ROW + 16 * c;
         if (r < np) {
             const size_t row = row0 + r;
-            if (c < 16) cp_async16(d, (which ? Vq : Kq) + row * HD + 16 * c);
-            else cp_async16(d, (which ? cB.vsc : cB.ksc) + row * (HD / 32));
+            const bool q4 = which ? vq4 : kq4;
+            if (c < 16) {
+                if (!q4 || c < 8) cp_async16(d, (which ? Vq : Kq) + row * (q4 ? HD / 2 : HD) + 16 * c);
+            } else {
+                cp_async16(d, (which ? Vs : Ks) + row * (HD / 32));
+            }
         } else if (c == 16) {
             *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
         }
@@ -1405,15 +1607,20 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     int nch, CS;
     attn_dims(n + T, nch, CS);
     const size_t ctx = cB.ctx;
-    const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    const uint8_t * Kc = static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rowb;
-    const uint8_t * Vc = static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rowb;
+    // bytes and 128-byte lines per K / V row (fp16 256 x 2, q8 256, q4 128)
+    const int rk = cB.kvq8 ? HD * cB.kvb[0][slot] / 8 : HD * 2, rv = cB.kvq8 ? HD * cB.kvb[1][slot] / 8 : HD * 2;
+    const int lk = rk / 128, lv = rv / 128, lines = max(lk, lv);
+    const uint8_t * Kc = cB.kvq8 ? reinterpret_cast<const uint8_t *>(cB.kvp[0][slot])
+                                 : static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rk;
+    const uint8_t * Vc = cB.kvq8 ? reinterpret_cast<const uint8_t *>(cB.kvp[1][slot])
+                                 : static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rv;
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
-            const size_t off = ((size_t) g * ctx + c0 + i / lines) * rowb + (i % lines) * 128;
-            pf_l2(Kc + off);
-            pf_l2(Vc + off);
+            const size_t pos = (size_t) g * ctx + c0 + i / lines;
+            const int l = i % lines;
+            if (l < lk) pf_l2(Kc + pos * rk + l * 128);
+            if (l < lv) pf_l2(Vc + pos * rv + l * 128);
         }
     }
 }
@@ -1477,11 +1684,13 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
     __half * Kc = static_cast<__half *>(cB.kc) + slot0 * HD;
     __half * Vc = static_cast<__half *>(cB.vc) + slot0 * HD;
+    const bool kq4 = Q8 && cB.kvb[0][slot] == 4, vq4 = Q8 && cB.kvb[1][slot] == 4; // MK_KV per-slot formats
     const int mt = warp >> 3, wn = warp & 7; // MMA work split: warp -> (row tile, column group)
 
     auto issue_tile = [&](int g, int tb, int np_, int st) {
         if constexpr (Q8) {
-            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, slot0 + (size_t) g * ctx + tb, TP, np_);
+            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, cB.kvp[0][slot], cB.kvp[1][slot], cB.kvs[0][slot], cB.kvs[1][slot],
+                     (size_t) g * ctx + tb, TP, np_, kq4, vq4);
             asm volatile("cp.async.commit_group;" ::: "memory");
             return;
         }
@@ -1508,24 +1717,27 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         float qv[2][8], qw[8];
         float2 rc[2][8];
         load8(W.qn + lane * 8, qw);
+        // Unconditional loads (rows >= R and lanes >= 8 load valid, unused data): conditionally assigned arrays
+        // were carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
+        // reserves for all 1,536 thread slots of every SM).
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
-            const int r = warp + 16 * k2;
-            if (r < R) {
-                const int hq = r / T, t = r % T, head = g * 6 + hq;
-                load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
-                if (lane < 8) {
-                    const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+            const int r = min(warp + 16 * k2, R - 1);
+            const int hq = r / T, t = r % T, head = g * 6 + hq;
+            load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
+            const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
 #pragma unroll
-                    for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
-                }
-            }
+            for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
         }
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = warp + 16 * k2;
             if (r < R) {
-                float * v = qv[k2];
+                // a copy, not a pointer into qv: a pointer made ptxas keep qv / qw / rc in local memory (~2 KB of
+                // mk_cycle's 2.8 KB stack frame over the 10 attn_core_t instances, reserved for 1,536 threads per SM)
+                float v[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] = qv[k2][k];
                 float ss = 0.f;
 #pragma unroll
                 for (int k = 0; k < 8; k++) ss += v[k] * v[k];
@@ -1540,6 +1752,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
                     for (int k = 0; k < 8; k++)
                         v[k] = lane < 4 ? v[k] * rc[k2][k].x - o[k] * rc[k2][k].y : o[k] * rc[k2][k].y + v[k] * rc[k2][k].x;
                 }
+                if (Q8 && cB.kvr[slot]) fwht256(v); // K of this slot is stored rotated (MK_KV "4r")
                 __half2 hq2[4];
 #pragma unroll
                 for (int k = 0; k < 4; k++) hq2[k] = __floats2half2_rn(v[2 * k] * 0.0625f, v[2 * k + 1] * 0.0625f);
@@ -1562,11 +1775,19 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            const size_t row = slot0 + (size_t) g * ctx + pp;
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
+            const size_t row = slot0 + (size_t) g * ctx + pp, srow = (size_t) g * ctx + pp;
+#if MK_KV_EMU
+            if (Q8 && cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot]);
+            else
+#endif
+            if constexpr (Q8) kv_store(0, slot, srow, v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
+#if MK_KV_EMU
+            if (Q8 && cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot]);
+            else
+#endif
+            if constexpr (Q8) kv_store(1, slot, srow, v);
             else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
         }
         if (tid < 32) {
@@ -1596,7 +1817,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             }
             __syncthreads();
             if constexpr (Q8) { // q8 stage -> the fp16 tile
-                kv_tile_to_f16(sKVq + st * 2 * TP * KVQ_ROW, sKV, sKV + TP * LDH, TP, LDH);
+                kv_tile_to_f16(sKVq + st * 2 * TP * KVQ_ROW, sKV, sKV + TP * LDH, TP, LDH, kq4, vq4);
                 __syncthreads();
             }
             // S = Q K^T : warp -> row tile mt, positions 8*wn .. 8*wn+7
@@ -1779,7 +2000,18 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
     float * m = misc(sm);
-    pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    // the draft head reads lm_head rows through cW.draft_ids (row r of head_d is lm_head row draft_ids[r])
+    const int * ids = draft ? cW.draft_ids : nullptr;
+    if (ids) {
+        const int r0 = 2 * gwarp();
+        if (r0 < cW.head_d.N)
+            for (int k = 0; k < 2; k++) {
+                const uint8_t * p = cW.head.w + (size_t) __ldg(ids + r0 + k) * cW.head.rb;
+                for (int off = lane * 128; off < 896; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+            }
+    } else {
+        pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    }
     fill_xs<TL>(cB.qn, t0, true, sx, m);
     float bv[TL];
     int bi[TL];
@@ -1793,7 +2025,16 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
-        mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
+        {
+            const uint8_t * rp[2];
+            const __half * dp[2]; // Q6_K: the rows' scale (meta) streams
+            const int p0 = ids ? __ldg(ids + r) : r, p1 = ids ? __ldg(ids + r + 1) : r + 1;
+            rp[0] = head.w + (size_t) p0 * head.rb;
+            rp[1] = head.w + (size_t) p1 * head.rb;
+            dp[0] = head.d + (size_t) p0 * head.nd;
+            dp[1] = head.d + (size_t) p1 * head.nd;
+            rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
+        }
         wsum_acc<TL, 2>(a);
         if constexpr (LSE) {
             const float v0 = a[0][0] * m[0], v1 = a[1][0] * m[0];
@@ -2336,14 +2577,6 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     }
 }
 
-__global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * dsrc, __half * ddst, const int * ids,
-                            int rb, int nd) {
-    const int r = blockIdx.x, id = ids[r];
-    for (int i = threadIdx.x; i < rb / 16; i += blockDim.x)
-        reinterpret_cast<int4 *>(dst + (size_t) r * rb)[i] = reinterpret_cast<const int4 *>(src + (size_t) id * rb)[i];
-    for (int i = threadIdx.x; i < nd; i += blockDim.x) ddst[(size_t) r * nd + i] = dsrc[(size_t) id * nd + i];
-}
-
 #include "prefill.cuh"
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
@@ -2450,21 +2683,35 @@ void reencode_iq4nl_q80(const uint8_t * src, uint8_t * out, int64_t K) {
     }
 }
 
-// GGUF IQ4_XS blocks (136 B: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]) -> the 144-byte layout
-// rows_iq4x and the prefill GEMM read (see rows_iq4x).
+// GGUF IQ4_XS blocks (136 B: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]) -> the layout rows_iq4x and the
+// prefill GEMM read: pairs of blocks in 272 B (16-byte aligned, no padding): the two 8-byte GGUF headers, then
+// each block's 128 index bytes in Q4_K order (see rows_iq4x). nblocks must be even.
 void repack_iq4xs(const uint8_t * src, uint8_t * dst, size_t nblocks) {
     for (size_t i = 0; i < nblocks; i++) {
         const uint8_t *s = src + i * 136, *qs = s + 8;
-        uint8_t * o = dst + i * 144;
-        uint16_t sh;
-        memcpy(&sh, s + 2, 2);
-        memset(o, 0, 16);
-        memcpy(o, s, 2);
-        for (int ib = 0; ib < 8; ib++)
-            o[4 + ib] = (uint8_t) ((((s[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4)) - 32);
+        uint8_t * pr = dst + (i >> 1) * 272;
+        memcpy(pr + 8 * (i & 1), s, 8);
+        uint8_t * o = pr + 16 + 128 * (i & 1);
         auto idx = [&](int v) {
             const int ib = v >> 5, j = v & 31;
             return j < 16 ? qs[16 * ib + j] & 0xf : qs[16 * ib + j - 16] >> 4;
+        };
+        for (int p = 0; p < 4; p++)
+            for (int l = 0; l < 32; l++) o[32 * p + l] = (uint8_t) (idx(64 * p + l) | (idx(64 * p + 32 + l) << 4));
+    }
+}
+
+// GGUF IQ4_NL (8 blocks of 18 B: fp16 d, u8 qs[16]) per 256 weights -> 144 B: the eight fp16 d, then the 128 index
+// bytes in the order of repack_iq4xs (rows_iq4nl, prefill TIQ4NL)
+void repack_iq4nl(const uint8_t * src, uint8_t * dst, size_t nblocks) {
+    for (size_t i = 0; i < nblocks; i++) {
+        const uint8_t * s = src + i * 144;
+        uint8_t * o = dst + i * 144;
+        for (int ib = 0; ib < 8; ib++) memcpy(o + 2 * ib, s + 18 * ib, 2);
+        auto idx = [&](int v) {
+            const uint8_t * qs = s + 18 * (v >> 5) + 2;
+            const int j = v & 31;
+            return j < 16 ? qs[j] & 0xf : qs[j - 16] >> 4;
         };
         for (int p = 0; p < 4; p++)
             for (int l = 0; l < 32; l++) o[16 + 32 * p + l] = (uint8_t) (idx(64 * p + l) | (idx(64 * p + 32 + l) << 4));
@@ -2512,27 +2759,47 @@ struct MKEngine::Impl {
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
+    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore is one ~8 ms PCIe copy per
+    // prompt). MK_CK_DEVICE=1 keeps it in device memory.
     float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
+    void * ck_host = nullptr;
     Ctl ck_ctl;
     int ck_pos = -1;
+    double ck_ms = 0; // last save / restore copy time (MK_MEMLOG)
     void ck_save() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
         if (!ck_dstate) {
-            ck_dstate = dalloc<float>(ns, false);
-            ck_conv = dalloc<float>(nc, false);
-            ck_hhist = dalloc<float>(nh, false);
+            const char * cd = getenv("MK_CK_DEVICE");
+            if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
+                ck_dstate = static_cast<float *>(ck_host);
+                ck_conv = ck_dstate + ns;
+                ck_hhist = ck_conv + nc;
+            } else {
+                cudaGetLastError();
+                ck_host = nullptr;
+                ck_dstate = dalloc<float>(ns, false);
+                ck_conv = dalloc<float>(nc, false);
+                ck_hhist = dalloc<float>(nh, false);
+            }
+            mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
         }
-        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDeviceToDevice));
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault));
         CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint save %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDeviceToDevice));
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault));
+        ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         hctl = ck_ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -2543,7 +2810,7 @@ struct MKEngine::Impl {
     std::vector<uint8_t> dv_in;
     int dv_base = 0;
 
-    // Adds the tokens not yet in the draft head's vocabulary (copies their lm_head rows).
+    // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
         if (dv_in.empty()) return; // full-vocabulary draft head
         const int n0 = (int) dv_ids.size();
@@ -2557,8 +2824,6 @@ struct MKEngine::Impl {
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
-        gather_rows<<<k, 256>>>(hw.head.w, const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb, hw.head.d,
-                                m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
@@ -2571,6 +2836,27 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw.head_d.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
     Ctl hctl{};
+
+    // MK_MEMLOG=1: device memory accounting. Each mark prints the bytes dalloc'd since the previous mark
+    // and the drop of cudaMemGetInfo's free memory over the same span (the difference is allocation
+    // granularity, module code, local memory or another process).
+    const bool memlog = getenv("MK_MEMLOG") != nullptr;
+    size_t alloc_bytes = 0, mark_alloc = 0, mark_free = 0;
+    long launches_seen = 0, pf_runs_seen = 0;
+    void mem_mark(const char * tag) {
+        if (!memlog) return;
+        CK(cudaDeviceSynchronize());
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        if (mark_free)
+            fprintf(stderr, "[mk-mem] %-26s alloc %9.2f MiB   free drop %9.2f MiB   (free %9.1f MiB)\n", tag,
+                    (alloc_bytes - mark_alloc) / 1048576.0, ((double) mark_free - (double) fr) / 1048576.0, fr / 1048576.0);
+        else
+            fprintf(stderr, "[mk-mem] %-26s free %.1f MiB of %.1f MiB\n", tag, fr / 1048576.0, tot / 1048576.0);
+        mark_free = fr;
+        mark_alloc = alloc_bytes;
+    }
+
     size_t wbytes = 0;
     bool profiling = false;
     std::vector<double> ph_ns = std::vector<double>(PH_COUNT, 0.0);
@@ -2585,11 +2871,34 @@ struct MKEngine::Impl {
                         arr_last = std::vector<double>(PH_COUNT, 0.0);
     std::vector<long> arr_n = std::vector<long>(PH_COUNT, 0);
 
+    // Device buffers come from the default memory pool (stream-ordered allocator, never trimmed): it packs the
+    // allocations, where cudaMalloc rounds each one up to whole 2 MiB pages (~0.5 GB over the ~900 weight tensors).
+    // MK_CUDAMALLOC=1: plain cudaMalloc.
+    bool pool_init = false, use_pool = true;
     template <class T> T * dalloc(size_t n, bool zero = true) {
         void * p;
-        CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        if (!pool_init) {
+            pool_init = true;
+            const char * cm = getenv("MK_CUDAMALLOC");
+            int ok = 0;
+            cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, 0);
+            use_pool = ok && !(cm && cm[0] == '1');
+            if (use_pool) {
+                cudaMemPool_t pool;
+                CK(cudaDeviceGetDefaultMemPool(&pool, 0));
+                unsigned long long thr = ~0ull; // keep freed memory in the pool (nothing is freed before exit anyway)
+                CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr));
+            }
+        }
+        if (use_pool) {
+            CK(cudaMallocAsync(&p, n * sizeof(T) + 16, 0));
+            CK(cudaStreamSynchronize(0));
+        } else {
+            CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        }
         if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
         allocs.push_back(p);
+        alloc_bytes += n * sizeof(T) + 16;
         return (T *) p;
     }
 
@@ -2616,7 +2925,7 @@ struct MKEngine::Impl {
         s.nbytes = t.nbytes;
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
         const bool to_q6 = !to_f32 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
-        const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL;
+        const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8"); // native IQ4_NL unless MK_IQ4NL_Q8
         if (!to_f32 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
         const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
@@ -2680,9 +2989,12 @@ struct MKEngine::Impl {
             m.w = d;
             wbytes += t.nbytes;
         } else if (t.type == gguf::Q6_K) {
-            m.rb = nb * 224;
-            m.nd = 0;
-            std::vector<uint8_t> q((size_t) N * m.rb, 0);
+            // two streams (rows_q6k): 192 B of values per block, and per row a meta stream of 18 B per block in
+            // pairs (sc even | sc odd | d even | d odd)
+            if (nb & 1) throw std::runtime_error(name + ": Q6_K rows need an even number of 256-blocks");
+            m.rb = nb * Q6_BLK;
+            m.nd = nb * (Q6_META / 2); // halves
+            std::vector<uint8_t> q((size_t) N * m.rb, 0), meta((size_t) N * nb * Q6_META, 0);
             const uint8_t * src = t.data;
             parallel_rows(N, [&](int64_t r) {
                 for (int b = 0; b < nb; b++) {
@@ -2702,7 +3014,7 @@ struct MKEngine::Impl {
                             vals[128 * nn + l + 64] = (L[l] >> 4) | (((H[l] >> 4) & 3) << 4);
                             vals[128 * nn + l + 96] = (L[l + 32] >> 4) | (((H[l] >> 6) & 3) << 4);
                         }
-                    uint8_t * dst = q.data() + (size_t) r * m.rb + b * 224;
+                    uint8_t * dst = q.data() + (size_t) r * m.rb + b * Q6_BLK;
                     for (int p = 0; p < 4; p++)
                         for (int i = 0; i < 32; i++)
                             dst[32 * p + i] = (vals[64 * p + i] & 0xF) | ((vals[64 * p + 32 + i] & 0xF) << 4);
@@ -2717,22 +3029,33 @@ struct MKEngine::Impl {
                             memcpy(dst + 128 + 8 * (2 * p + hh), &hA, 4);
                             memcpy(dst + 128 + 8 * (2 * p + hh) + 4, &hB, 4);
                         }
-                    for (int p = 0; p < 4; p++) {
-                        memcpy(dst + 192 + 8 * p, sc + 4 * p, 4);
-                        memcpy(dst + 192 + 8 * p + 4, &dbits, 2);
-                    }
+                    uint8_t * mp = meta.data() + ((size_t) r * nb + (b & ~1)) * Q6_META;
+                    memcpy(mp + 16 * (b & 1), sc, 16);
+                    memcpy(mp + 32 + 2 * (b & 1), &dbits, 2);
                 }
             });
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
+            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
             m.w = dq;
-            m.d = nullptr;
-            wbytes += q.size();
+            m.d = reinterpret_cast<const __half *>(dm);
+            wbytes += q.size() + meta.size();
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
-            m.rb = nb * 144;
+            if (nb & 1) throw std::runtime_error(name + ": IQ4_XS rows need an even number of 256-blocks");
+            m.rb = nb * 136;
             std::vector<uint8_t> q((size_t) N * m.rb);
             parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, q.data() + (size_t) r * m.rb, nb); });
+            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
+            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+            m.w = dq;
+            wbytes += q.size();
+        } else if (t.type == gguf::IQ4_NL) {
+            m.type = T_IQ4NL;
+            m.rb = nb * 144;
+            std::vector<uint8_t> q((size_t) N * m.rb);
+            parallel_rows(N, [&](int64_t r) { repack_iq4nl(t.data + (size_t) r * nb * 144, q.data() + (size_t) r * m.rb, nb); });
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
             m.w = dq;
@@ -2791,6 +3114,10 @@ struct MKEngine::Impl {
         cudaDeviceProp prop;
         CK(cudaGetDeviceProperties(&prop, 0));
         nsm = prop.multiProcessorCount;
+        if (memlog) {
+            CK(cudaFree(0));
+            mem_mark("context");
+        }
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
         // The kernels take the weight type as a template argument and dispatch on each matrix's
@@ -2819,7 +3146,7 @@ struct MKEngine::Impl {
             throw std::runtime_error(name + " is " + tname(got) + ", the kernel needs " + want +
                                      " (see README: the GGUF)");
         };
-        auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X}); };
+        auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL}); };
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
@@ -2848,6 +3175,30 @@ struct MKEngine::Impl {
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
+                const auto & raw_a = file.get(blk(i, "ssm_alpha.weight"));
+                const auto & raw_b = file.get(blk(i, "ssm_beta.weight"));
+                if (raw_a.type == gguf::Q8_0 && raw_b.type == gguf::Q8_0 && raw_a.ne[0] == D && raw_a.ne[1] == NVH &&
+                    raw_b.ne[0] == D && raw_b.ne[1] == NVH && !getenv("MK_AB_F32")) {
+                    // Q8_0 alpha / beta (UD) kept as int8 rows + fp16 block scales; the kernels form
+                    // (q * d) * attn_norm on the fly, the same fp32 values as the folded rows below (MK_AB_F32=1)
+                    std::vector<int8_t> q((size_t) 2 * NVH * D);
+                    std::vector<uint16_t> ds((size_t) 2 * NVH * (D / 32));
+                    for (int w = 0; w < 2; w++) {
+                        const uint8_t * src = (w ? raw_b : raw_a).data;
+                        for (size_t blk_ = 0; blk_ < (size_t) NVH * (D / 32); blk_++) {
+                            memcpy(&ds[(size_t) w * NVH * (D / 32) + blk_], src + blk_ * 34, 2);
+                            memcpy(&q[((size_t) w * NVH * (D / 32) + blk_) * 32], src + blk_ * 34 + 2, 32);
+                        }
+                    }
+                    int8_t * dq = dalloc<int8_t>(q.size(), false);
+                    CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+                    uint16_t * dd = dalloc<uint16_t>(ds.size(), false);
+                    CK(cudaMemcpy(dd, ds.data(), ds.size() * 2, cudaMemcpyHostToDevice));
+                    L.abq = dq;
+                    L.abd = reinterpret_cast<const __half *>(dd);
+                    L.ab = nullptr;
+                    wbytes += q.size() + ds.size() * 2;
+                } else {
                 // alpha/beta projections in fp32 with the attn_norm weight folded in
                 const Src ta = want(blk(i, "ssm_alpha.weight"), T_F32);
                 const Src tb = want(blk(i, "ssm_beta.weight"), T_F32);
@@ -2869,7 +3220,10 @@ struct MKEngine::Impl {
                 float * d = dalloc<float>(ab.size(), false);
                 CK(cudaMemcpy(d, ab.data(), ab.size() * 4, cudaMemcpyHostToDevice));
                 L.ab = d;
+                L.abq = nullptr;
+                L.abd = nullptr;
                 wbytes += ab.size() * 4;
+                }
             }
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
@@ -2878,6 +3232,7 @@ struct MKEngine::Impl {
             needq(blk(i, "ffn_up.weight"), L.fu.type);
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
+        mem_mark("weights: 64 layers + MTP");
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
         needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
@@ -2886,6 +3241,7 @@ struct MKEngine::Impl {
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
         if (hw.head.type != T_Q6K) throw std::runtime_error("output.weight must be Q6_K");
+        mem_mark("weights: eh, norms, lm_head");
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
         if (!draft_vocab.empty()) {
@@ -2901,17 +3257,12 @@ struct MKEngine::Impl {
             if (ids.size() & 1) ids.push_back(ids.back());
             // room for DV_EXTRA more rows: tokens of the current sequence that are not in the list
             // are added on the fly (identifiers of pasted code, see dv_add)
+            // the draft head reads lm_head rows through the id list (lm_head), so no copy of the rows is kept
             const int cap = (int) ids.size() + DV_EXTRA;
             int * did = dalloc<int>(cap, false);
             CK(cudaMemcpy(did, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
             Mat m = hw.head;
             m.N = (int) ids.size();
-            uint8_t * w = dalloc<uint8_t>((size_t) cap * m.rb, false);
-            __half * d = m.nd ? dalloc<__half>((size_t) cap * m.nd, false) : nullptr;
-            gather_rows<<<m.N, 256>>>(hw.head.w, w, hw.head.d, d, did, m.rb, m.nd);
-            CK(cudaDeviceSynchronize());
-            m.w = w;
-            m.d = d;
             hw.head_d = m;
             hw.draft_ids = did;
             dv_ids = ids;
@@ -2920,6 +3271,7 @@ struct MKEngine::Impl {
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         }
+        mem_mark("draft head copy");
         {
             const auto & t = file.get("token_embd.weight");
             if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
@@ -2940,9 +3292,11 @@ struct MKEngine::Impl {
                 hw.embd = d;
             }
         }
+        mem_mark("token_embd");
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
+        mem_mark("cW symbol (module load)");
         if (n_conv)
-            fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0; ssm_alpha / beta -> F32)\n",
+            fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0 with MK_IQ4NL_Q8; ssm_alpha / beta -> F32)\n",
                     n_conv, conv_s);
 
         hb.x = dalloc<float>(MAXT * D);
@@ -2958,24 +3312,89 @@ struct MKEngine::Impl {
         hb.vbuf = dalloc<float>(MAXT * KVD);
         hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
         hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
+        mem_mark("decode act bufs, conv, kvgb");
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+        mem_mark("GDN recurrent state");
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
-            // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime
-            const bool q8 = kv_mode == 1 || (kv_mode < 0 && rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b);
+            // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime.
+            // A non-empty MK_KV picks the quantized cache in auto mode too.
+            const char * kv_spec = getenv("MK_KV");
+            const bool want_kv = kv_spec && kv_spec[0];
+            const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b));
             hb.kvq8 = q8;
-            hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-            hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+            // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default) or q4 (kv_store_q4), e.g. "V*=4,K16=4r":
+            // comma-separated <K|V|*><slot>=<8|4>[r], slot 0..15 = attention layer 4 slot + 3, 16 = MTP block, * or
+            // empty = all slots; r (K only): K and the queries Hadamard-rotated
+            const size_t srows = (size_t) NKV * ctx; // rows of one slot
+            for (int s = 0; s < N_ATT_SLOTS; s++) {
+                hb.kvb[0][s] = hb.kvb[1][s] = 8;
+                hb.kvr[s] = 0;
+            }
+            if (want_kv) {
+                if (!q8) throw std::runtime_error("MK_KV needs the q8 KV cache (--kv q8 or auto, not f16)");
+                const std::string str = kv_spec;
+                size_t i = 0;
+                while (i < str.size()) {
+                    size_t j = str.find(',', i);
+                    if (j == std::string::npos) j = str.size();
+                    const std::string tok = str.substr(i, j - i);
+                    i = j + 1;
+                    if (tok.empty()) continue;
+                    const size_t e = tok.find('=');
+                    if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV: bad item " + tok);
+                    const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
+                    if (md != "8" && md != "4" && md != "8r" && md != "4r") throw std::runtime_error("MK_KV: expected 8, 4, 8r or 4r in " + tok);
+                    const bool rot = md.size() == 2;
+                    if (rot && tok[0] == 'V') throw std::runtime_error("MK_KV: rotation (r) is for K only: " + tok);
+                    const bool all = sl.empty() || sl == "*";
+                    const int slot = all ? -1 : std::stoi(sl);
+                    if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV: bad slot in " + tok);
+                    for (int w = 0; w < 2; w++)
+                        if (tok[0] == '*' || tok[0] == "KV"[w])
+                            for (int s = 0; s < N_ATT_SLOTS; s++)
+                                if (all || s == slot) {
+                                    hb.kvb[w][s] = md[0] - '0';
+                                    if (w == 0) hb.kvr[s] = rot;
+                                }
+                }
+            }
+            size_t vbytes[2] = {0, 0};
+            int n4 = 0;
+            for (int w = 0; w < 2; w++)
+                for (int s = 0; s < N_ATT_SLOTS; s++) {
+                    vbytes[w] += srows * HD * hb.kvb[w][s] / 8;
+                    n4 += hb.kvb[w][s] == 4 || (w == 0 && hb.kvr[s]);
+                }
+            hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
+            hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
             hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
             hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
-                    rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, ctx);
+            size_t off[2] = {0, 0};
+            for (int s = 0; s < N_ATT_SLOTS; s++)
+                for (int w = 0; w < 2; w++) { // slots packed in order: all-q8 gives the same addresses as [slot][head][ctx][HD]
+                    hb.kvp[w][s] = static_cast<int8_t *>(w ? hb.vc : hb.kc) + off[w];
+                    hb.kvs[w][s] = q8 ? (w ? hb.vsc : hb.ksc) + s * srows * (HD / 32) : nullptr;
+                    off[w] += srows * HD * hb.kvb[w][s] / 8;
+                }
+            const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2) / 1e9 : rows * HD * 4.0 / 1e9;
+            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
+            if (n4) {
+                std::string k, v;
+                for (int s = 0; s < N_ATT_SLOTS; s++) {
+                    k += hb.kvb[0][s] == 4 ? (hb.kvr[s] ? 'R' : '4') : (hb.kvr[s] ? 'r' : '8');
+                    v += hb.kvb[1][s] == 4 ? '4' : '8';
+                }
+                fprintf(stderr, "[mk] MK_KV bits per slot (layers 3, 7, .., 63, MTP; R = 4 rotated, r = 8 rotated): K %s  V %s\n", k.c_str(), v.c_str());
+            }
         }
+        mem_mark("KV cache");
         hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
         hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
         hb.h_hist = dalloc<float>((size_t) H_RING * D);
+        mem_mark("attn partials, h ring");
         {
             std::vector<float2> rt((size_t) ctx * 32);
             for (int p = 0; p < ctx; p++)
@@ -2987,6 +3406,7 @@ struct MKEngine::Impl {
             CK(cudaMemcpy(d, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
             hb.rope = d;
         }
+        mem_mark("RoPE table");
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
         hb.blk_lse = dalloc<float2>((size_t) nsm);
@@ -3000,12 +3420,80 @@ struct MKEngine::Impl {
         hb.ctx = ctx;
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
+        mem_mark("logits, sampling, ctl");
+        if (const char * spec = getenv("MK_KV_EMU_SPEC")) {
+#if MK_KV_EMU
+            // comma-separated <which><slot>=<bits>[r][a]: which K, V or * (both); slot 0..15 (attention layer 4 slot + 3),
+            // 16 (MTP) or * / empty (all); r: Hadamard rotation, a: q4_0-style scale (kv_store_emu)
+            const std::string s = spec;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                if (j == std::string::npos) j = s.size();
+                const std::string tok = s.substr(i, j - i);
+                i = j + 1;
+                if (tok.empty()) continue;
+                const size_t e = tok.find('=');
+                if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV_EMU_SPEC: bad item " + tok);
+                const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
+                int bits = 0, mode = 0;
+                size_t k = 0;
+                while (k < md.size() && isdigit((unsigned char) md[k])) bits = 10 * bits + (md[k++] - '0');
+                for (; k < md.size(); k++) {
+                    if (md[k] == 'r') mode |= 16;
+                    else if (md[k] == 'a') mode |= 32;
+                    else throw std::runtime_error("MK_KV_EMU_SPEC: bad mode " + md);
+                }
+                if (bits < 2 || bits > 8) throw std::runtime_error("MK_KV_EMU_SPEC: bits must be 2..8 in " + tok);
+                mode |= bits;
+                const bool all = sl.empty() || sl == "*";
+                const int slot = all ? -1 : std::stoi(sl);
+                if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV_EMU_SPEC: bad slot in " + tok);
+                for (int w = 0; w < 2; w++)
+                    if (tok[0] == '*' || tok[0] == "KV"[w])
+                        for (int q = 0; q < N_ATT_SLOTS; q++)
+                            if (all || q == slot) hb.kvemu[w][q] = mode == 8 ? 0 : mode;
+            }
+            fprintf(stderr, "[mk] MK_KV_EMU_SPEC %s: K", spec);
+            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[0][q]);
+            fprintf(stderr, " | V");
+            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[1][q]);
+            fprintf(stderr, "\n");
+            if (!hb.kvq8) throw std::runtime_error("MK_KV_EMU_SPEC needs the q8 KV cache (--kv q8)");
+            for (int w = 0; w < 2; w++)
+                for (int s = 0; s < N_ATT_SLOTS; s++)
+                    if (hb.kvb[w][s] != 8 || hb.kvr[s]) throw std::runtime_error("MK_KV_EMU_SPEC needs an all-q8 cache (no MK_KV)");
+#else
+            (void) spec;
+            throw std::runtime_error("MK_KV_EMU_SPEC needs a build with -DMK_KV_EMU=1");
+#endif
+        }
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
         int nb = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mk_cycle, NT, SM_TOTAL));
         if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
+        // The driver reserves local memory for every thread slot of the device (1,536 per SM x 82 SMs), sized by
+        // the larger of the stack-size limit (default 1 KB per thread = 123 MiB) and the launched kernels' own
+        // (static) frames. No kernel here needs a dynamic stack, so the limit only adds a floor: drop it.
+        {
+            const char * sl = getenv("MK_STACK_LIMIT");
+            CK(cudaDeviceSetLimit(cudaLimitStackSize, sl ? (size_t) atol(sl) : 0));
+        }
+        if (memlog) {
+            mem_mark("mk_cycle attributes");
+            cudaFuncAttributes fa{};
+            CK(cudaFuncGetAttributes(&fa, mk_cycle));
+            size_t stk = 0, heap = 0, fifo = 0;
+            CK(cudaDeviceGetLimit(&stk, cudaLimitStackSize));
+            CK(cudaDeviceGetLimit(&heap, cudaLimitMallocHeapSize));
+            CK(cudaDeviceGetLimit(&fifo, cudaLimitPrintfFifoSize));
+            fprintf(stderr, "[mk-mem] mk_cycle: %d regs, local %zu B/thread, const %zu B, static smem %zu B; limits: stack %zu B/thread, "
+                            "malloc heap %zu B, printf fifo %zu B; %d SMs x %d threads/SM\n",
+                    fa.numRegs, (size_t) fa.localSizeBytes, (size_t) fa.constSizeBytes, (size_t) fa.sharedSizeBytes, stk, heap, fifo, nsm,
+                    prop.maxThreadsPerMultiProcessor);
+        }
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
@@ -3054,8 +3542,11 @@ struct MKEngine::Impl {
         if (slog) fclose(slog);
 #endif
         print_profile();
-        for (void * p : allocs) cudaFree(p);
+        mem_mark("at exit");
+        for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
+        cudaStreamSynchronize(0);
         if (embd_host) cudaFreeHost(embd_host);
+        if (ck_host) cudaFreeHost(ck_host);
     }
 
     void launch(int mode, int T, int last, int score = 0) {
@@ -3070,6 +3561,7 @@ struct MKEngine::Impl {
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+        if (memlog && launches_seen++ == 0) mem_mark("first mk_cycle launch");
         if (profiling && mode == MODE_DECODE) {
             std::vector<unsigned long long> pr(4096 + 1024 * 128);
             CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
@@ -3201,10 +3693,11 @@ struct MKEngine::Impl {
         int cap = 2048;
         if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
         hp.cap = cap;
+        mem_mark("before prefill scratch");
         hp.x = dalloc<float>((size_t) cap * D);
         hp.xm = dalloc<float>((size_t) cap * D);
         hp.rs = dalloc<float>(cap);
-        hp.xh = dalloc<__half>((size_t) cap * FF);
+        hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
         hp.xh2 = dalloc<__half>((size_t) cap * FF);
         hp.y0 = dalloc<float>((size_t) cap * FF);
         hp.y1 = dalloc<float>((size_t) cap * FF);
@@ -3216,12 +3709,14 @@ struct MKEngine::Impl {
         hp.qh = dalloc<__half>((size_t) cap * NH * HD);
         hp.tok = dalloc<int>(cap);
         hp.amax = dalloc<int>(cap);
+        mem_mark("prefill scratch");
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4NL>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4NL>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
@@ -3241,6 +3736,10 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_ATTN")) attn_old = atoi(e) == 1;
         if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
         if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
+        for (int w = 0; w < 2; w++)
+            for (int s = 0; s < N_ATT_SLOTS; s++)
+                if (attn_old && hb.kvb[w][s] != 8) throw std::runtime_error("MK_ATTN=1 (the original prefill attention) reads q8_0 only: no MK_KV");
+        mem_mark("prefill kernel attributes");
         pf_ready = true;
     }
 
@@ -3280,6 +3779,7 @@ struct MKEngine::Impl {
             case T_Q6K: pf::mmh<pf::TQ6K><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, X, ntok, O); break;
             case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
             case T_IQ4X: pf::mmh<pf::TIQ4><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, X, ntok, O); break;
+            case T_IQ4NL: pf::mmh<pf::TIQ4NL><<<grid, 256, pf::hm_smem<pf::TIQ4NL>()>>>(W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }
@@ -3403,7 +3903,7 @@ struct MKEngine::Impl {
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
-                    pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, T); });
+                    pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
                     pf_time("dn_prep", [&] { pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A); pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl); });
                     pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl); });
                     pf_time("dn_out", [&] { pk_dn_out<<<T, 256>>>(W.snorm); });
@@ -3451,6 +3951,7 @@ struct MKEngine::Impl {
         }
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
+        if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
         pf_report();
     }
 
