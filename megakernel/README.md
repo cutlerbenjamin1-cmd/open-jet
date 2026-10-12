@@ -179,7 +179,8 @@ divergence, perplexity and agreement against a reference file, see Correctness),
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
 megakernel instead), `MK_PF_CAP=n` (prefill chunk tokens), `MK_ATTN_PV16=0` / `MK_ATTN_SPLIT=0` (prefill
 attention with fp32-accumulated P V / without the tail split; with both, bit-identical to `MK_ATTN=1`, the
-original prefill attention kernel).
+original prefill attention kernel), `MK_ATTN_S8=0` (q8 cache: Q K^T on fp16 tensor cores instead of int8;
+`=2`: one Q scale per row instead of per 32 dims).
 
 ### The GGUF
 
@@ -305,7 +306,11 @@ processing the whole conversation as one fresh prompt.
   next phase load during the MMAs. P V accumulates in fp16 per 32-position tile, then in fp32. The
   q-tiles of the last, partial wave are split along the keys and merged. ~64 TFLOPS on a 3090 at
   30K-100K context (`bench/attn_bench.cu`), 1.9-2.4x the previous kernel; prefill of a 101K-token
-  prompt went from 128 s to 90 s.
+  prompt went from 128 s to 90 s. With the q8 cache (default), Q K^T runs on int8 tensor cores
+  straight from the cache (`pk_attn8`): Q is quantized per 32 dims like the cache, each 32-dim block's
+  int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles stream through a cp.async ring
+  and V is converted for the next tile while the current one computes (~84 TFLOPS-equivalent at 100K,
+  1.4x; attention of a 101K-token prompt 38 s -> 26 s, no measurable KLD change).
 
 ## Limitations
 

@@ -2581,20 +2581,25 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
 // hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
-__global__ void pk_glu(const float * g, const float * u, __half * out, int ld) {
+__global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, const float * __restrict__ u, __half * __restrict__ out, int ld) {
+    // thread = 4 consecutive values (one float4 of g and u: a warp reads 512 contiguous bytes of each); within a
+    // 16-group, values 4 j .. 4 j + 3 go to hperm slots 2 j, 2 j + 1 and 8 + 2 j, 9 + 2 j (two 4-byte stores)
     const size_t t = blockIdx.x;
-    for (int q = threadIdx.x; q < ld / 16; q += blockDim.x) {
-        const float * gp = g + t * ld + 16 * q;
-        const float * up = u + t * ld + 16 * q;
-        __align__(16) __half hv[16];
+    const float4 * g4 = reinterpret_cast<const float4 *>(g + t * ld);
+    const float4 * u4 = reinterpret_cast<const float4 *>(u + t * ld);
+    __half * o = out + t * ld;
+    for (int k = threadIdx.x; k < ld / 4; k += blockDim.x) {
+        const float4 a = g4[k], b = u4[k];
+        const float gv[4] = {a.x, a.y, a.z, a.w}, uv[4] = {b.x, b.y, b.z, b.w};
+        __half hv[4];
 #pragma unroll
-        for (int e = 0; e < 16; e++) {
-            const float gv = gp[e], v = gv / (1.0f + expf(-gv)) * up[e];
-            hv[pf::hperm(e)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
+        for (int e = 0; e < 4; e++) {
+            const float v = gv[e] / (1.0f + expf(-gv[e])) * uv[e];
+            hv[e] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
         }
-        uint4 * dst = reinterpret_cast<uint4 *>(out + t * ld + 16 * q);
-        dst[0] = reinterpret_cast<const uint4 *>(hv)[0];
-        dst[1] = reinterpret_cast<const uint4 *>(hv)[1];
+        __half * og = o + 16 * (k >> 2) + 2 * (k & 3);
+        *reinterpret_cast<__half2 *>(og) = __halves2half2(hv[0], hv[1]);
+        *reinterpret_cast<__half2 *>(og + 8) = __halves2half2(hv[2], hv[3]);
     }
 }
 
@@ -3726,6 +3731,8 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int dev = 0, nsm = 0, occ = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
@@ -3739,6 +3746,13 @@ struct MKEngine::Impl {
         for (int w = 0; w < 2; w++)
             for (int s = 0; s < N_ATT_SLOTS; s++)
                 if (attn_old && hb.kvb[w][s] != 8) throw std::runtime_error("MK_ATTN=1 (the original prefill attention) reads q8_0 only: no MK_KV");
+        // MK_ATTN_S8 (q8 cache, with PV16): 1 = int8 Q K^T, Q scales per 32-dim block (pk_attn8); 2 = per row; 0 = off
+        if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
+        if (attn_s8) {
+            int occ8 = 0;
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
+        }
         mem_mark("prefill kernel attributes");
         pf_ready = true;
     }
@@ -3746,6 +3760,7 @@ struct MKEngine::Impl {
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
     bool attn_old = false, attn_split = true, attn_pv16 = true;
+    int attn_s8 = 1;
     void attn(int T, int n, int slot) {
         if (attn_old) {
             if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
@@ -3758,7 +3773,11 @@ struct MKEngine::Impl {
         if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
-            if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            // pk_attn8 reads plain q8_0 K and V only; MK_KV q4 or rotated-K slots stay on pk_attn2
+            const bool s8 = attn_pv16 && hb.kvb[0][slot] == 8 && hb.kvb[1][slot] == 8 && !hb.kvr[slot];
+            if (s8 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (s8 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
         } else {
             if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
@@ -3786,11 +3805,14 @@ struct MKEngine::Impl {
 
     // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh: one fused GEMM when gate and
     // up share a type with in-row scales, else two GEMMs into y0 / y1 and pk_glu
+    static bool glu_fused(const Mat & g, const Mat & u) {
+        return g.type == u.type && g.rb == u.rb && (g.type == T_Q4K || g.type == T_Q5K || g.type == T_IQ4X);
+    }
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
-        if (g.type == u.type && g.rb == u.rb) {
+        if (glu_fused(g, u)) {
             switch (g.type) {
                 case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w); return;
                 case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w); return;
@@ -3810,7 +3832,7 @@ struct MKEngine::Impl {
     template <class F> void pf_time(const char * cat, F f) {
         if (!pf_prof) { f(); return; }
         // MK_PF_PROFILE=2: idempotent kernels are timed alone (5 repeats, min)
-        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_dn_in", "gemm_attn_qkv"};
+        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_ffn_gu2", "gemm_dn_in", "gemm_attn_qkv"};
         if (getenv("MK_PF_PROFILE")[0] == '2' && std::any_of(std::begin(idem), std::end(idem), [&](const char * c) { return !strcmp(c, cat); })) {
             float best = 1e30f;
             for (int r = 0; r < 5; r++) {
@@ -3911,7 +3933,8 @@ struct MKEngine::Impl {
                     dl++;
                 }
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.post_norm); });
-                pf_time("gemm_ffn_gu", [&] { gemm_glu(W.fg, W.fu, T); });
+                // (profile: gate / up pairs that run as two GEMMs + pk_glu are reported as gemm_ffn_gu2)
+                pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : "gemm_ffn_gu2", [&] { gemm_glu(W.fg, W.fu, T); });
                 pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
             }
             if (pred || sink) {

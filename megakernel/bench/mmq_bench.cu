@@ -6,6 +6,15 @@
 #include <random>
 #include <vector>
 
+#include <cuda_fp16.h>
+// IQ4_XS index -> value lookup used by prefill_gemm.cuh (defined in qwen38_mk.cu for the engine)
+__device__ __forceinline__ void iq4_lut(unsigned q, unsigned t0, unsigned t1, unsigned t2, unsigned t3, int & lo, int & hi) {
+    const unsigned sel = 0x32103210u | ((q & 0x88888888u) >> 1);
+    const unsigned a = __byte_perm(__byte_perm(t0, t1, q), __byte_perm(t2, t3, q), sel);
+    const unsigned b = __byte_perm(__byte_perm(t0, t1, q >> 16), __byte_perm(t2, t3, q >> 16), sel >> 16);
+    lo = (int) __byte_perm(a, b, 0x6420);
+    hi = (int) __byte_perm(a, b, 0x7531);
+}
 #include "../prefill_gemm.cuh"
 
 #define CK(x)                                                                                        \
