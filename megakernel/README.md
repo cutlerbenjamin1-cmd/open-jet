@@ -180,7 +180,8 @@ users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill 
 megakernel instead), `MK_PF_CAP=n` (prefill chunk tokens), `MK_ATTN_PV16=0` / `MK_ATTN_SPLIT=0` (prefill
 attention with fp32-accumulated P V / without the tail split; with both, bit-identical to `MK_ATTN=1`, the
 original prefill attention kernel), `MK_ATTN_S8=0` (q8 cache: Q K^T on fp16 tensor cores instead of int8;
-`=2`: one Q scale per row instead of per 32 dims).
+`=2`: one Q scale per row instead of per 32 dims), `MK_DATTN=0` (q8 cache: the previous, unpipelined
+decode attention; same output).
 
 ### The GGUF
 
@@ -262,8 +263,13 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   surely-accepted token; accepted drafts are replayed from a small (k, v, g, beta) ring at the
   start of the next cycle, so rejected drafts cost no state snapshots or extra state traffic.
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32
-  accumulation, online softmax), double-buffered 32-position K/V tiles in shared memory (the next
-  tile streams in while the current one is processed: ~5% faster cycles at 30K context).
+  accumulation, online softmax) over 32-position K/V tiles; the chunk boundaries depend on the
+  context length only, so greedy output does not depend on the draft depth. With the q8 cache
+  (`attn_core_q8`) each block runs a three-deep software pipeline with one barrier per tile
+  (S of tile j, softmax of tile j - 1 and P V of tile j - 2 on specialised warps), the raw q8 K and V
+  tiles stream through cp.async rings and both MMA operands are converted from int8 in registers.
+  Same arithmetic as the simple loop (bit-identical output), ~2x faster at 100K context: 650-750 GB/s
+  of KV per call; decode +18.7% at 101.6K depth, +7.3% at 38K (`bench/dattn_bench.cu`).
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent
   tokens (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers
   ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the
