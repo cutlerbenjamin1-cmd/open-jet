@@ -909,21 +909,30 @@ __device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst
     return dst;
 }
 
-// token embedding rows -> x, plus quantised attn_norm input for layer 0
+// token embedding rows -> x, plus quantised attn_norm input for layer 0.  Block s of row t handles the 16 units of
+// super-blocks 2s, 2s+1 (one per warp; 10 blocks per row, U_D / 16): a single block per row spent ~12 us in its
+// serial per-unit quantise chain while the grid waited (the row fetch itself is ~free, MK_EMBD_DEVICE A/B)
+constexpr int EMB_UB = 16; // units per embed block
+static_assert(U_D % EMB_UB == 0 && EMB_UB == NW, "embed_prologue: one unit per warp");
+__device__ __forceinline__ void stage_embd_part(int tok, int b0, int nbytes, uint8_t * dst) {
+    if (threadIdx.x < nbytes / 16)
+        reinterpret_cast<uint4 *>(dst)[threadIdx.x] = reinterpret_cast<const uint4 *>(cW.embd + (size_t) tok * EMBD_RB + b0)[threadIdx.x];
+    __syncthreads();
+}
 template <int T>
 __device__ __noinline__ void embed_prologue() {
-    const int t = blockIdx.x;
+    constexpr int NB = U_D / EMB_UB; // blocks per row
+    const int t = blockIdx.x / NB, s = blockIdx.x - t * NB;
     if (t >= T) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tok = ((volatile Ctl *) cB.ctl)->tok[t];
-    const uint8_t * row = stage_embd_row(tok, smem);
+    // units 16 s .. 16 s + 15 = elements [512 s, 512 s + 512) = Q4_K super-blocks 2 s, 2 s + 1 (288 bytes)
+    stage_embd_part(tok, 2 * s * 144, 2 * 144, smem);
     const float * w0 = cW.L[0].attn_norm;
-    for (int j = warp; j < U_D; j += NW) {
-        const int e = 32 * j + lane;
-        const float v = dequant_q4k(row, e);
-        cB.x[t * D + e] = v;
-        q32_store(cB.qn, t, j, v * w0[e], v * v, true);
-    }
+    const int j = EMB_UB * s + warp, e = 32 * j + lane;
+    const float v = dequant_q4k(smem, e - 512 * s);
+    cB.x[t * D + e] = v;
+    q32_store(cB.qn, t, j, v * w0[e], v * v, true);
 }
 
 // ffn_down (K = FF) whole-K rows out of line (half_rows) at the T of mask bit T: inlined into resid32's item loop,
@@ -2574,9 +2583,12 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
     if (draft_row) pos0 = vc->mtp_P + draft_idx;
     else pos0 = vc->mtp_pos[row0];
 
-    // M0: concat(enorm(embed(tok)), hnorm(h_prev)) -> qe
-    if (blockIdx.x < R) {
-        const int r = blockIdx.x;
+    // M0: concat(enorm(embed(tok)), hnorm(h_prev)) -> qe.  M0_NB blocks per row: each computes the row's two norms
+    // (the same sums in the same order in every block) and quantises its share of the 2 U_D units (was: one block per
+    // row doing all 320 units, ~20 us while the grid waited)
+    constexpr int M0_NB = 10;
+    if (blockIdx.x < R * M0_NB) {
+        const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
         const int pos = pos0 + r;
         const int tok = draft_row ? vc->tok[draft_idx] : vc->mtp_tok[row0 + r];
         const float * hsrc = draft_row ? cB.hm : (pos >= 1 ? cB.h_hist + (size_t) ((pos - 1) % H_RING) * D : nullptr);
@@ -2596,7 +2608,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         ae = bsum(ae, red);
         ah = bsum(ah, red + 16);
         const float rse = rsqrtf(ae / (float) D + EPS), rsh = rsqrtf(ah / (float) D + EPS);
-        for (int j = warp; j < 2 * U_D; j += NW) {
+        for (int j = s * NW + warp; j < 2 * U_D; j += M0_NB * NW) {
             const int e = 32 * (j % U_D) + lane;
             const float v = j < U_D ? se[e] * rse * cW.enorm[e] : sh[e] * rsh * cW.hnorm[e];
             q32_store(cB.qe, r, j, v, 0.f, false);
