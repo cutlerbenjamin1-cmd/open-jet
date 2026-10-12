@@ -1864,7 +1864,18 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
     float * m = misc(sm);
-    pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    // the draft head reads lm_head rows through cW.draft_ids (row r of head_d is lm_head row draft_ids[r])
+    const int * ids = draft ? cW.draft_ids : nullptr;
+    if (ids) {
+        const int r0 = 2 * gwarp();
+        if (r0 < cW.head_d.N)
+            for (int k = 0; k < 2; k++) {
+                const uint8_t * p = cW.head.w + (size_t) __ldg(ids + r0 + k) * cW.head.rb;
+                for (int off = lane * 128; off < 896; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+            }
+    } else {
+        pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    }
     fill_xs<TL>(cB.qn, t0, true, sx, m);
     float bv[TL];
     int bi[TL];
@@ -1878,7 +1889,14 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
-        mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
+        {
+            const uint8_t * rp[2];
+            const __half * dp[2] = {nullptr, nullptr}; // Q6_K: scales are in the rows
+            const int p0 = ids ? __ldg(ids + r) : r, p1 = ids ? __ldg(ids + r + 1) : r + 1;
+            rp[0] = head.w + (size_t) p0 * head.rb;
+            rp[1] = head.w + (size_t) p1 * head.rb;
+            rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
+        }
         wsum_acc<TL, 2>(a);
         if constexpr (LSE) {
             const float v0 = a[0][0] * m[0], v1 = a[1][0] * m[0];
@@ -2421,14 +2439,6 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     }
 }
 
-__global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * dsrc, __half * ddst, const int * ids,
-                            int rb, int nd) {
-    const int r = blockIdx.x, id = ids[r];
-    for (int i = threadIdx.x; i < rb / 16; i += blockDim.x)
-        reinterpret_cast<int4 *>(dst + (size_t) r * rb)[i] = reinterpret_cast<const int4 *>(src + (size_t) id * rb)[i];
-    for (int i = threadIdx.x; i < nd; i += blockDim.x) ddst[(size_t) r * nd + i] = dsrc[(size_t) id * nd + i];
-}
-
 #include "prefill.cuh"
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
@@ -2628,7 +2638,7 @@ struct MKEngine::Impl {
     std::vector<uint8_t> dv_in;
     int dv_base = 0;
 
-    // Adds the tokens not yet in the draft head's vocabulary (copies their lm_head rows).
+    // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
         if (dv_in.empty()) return; // full-vocabulary draft head
         const int n0 = (int) dv_ids.size();
@@ -2642,8 +2652,6 @@ struct MKEngine::Impl {
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
-        gather_rows<<<k, 256>>>(hw.head.w, const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb, hw.head.d,
-                                m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
@@ -3013,17 +3021,12 @@ struct MKEngine::Impl {
             if (ids.size() & 1) ids.push_back(ids.back());
             // room for DV_EXTRA more rows: tokens of the current sequence that are not in the list
             // are added on the fly (identifiers of pasted code, see dv_add)
+            // the draft head reads lm_head rows through the id list (lm_head), so no copy of the rows is kept
             const int cap = (int) ids.size() + DV_EXTRA;
             int * did = dalloc<int>(cap, false);
             CK(cudaMemcpy(did, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
             Mat m = hw.head;
             m.N = (int) ids.size();
-            uint8_t * w = dalloc<uint8_t>((size_t) cap * m.rb, false);
-            __half * d = m.nd ? dalloc<__half>((size_t) cap * m.nd, false) : nullptr;
-            gather_rows<<<m.N, 256>>>(hw.head.w, w, hw.head.d, d, did, m.rb, m.nd);
-            CK(cudaDeviceSynchronize());
-            m.w = w;
-            m.d = d;
             hw.head_d = m;
             hw.draft_ids = did;
             dv_ids = ids;
