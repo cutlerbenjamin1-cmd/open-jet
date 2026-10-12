@@ -2468,14 +2468,17 @@ struct MKEngine::Impl {
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
     int last_acc = 0;    // drafts the last decode cycle accepted
-    // draft-depth policy (MKEngine::set_policy)
+    // draft-depth policy (MKEngine::set_policy). Default: up to n_draft drafts, the on-device gate on the running
+    // product c_k of the MTP's own top-1 probabilities stops drafting after draft k >= 2 when c_k < 0.4 and drops
+    // the 4th draft (the T = 5 verify row) when c_4 < 0.4; sampled drafts when sampling. Tuned on replayed logs
+    // + live A/B (notes/agent_spec.md). The previous behaviour: "depth=0,drop=0,stop=0,chain=0,h1=0".
     struct Policy {
-        int depth = 0;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
+        int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
         int dmin = 1;
-        float gate_drop[4] = {0.f, 0.f, 0.f, 0.f}, gate_stop[4] = {0.f, 0.f, 0.f, 0.f}; // on-device early stop
-        int gate_chain = 0;
-        int h1 = 0; // sampling: sampled drafts (Launch::spec_smp)
+        float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
+        int gate_chain = 1;
+        int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
     } pol;
 #if MK_SPEC_LOG
     FILE * slog = nullptr;               // MK_SPEC_LOG_FILE: one JSON line per decode cycle
