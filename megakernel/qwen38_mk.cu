@@ -1624,24 +1624,27 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         float qv[2][8], qw[8];
         float2 rc[2][8];
         load8(W.qn + lane * 8, qw);
+        // Unconditional loads (rows >= R and lanes >= 8 load valid, unused data): conditionally assigned arrays
+        // were carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
+        // reserves for all 1,536 thread slots of every SM).
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
-            const int r = warp + 16 * k2;
-            if (r < R) {
-                const int hq = r / T, t = r % T, head = g * 6 + hq;
-                load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
-                if (lane < 8) {
-                    const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+            const int r = min(warp + 16 * k2, R - 1);
+            const int hq = r / T, t = r % T, head = g * 6 + hq;
+            load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
+            const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
 #pragma unroll
-                    for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
-                }
-            }
+            for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
         }
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = warp + 16 * k2;
             if (r < R) {
-                float * v = qv[k2];
+                // a copy, not a pointer into qv: a pointer made ptxas keep qv / qw / rc in local memory (~2 KB of
+                // mk_cycle's 2.8 KB stack frame over the 10 attn_core_t instances, reserved for 1,536 threads per SM)
+                float v[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] = qv[k2][k];
                 float ss = 0.f;
 #pragma unroll
                 for (int k = 0; k < 8; k++) ss += v[k] * v[k];
@@ -3229,12 +3232,77 @@ struct MKEngine::Impl {
         hb.ctx = ctx;
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
+        mem_mark("logits, sampling, ctl");
+        if (const char * spec = getenv("MK_KV_EMU_SPEC")) {
+#if MK_KV_EMU
+            // comma-separated <which><slot>=<bits>[r][a]: which K, V or * (both); slot 0..15 (attention layer 4 slot + 3),
+            // 16 (MTP) or * / empty (all); r: Hadamard rotation, a: q4_0-style scale (kv_store_emu)
+            const std::string s = spec;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                if (j == std::string::npos) j = s.size();
+                const std::string tok = s.substr(i, j - i);
+                i = j + 1;
+                if (tok.empty()) continue;
+                const size_t e = tok.find('=');
+                if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV_EMU_SPEC: bad item " + tok);
+                const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
+                int bits = 0, mode = 0;
+                size_t k = 0;
+                while (k < md.size() && isdigit((unsigned char) md[k])) bits = 10 * bits + (md[k++] - '0');
+                for (; k < md.size(); k++) {
+                    if (md[k] == 'r') mode |= 16;
+                    else if (md[k] == 'a') mode |= 32;
+                    else throw std::runtime_error("MK_KV_EMU_SPEC: bad mode " + md);
+                }
+                if (bits < 2 || bits > 8) throw std::runtime_error("MK_KV_EMU_SPEC: bits must be 2..8 in " + tok);
+                mode |= bits;
+                const bool all = sl.empty() || sl == "*";
+                const int slot = all ? -1 : std::stoi(sl);
+                if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV_EMU_SPEC: bad slot in " + tok);
+                for (int w = 0; w < 2; w++)
+                    if (tok[0] == '*' || tok[0] == "KV"[w])
+                        for (int q = 0; q < N_ATT_SLOTS; q++)
+                            if (all || q == slot) hb.kvemu[w][q] = mode == 8 ? 0 : mode;
+            }
+            fprintf(stderr, "[mk] MK_KV_EMU_SPEC %s: K", spec);
+            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[0][q]);
+            fprintf(stderr, " | V");
+            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[1][q]);
+            fprintf(stderr, "\n");
+            if (!hb.kvq8) throw std::runtime_error("MK_KV_EMU_SPEC needs the q8 KV cache (--kv q8)");
+#else
+            (void) spec;
+            throw std::runtime_error("MK_KV_EMU_SPEC needs a build with -DMK_KV_EMU=1");
+#endif
+        }
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
         int nb = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mk_cycle, NT, SM_TOTAL));
         if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
+        // The driver reserves local memory for every thread slot of the device (1,536 per SM x 82 SMs), sized by
+        // the larger of the stack-size limit (default 1 KB per thread = 123 MiB) and the launched kernels' own
+        // (static) frames. No kernel here needs a dynamic stack, so the limit only adds a floor: drop it.
+        {
+            const char * sl = getenv("MK_STACK_LIMIT");
+            CK(cudaDeviceSetLimit(cudaLimitStackSize, sl ? (size_t) atol(sl) : 0));
+        }
+        if (memlog) {
+            mem_mark("mk_cycle attributes");
+            cudaFuncAttributes fa{};
+            CK(cudaFuncGetAttributes(&fa, mk_cycle));
+            size_t stk = 0, heap = 0, fifo = 0;
+            CK(cudaDeviceGetLimit(&stk, cudaLimitStackSize));
+            CK(cudaDeviceGetLimit(&heap, cudaLimitMallocHeapSize));
+            CK(cudaDeviceGetLimit(&fifo, cudaLimitPrintfFifoSize));
+            fprintf(stderr, "[mk-mem] mk_cycle: %d regs, local %zu B/thread, const %zu B, static smem %zu B; limits: stack %zu B/thread, "
+                            "malloc heap %zu B, printf fifo %zu B; %d SMs x %d threads/SM\n",
+                    fa.numRegs, (size_t) fa.localSizeBytes, (size_t) fa.constSizeBytes, (size_t) fa.sharedSizeBytes, stk, heap, fifo, nsm,
+                    prop.maxThreadsPerMultiProcessor);
+        }
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
