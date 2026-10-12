@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -37,6 +38,11 @@
 // cycle appends a JSON line (drafts + their MTP top logits, verify rows, outcome). Analysis only.
 #ifndef MK_SPEC_LOG
 #define MK_SPEC_LOG 0
+#endif
+// MK_KV_EMU=1 (accuracy experiments): MK_KV_EMU_SPEC rounds chosen K / V cache slots to a lower-bit grid (kv_store_emu)
+// while keeping the q8 layout, so lower-bit KV formats can be scored per layer before the kernels support them.
+#ifndef MK_KV_EMU
+#define MK_KV_EMU 0
 #endif
 
 #define CK(x)                                                                                   \
@@ -177,6 +183,9 @@ struct Bufs {
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
     int ctx;
+#if MK_KV_EMU
+    int kvemu[2][N_ATT_SLOTS]; // per slot, K / V: 0 plain q8, else the kv_store_emu mode (MK_KV_EMU_SPEC)
+#endif
 };
 
 __constant__ ModelW cW;
@@ -1328,6 +1337,74 @@ __device__ __forceinline__ void kv_store_q8(int8_t * q, __half * sc, const float
     if ((lane & 3) == 0) sc[lane >> 2] = __float2half_rn(am / 127.0f);
 }
 
+#if MK_KV_EMU
+// 256-point fast Walsh-Hadamard transform of one row, 8 values per lane (scaled by 1/16: orthonormal, its own inverse)
+__device__ __forceinline__ void fwht256(float (&v)[8]) {
+#pragma unroll
+    for (int m = 1; m < 8; m <<= 1)
+#pragma unroll
+        for (int k = 0; k < 8; k++)
+            if (!(k & m)) {
+                const float a = v[k], b = v[k | m];
+                v[k] = a + b;
+                v[k | m] = a - b;
+            }
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1)
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[k], m);
+            v[k] = (lane & m) ? o - v[k] : v[k] + o;
+        }
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] *= 0.0625f;
+}
+
+// A K / V row rounded to a lower-bit grid with one fp16 scale per 32 values (the format a real low-bit cache would
+// store), written in the q8 layout. mode: bits (2..8) | 16: Hadamard-rotated first (the dequantized row is rotated
+// back and stored as ordinary q8, which adds q8 rounding) | 32: q4_0-style scale d = (signed max) / -2^(b-1) with
+// 2^b levels (else symmetric: d = max |x| / (2^(b-1) - 1)).
+__device__ __forceinline__ void kv_store_emu(int8_t * q, __half * sc, const float (&vin)[8], int mode) {
+    const int lane = threadIdx.x & 31, bits = mode & 15;
+    const bool rot = mode & 16, q40 = mode & 32;
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = vin[k];
+    if (rot) fwht256(v);
+    float am = 0.f, sv = 0.f; // largest |x| of the 32-value block and that x (ties: the larger x, same in all 4 lanes)
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        if (fabsf(v[k]) > am || (fabsf(v[k]) == am && v[k] > sv)) { am = fabsf(v[k]); sv = v[k]; }
+#pragma unroll
+    for (int m = 1; m <= 2; m <<= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, m), os = __shfl_xor_sync(0xffffffffu, sv, m);
+        if (oa > am || (oa == am && os > sv)) { am = oa; sv = os; }
+    }
+    const int h = 1 << (bits - 1);
+    const float d = q40 ? sv / (float) -h : am / (float) (h - 1);
+    const float id = d != 0.f ? 1.0f / d : 0.f;
+    const __half dh = __float2half_rn(d);
+    int qi[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        qi[k] = q40 ? min(2 * h - 1, (int) (v[k] * id + ((float) h + 0.5f))) - h : max(1 - h, min(h - 1, __float2int_rn(v[k] * id)));
+    if (!rot) {
+        unsigned w[2] = {0u, 0u};
+#pragma unroll
+        for (int k = 0; k < 8; k++) w[k >> 2] |= ((unsigned) qi[k] & 0xffu) << (8 * (k & 3));
+        *reinterpret_cast<uint2 *>(q + lane * 8) = make_uint2(w[0], w[1]);
+        if ((lane & 3) == 0) sc[lane >> 2] = dh;
+        return;
+    }
+    const float df = __half2float(dh);
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = df * (float) qi[k];
+    fwht256(v);
+    kv_store_q8(q, sc, v);
+}
+#endif
+
 // fp16 store of one KV row (same lane layout)
 __device__ __forceinline__ void kv_store_f16(__half * dst, const float (&v)[8]) {
     __half2 h[4];
@@ -1563,9 +1640,17 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
             const size_t row = slot0 + (size_t) g * ctx + pp;
+#if MK_KV_EMU
+            if (Q8 && cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot]);
+            else
+#endif
             if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
+#if MK_KV_EMU
+            if (Q8 && cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot]);
+            else
+#endif
             if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
             else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
         }
@@ -2571,6 +2656,27 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw.head_d.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
     Ctl hctl{};
+
+    // MK_MEMLOG=1: device memory accounting. Each mark prints the bytes dalloc'd since the previous mark
+    // and the drop of cudaMemGetInfo's free memory over the same span (the difference is allocation
+    // granularity, module code, local memory or another process).
+    const bool memlog = getenv("MK_MEMLOG") != nullptr;
+    size_t alloc_bytes = 0, mark_alloc = 0, mark_free = 0;
+    long launches_seen = 0, pf_runs_seen = 0;
+    void mem_mark(const char * tag) {
+        if (!memlog) return;
+        CK(cudaDeviceSynchronize());
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        if (mark_free)
+            fprintf(stderr, "[mk-mem] %-26s alloc %9.2f MiB   free drop %9.2f MiB   (free %9.1f MiB)\n", tag,
+                    (alloc_bytes - mark_alloc) / 1048576.0, ((double) mark_free - (double) fr) / 1048576.0, fr / 1048576.0);
+        else
+            fprintf(stderr, "[mk-mem] %-26s free %.1f MiB of %.1f MiB\n", tag, fr / 1048576.0, tot / 1048576.0);
+        mark_free = fr;
+        mark_alloc = alloc_bytes;
+    }
+
     size_t wbytes = 0;
     bool profiling = false;
     std::vector<double> ph_ns = std::vector<double>(PH_COUNT, 0.0);
@@ -2791,6 +2897,10 @@ struct MKEngine::Impl {
         cudaDeviceProp prop;
         CK(cudaGetDeviceProperties(&prop, 0));
         nsm = prop.multiProcessorCount;
+        if (memlog) {
+            CK(cudaFree(0));
+            mem_mark("context");
+        }
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
         // The kernels take the weight type as a template argument and dispatch on each matrix's
@@ -2878,6 +2988,7 @@ struct MKEngine::Impl {
             needq(blk(i, "ffn_up.weight"), L.fu.type);
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
+        mem_mark("weights: 64 layers + MTP");
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
         needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
@@ -2886,6 +2997,7 @@ struct MKEngine::Impl {
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
         if (hw.head.type != T_Q6K) throw std::runtime_error("output.weight must be Q6_K");
+        mem_mark("weights: eh, norms, lm_head");
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
         if (!draft_vocab.empty()) {
@@ -2920,6 +3032,7 @@ struct MKEngine::Impl {
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         }
+        mem_mark("draft head copy");
         {
             const auto & t = file.get("token_embd.weight");
             if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
@@ -2958,7 +3071,9 @@ struct MKEngine::Impl {
         hb.vbuf = dalloc<float>(MAXT * KVD);
         hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
         hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
+        mem_mark("decode act bufs, conv, kvgb");
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+        mem_mark("GDN recurrent state");
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
@@ -2973,9 +3088,11 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
                     rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, ctx);
         }
+        mem_mark("KV cache");
         hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
         hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
         hb.h_hist = dalloc<float>((size_t) H_RING * D);
+        mem_mark("attn partials, h ring");
         {
             std::vector<float2> rt((size_t) ctx * 32);
             for (int p = 0; p < ctx; p++)
@@ -2987,6 +3104,7 @@ struct MKEngine::Impl {
             CK(cudaMemcpy(d, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
             hb.rope = d;
         }
+        mem_mark("RoPE table");
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
         hb.blk_lse = dalloc<float2>((size_t) nsm);
@@ -3070,6 +3188,7 @@ struct MKEngine::Impl {
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+        if (memlog && launches_seen++ == 0) mem_mark("first mk_cycle launch");
         if (profiling && mode == MODE_DECODE) {
             std::vector<unsigned long long> pr(4096 + 1024 * 128);
             CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
@@ -3416,6 +3535,7 @@ struct MKEngine::Impl {
         }
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
+        if (memlog && pf_runs_seen++ == 0) mem_mark("first prefill run");
         pf_report();
     }
 

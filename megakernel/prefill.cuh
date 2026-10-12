@@ -487,6 +487,11 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
             *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         } else {
             const size_t row = ((size_t) slot * NKV + (it - NH) % NKV) * ctx + pos;
+#if MK_KV_EMU
+            if (cB.kvq8 && cB.kvemu[isv][slot])
+                kv_store_emu(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v, cB.kvemu[isv][slot]);
+            else
+#endif
             if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
