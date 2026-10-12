@@ -926,6 +926,12 @@ __device__ __noinline__ void embed_prologue() {
     }
 }
 
+// ffn_down (K = FF) whole-K rows out of line (half_rows) at the T of mask bit T: inlined into resid32's item loop,
+// resid32<2..4,17,*> spilled 20-88 B and the phase ran 0.17-0.25 ms per pass slower (notes/agent_mtpcut.md). T = 5
+// splits K anyway; the K = 5120 / 6144 roles stay inline (out of line they got slower).
+#ifndef MK_FD_NOINL
+#define MK_FD_NOINL 0x1c
+#endif
 // T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop.
 template <int T, int IT, int TYPE>
 __device__ __noinline__ void half_rows(const Mat W, int row0, const SX s, float (&a)[2][T], int u0) {
@@ -1021,7 +1027,8 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
             float a[2][T];
             zero_acc<T, 2>(a);
-            mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
+            if constexpr (IT == 17 && ((MK_FD_NOINL >> T) & 1)) half_rows<T, IT, TYPE>(W, 32 * j + 2 * warp, sx, a, 0);
+            else mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
             epilogue(j, a);
         }
     }
@@ -1059,7 +1066,9 @@ __device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
         float act[T];
 #pragma unroll
         for (int t = 0; t < T; t++) act[t] = 0.f;
-        constexpr int RG = T >= 3 ? 1 : 2; // rows per matrix per step (fewer at large T: register budget)
+        // one row per matrix per step at every T: the 2 + 2-row step T <= 2 used to take was slower (T = 1 / 2 ffn_gu
+        // 10.2 / 10.9 -> 9.0 / 9.4 ms per pass on UD-Q4_K_XL, where it spilled; notes/agent_mtpcut.md)
+        constexpr int RG = 1;
 #pragma unroll 1
         for (int r = 0; r < 16; r += RG) {
             const int row = 16 * j + r;
@@ -1098,7 +1107,7 @@ __device__ __noinline__ LaneT<T> rows16(const Mat m, int j) {
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(nullptr, U_D);
     const float * s_rs = misc(nullptr);
-    constexpr int R = T >= 3 ? 2 : 4;
+    constexpr int R = 2; // at every T (4 rows at T <= 2 spilled 44-160 B and ran 1.1-1.5 ms per pass slower)
     LaneT<T> res;
 #pragma unroll
     for (int t = 0; t < T; t++) res.v[t] = 0.f;
