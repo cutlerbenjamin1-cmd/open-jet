@@ -3957,15 +3957,20 @@ struct MKEngine::Impl {
         hp.amax = dalloc<int>(cap);
         mem_mark("prefill scratch");
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4NL>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4NL>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
-        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
+        mmh_attr<pf::TQ4K, false>();
+        mmh_attr<pf::TQ5K, false>();
+        mmh_attr<pf::TQ6K, false>();
+        mmh_attr<pf::TQ80, false>();
+        mmh_attr<pf::TIQ4, false>();
+        mmh_attr<pf::TIQ4NL, false>();
+        mmh_attr<pf::TQ4K, true>();
+        mmh_attr<pf::TQ5K, true>();
+        mmh_attr<pf::TIQ4, true>();
+        if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
+            pf_bn_force = atoi(e);
+            if (pf_bn_force != 0 && pf_bn_force != 32 && pf_bn_force != 64 && pf_bn_force != 128)
+                throw std::runtime_error("MK_PF_BN: 0, 32, 64 or 128");
+        }
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
@@ -4027,19 +4032,52 @@ struct MKEngine::Impl {
         if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, hp.y1);
     }
 
+    // GEMM token tile (pf::mmh NB): every NB gives bit-identical results, so this is a pure speed choice.
+    // At 128 a short prompt pads to 128 columns and the CTA is tensor-pipe bound on the padding (42 tokens: 2.1 us
+    // per 64-K stage, 86 of 128 columns wasted); 32 / 64 cut the MMA work and add CTAs.
+    // The choice is a small cost model over waves of CTAs (nrt row tiles x token tiles) on the nsm SMs, with the
+    // per-stage time of a lone CTA at NB = 32 / 64 / 128 (0.80 / 0.95 / 1.44, relative; the model's Q4_K .. Q8_0
+    // shapes, microbenchmark notes/ttft/gemm_nb.cu). NB 64 / 128 run one CTA per SM (shared memory), NB 32 two (a
+    // pair takes 1.77x as long as one CTA). It picks 32 for <= 32 tokens; up to 64 tokens 64, or 32 when the GEMM is
+    // narrow (40 row tiles x 2 token tiles still fit one wave); up to 128 tokens 128, or 64 when narrow; above that
+    // mostly 128. Chunks of more than 384 tokens always use 128 (the original kernel).
+    int pf_bn_force = 0; // MK_PF_BN
+    int pf_nb(int ntok, int nrt) const {
+        if (pf_bn_force) return pf_bn_force;
+        if (ntok > 384) return 128;
+        const int n32 = nrt * ((ntok + 31) / 32), n64 = nrt * ((ntok + 63) / 64), n128 = nrt * ((ntok + 127) / 128);
+        const double t32 = 0.80 * (n32 <= nsm ? 1.0 : 1.77 * ((n32 + 2 * nsm - 1) / (2 * nsm)));
+        const double t64 = 0.95 * ((n64 + nsm - 1) / nsm), t128 = 1.44 * ((n128 + nsm - 1) / nsm);
+        return t32 <= t64 && t32 <= t128 ? 32 : t64 <= t128 ? 64 : 128;
+    }
+    template <int TYPE, bool GLU> void mmh_attr() {
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 32>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 64>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 128>()));
+    }
+    // nrt row tiles (CTAs along N) x token tiles of pf_nb tokens
+    template <int TYPE, bool GLU>
+    void mmh_launch(int nrt, const pf::WMat & W, const __half * X, int ntok, const pf::Out & O, const uint8_t * W2 = nullptr) {
+        switch (pf_nb(ntok, nrt)) {
+            case 32: pf::mmh<TYPE, GLU, 32><<<dim3(nrt, (ntok + 31) / 32), 256, pf::hm_smem<TYPE, 32>()>>>(W, X, ntok, O, W2); break;
+            case 64: pf::mmh<TYPE, GLU, 64><<<dim3(nrt, (ntok + 63) / 64), 256, pf::hm_smem<TYPE, 64>()>>>(W, X, ntok, O, W2); break;
+            default: pf::mmh<TYPE, GLU, 128><<<dim3(nrt, (ntok + 127) / 128), 256, pf::hm_smem<TYPE, 128>()>>>(W, X, ntok, O, W2); break;
+        }
+    }
+
     // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
     void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr) {
         const pf::WMat W{m.w, m.d, m.type, m.K, m.N, m.rb, m.nd};
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
         const pf::Out O{y, ldy, mode, nullptr};
-        const dim3 grid(m.N / pf::BM, (ntok + pf::BN - 1) / pf::BN);
+        const int nrt = m.N / pf::BM;
         switch (m.type) {
-            case T_Q4K: pf::mmh<pf::TQ4K><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, X, ntok, O); break;
-            case T_Q5K: pf::mmh<pf::TQ5K><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, X, ntok, O); break;
-            case T_Q6K: pf::mmh<pf::TQ6K><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, X, ntok, O); break;
-            case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
-            case T_IQ4X: pf::mmh<pf::TIQ4><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, X, ntok, O); break;
-            case T_IQ4NL: pf::mmh<pf::TIQ4NL><<<grid, 256, pf::hm_smem<pf::TIQ4NL>()>>>(W, X, ntok, O); break;
+            case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
+            case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
+            case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O); break;
+            case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;
+            case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O); break;
+            case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }
@@ -4052,12 +4090,12 @@ struct MKEngine::Impl {
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
-        const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
+        const int nrt = g.N / (pf::BM / 2);
         if (glu_fused(g, u)) {
             switch (g.type) {
-                case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w); return;
-                case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w); return;
-                case T_IQ4X: pf::mmh<pf::TIQ4, true><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, hp.xh, ntok, O, u.w); return;
+                case T_Q4K: mmh_launch<pf::TQ4K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
+                case T_Q5K: mmh_launch<pf::TQ5K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
+                case T_IQ4X: mmh_launch<pf::TIQ4, true>(nrt, W, hp.xh, ntok, O, u.w); return;
                 default: break;
             }
         }
