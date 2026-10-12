@@ -2772,11 +2772,34 @@ struct MKEngine::Impl {
                         arr_last = std::vector<double>(PH_COUNT, 0.0);
     std::vector<long> arr_n = std::vector<long>(PH_COUNT, 0);
 
+    // Device buffers come from the default memory pool (stream-ordered allocator, never trimmed): it packs the
+    // allocations, where cudaMalloc rounds each one up to whole 2 MiB pages (~0.5 GB over the ~900 weight tensors).
+    // MK_CUDAMALLOC=1: plain cudaMalloc.
+    bool pool_init = false, use_pool = true;
     template <class T> T * dalloc(size_t n, bool zero = true) {
         void * p;
-        CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        if (!pool_init) {
+            pool_init = true;
+            const char * cm = getenv("MK_CUDAMALLOC");
+            int ok = 0;
+            cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, 0);
+            use_pool = ok && !(cm && cm[0] == '1');
+            if (use_pool) {
+                cudaMemPool_t pool;
+                CK(cudaDeviceGetDefaultMemPool(&pool, 0));
+                unsigned long long thr = ~0ull; // keep freed memory in the pool (nothing is freed before exit anyway)
+                CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr));
+            }
+        }
+        if (use_pool) {
+            CK(cudaMallocAsync(&p, n * sizeof(T) + 16, 0));
+            CK(cudaStreamSynchronize(0));
+        } else {
+            CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        }
         if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
         allocs.push_back(p);
+        alloc_bytes += n * sizeof(T) + 16;
         return (T *) p;
     }
 
@@ -3260,8 +3283,11 @@ struct MKEngine::Impl {
         if (slog) fclose(slog);
 #endif
         print_profile();
-        for (void * p : allocs) cudaFree(p);
+        mem_mark("at exit");
+        for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
+        cudaStreamSynchronize(0);
         if (embd_host) cudaFreeHost(embd_host);
+        if (ck_host) cudaFreeHost(ck_host);
     }
 
     void launch(int mode, int T, int last, int score = 0) {
