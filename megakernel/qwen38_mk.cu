@@ -112,7 +112,9 @@ struct LayerW {
     const float *attn_norm, *post_norm;
     // gated delta net
     Mat qkv, gate, sout;
-    const float *ab, *conv, *dt, *A, *snorm;
+    const float *ab, *conv, *dt, *A, *snorm; // ab: alpha | beta rows, fp32 with attn_norm folded in, or (UD, Q8_0):
+    const int8_t * abq;                      // int8 rows [2 NVH][D] + fp16 scales per 32 (abd): w = (q * d) * attn_norm
+    const __half * abd;
     // gated attention
     Mat q, k, v, o;
     const float *qn, *kn;
@@ -1161,16 +1163,36 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     // row split into AB_SPLIT K-chunks so these heavier items do not form a tail
     for (int it = gwarp(); it < n_ab; it += nwarps()) {
         const int row = it % (2 * NVH), ch = it / (2 * NVH);
-        const float * wr = W.ab + (size_t) row * D;
         float acc[T];
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = 0.f;
-        for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
-            const float4 w = ldw4f(wr + k);
+        if (W.abq) { // Q8_0 rows: the folded fp32 weights (q * d) * attn_norm, formed on the fly (same values)
+            const int8_t * qr = W.abq + (size_t) row * D;
+            const __half * dr = W.abd + (size_t) row * (D / 32);
+            for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                const int qw = ldw1(qr + k);
+                const float d = __half2float(dr[k >> 5]);
+                const float4 fn = __ldg(reinterpret_cast<const float4 *>(W.attn_norm + k));
+                float4 w;
+                w.x = ((float) (int8_t) (qw) * d) * fn.x;
+                w.y = ((float) (int8_t) (qw >> 8) * d) * fn.y;
+                w.z = ((float) (int8_t) (qw >> 16) * d) * fn.z;
+                w.w = ((float) (int8_t) (qw >> 24) * d) * fn.w;
 #pragma unroll
-            for (int t = 0; t < T; t++) {
-                const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
-                acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                for (int t = 0; t < T; t++) {
+                    const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                    acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                }
+            }
+        } else {
+            const float * wr = W.ab + (size_t) row * D;
+            for (int k = ch * (D / AB_SPLIT) + lane * 4; k < (ch + 1) * (D / AB_SPLIT); k += 128) {
+                const float4 w = ldw4f(wr + k);
+#pragma unroll
+                for (int t = 0; t < T; t++) {
+                    const float4 xv = __ldcg(reinterpret_cast<const float4 *>(cB.x + t * D + k));
+                    acc[t] += w.x * xv.x + w.y * xv.y + w.z * xv.z + w.w * xv.w;
+                }
             }
         }
 #pragma unroll
@@ -3087,6 +3109,30 @@ struct MKEngine::Impl {
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
+                const auto & raw_a = file.get(blk(i, "ssm_alpha.weight"));
+                const auto & raw_b = file.get(blk(i, "ssm_beta.weight"));
+                if (raw_a.type == gguf::Q8_0 && raw_b.type == gguf::Q8_0 && raw_a.ne[0] == D && raw_a.ne[1] == NVH &&
+                    raw_b.ne[0] == D && raw_b.ne[1] == NVH && !getenv("MK_AB_F32")) {
+                    // Q8_0 alpha / beta (UD) kept as int8 rows + fp16 block scales; the kernels form
+                    // (q * d) * attn_norm on the fly, the same fp32 values as the folded rows below (MK_AB_F32=1)
+                    std::vector<int8_t> q((size_t) 2 * NVH * D);
+                    std::vector<uint16_t> ds((size_t) 2 * NVH * (D / 32));
+                    for (int w = 0; w < 2; w++) {
+                        const uint8_t * src = (w ? raw_b : raw_a).data;
+                        for (size_t blk_ = 0; blk_ < (size_t) NVH * (D / 32); blk_++) {
+                            memcpy(&ds[(size_t) w * NVH * (D / 32) + blk_], src + blk_ * 34, 2);
+                            memcpy(&q[((size_t) w * NVH * (D / 32) + blk_) * 32], src + blk_ * 34 + 2, 32);
+                        }
+                    }
+                    int8_t * dq = dalloc<int8_t>(q.size(), false);
+                    CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+                    uint16_t * dd = dalloc<uint16_t>(ds.size(), false);
+                    CK(cudaMemcpy(dd, ds.data(), ds.size() * 2, cudaMemcpyHostToDevice));
+                    L.abq = dq;
+                    L.abd = reinterpret_cast<const __half *>(dd);
+                    L.ab = nullptr;
+                    wbytes += q.size() + ds.size() * 2;
+                } else {
                 // alpha/beta projections in fp32 with the attn_norm weight folded in
                 const Src ta = want(blk(i, "ssm_alpha.weight"), T_F32);
                 const Src tb = want(blk(i, "ssm_beta.weight"), T_F32);
@@ -3108,7 +3154,10 @@ struct MKEngine::Impl {
                 float * d = dalloc<float>(ab.size(), false);
                 CK(cudaMemcpy(d, ab.data(), ab.size() * 4, cudaMemcpyHostToDevice));
                 L.ab = d;
+                L.abq = nullptr;
+                L.abd = nullptr;
                 wbytes += ab.size() * 4;
+                }
             }
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
@@ -3721,7 +3770,7 @@ struct MKEngine::Impl {
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
-                    pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, T); });
+                    pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
                     pf_time("dn_prep", [&] { pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A); pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl); });
                     pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl); });
                     pf_time("dn_out", [&] { pk_dn_out<<<T, 256>>>(W.snorm); });
