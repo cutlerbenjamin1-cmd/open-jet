@@ -490,6 +490,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
+            if (it < NH && cB.kvq8 && cB.kvr[slot]) fwht256(v); // the slot's K is stored rotated (MK_KV "4r")
         }
         const float sc = it < NH ? 0.0625f : 1.0f;
         __half2 hv[4];
@@ -504,7 +505,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
                 kv_store_emu(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v, cB.kvemu[isv][slot]);
             else
 #endif
-            if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
+            if (cB.kvq8) kv_store(isv, slot, (size_t) ((it - NH) % NKV) * ctx + pos, v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
     }

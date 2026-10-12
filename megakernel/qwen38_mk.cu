@@ -170,6 +170,13 @@ struct Bufs {
     void *kc, *vc;     // KV cache [slot][kv head][ctx][HD]: fp16, or int8 (q8_0) when kvq8 ...
     __half *ksc, *vsc; // ... with one fp16 scale per 32 values: [slot][kv head][ctx][HD / 32]
     int kvq8;
+    // kvq8: per attention slot (16 layers + MTP) and K / V (MK_KV): kvb bits per value, 8 (q8_0) or 4 (q4: q4_0
+    // rounding, 16 levels, low nibbles of a lane's word = values 0..3), kvp its values [kv head][ctx][HD * bits / 8]
+    // (slots packed one after the other in kc / vc), kvs its scales [kv head][ctx][HD / 32] (= ksc / vsc + slot offset)
+    int8_t * kvp[2][N_ATT_SLOTS];
+    __half * kvs[2][N_ATT_SLOTS];
+    int kvb[2][N_ATT_SLOTS];
+    int kvr[N_ATT_SLOTS]; // K stored Hadamard-rotated (MK_KV "4r"): the queries get the same orthonormal 256-point rotation
     float * apart;
     float2 * aml;
     float *h_hist, *hm;
@@ -1404,7 +1411,29 @@ __device__ __forceinline__ void kv_store_q8(int8_t * q, __half * sc, const float
     if ((lane & 3) == 0) sc[lane >> 2] = __float2half_rn(am / 127.0f);
 }
 
-#if MK_KV_EMU
+// q4 store of one KV row (row = HD / 2 bytes), q4_0 rounding: per 32-value block d = (the value of largest
+// magnitude) / -8, nibble = min(15, (int) (x / d + 8.5)), value = (nibble - 8) d. Lane holds values 8 lane .. + 7 and
+// writes one word: low nibbles = values 0..3, high nibbles = values 4..7. Ties of |x| go to the larger x (the same
+// in all 4 lanes of a block). Bit-identical to MK_KV_EMU mode "4a".
+__device__ __forceinline__ void kv_store_q4(int8_t * q, __half * sc, const float (&v)[8]) {
+    const int lane = threadIdx.x & 31;
+    float am = 0.f, sv = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        if (fabsf(v[k]) > am || (fabsf(v[k]) == am && v[k] > sv)) { am = fabsf(v[k]); sv = v[k]; }
+#pragma unroll
+    for (int m = 1; m <= 2; m <<= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, m), os = __shfl_xor_sync(0xffffffffu, sv, m);
+        if (oa > am || (oa == am && os > sv)) { am = oa; sv = os; }
+    }
+    const float d = sv / -8.0f, id = d != 0.f ? 1.0f / d : 0.f;
+    unsigned w = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++) w |= (unsigned) min(15, (int) (v[k] * id + 8.5f)) << (k < 4 ? 8 * k : 8 * (k - 4) + 4);
+    *reinterpret_cast<unsigned *>(q + lane * 4) = w;
+    if ((lane & 3) == 0) sc[lane >> 2] = __float2half_rn(d);
+}
+
 // 256-point fast Walsh-Hadamard transform of one row, 8 values per lane (scaled by 1/16: orthonormal, its own inverse)
 __device__ __forceinline__ void fwht256(float (&v)[8]) {
 #pragma unroll
@@ -1427,6 +1456,18 @@ __device__ __forceinline__ void fwht256(float (&v)[8]) {
 #pragma unroll
     for (int k = 0; k < 8; k++) v[k] *= 0.0625f;
 }
+
+// one K (w = 0) or V (w = 1) row of attention slot `slot` in its MK_KV format; row = kv head * ctx + position
+__device__ __forceinline__ void kv_store(int w, int slot, size_t row, const float (&vin)[8]) {
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = vin[k];
+    if (w == 0 && cB.kvr[slot]) fwht256(v);
+    if (cB.kvb[w][slot] == 4) kv_store_q4(cB.kvp[w][slot] + row * (HD / 2), cB.kvs[w][slot] + row * (HD / 32), v);
+    else kv_store_q8(cB.kvp[w][slot] + row * HD, cB.kvs[w][slot] + row * (HD / 32), v);
+}
+
+#if MK_KV_EMU
 
 // A K / V row rounded to a lower-bit grid with one fp16 scale per 32 values (the format a real low-bit cache would
 // store), written in the q8 layout. mode: bits (2..8) | 16: Hadamard-rotated first (the dequantized row is rotated
@@ -1490,27 +1531,44 @@ __device__ __forceinline__ void q8_to_f16(uint2 q, float d, __half2 (&h)[4]) {
     }
 }
 
-// staged q8 K/V rows (KVQ_ROW bytes: values, then scales) -> fp16 rows of stride ld; rows x 2 tensors
-__device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK, __half * dV, int rows, int ld) {
+// 8 q4 values (one word in kv_store_q4's nibble order) + scale -> 4 fp16 pairs, the q8_to_f16 arithmetic
+__device__ __forceinline__ void q4_to_f16(unsigned w, float d, __half2 (&h)[4]) {
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int j0 = 2 * k, j1 = 2 * k + 1;
+        const int a = (int) ((w >> (j0 < 4 ? 8 * j0 : 8 * (j0 - 4) + 4)) & 0xfu) - 8;
+        const int b = (int) ((w >> (j1 < 4 ? 8 * j1 : 8 * (j1 - 4) + 4)) & 0xfu) - 8;
+        h[k] = __floats2half2_rn(d * (float) a, d * (float) b);
+    }
+}
+
+// staged q8 / q4 K/V rows (KVQ_ROW bytes: values, then scales at 256) -> fp16 rows of stride ld; rows x 2 tensors
+__device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK, __half * dV, int rows, int ld, bool kq4, bool vq4) {
     for (int i = threadIdx.x; i < 2 * rows * 32; i += blockDim.x) {
         const int which = i / (rows * 32), r = (i >> 5) % rows, c = i & 31;
         const uint8_t * row = src + (size_t) (which * rows + r) * KVQ_ROW;
+        const float d = __half2float(reinterpret_cast<const __half *>(row + 256)[c >> 2]);
         __half2 h[4];
-        q8_to_f16(*reinterpret_cast<const uint2 *>(row + 8 * c), __half2float(reinterpret_cast<const __half *>(row + 256)[c >> 2]), h);
+        if (which ? vq4 : kq4) q4_to_f16(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
+        else q8_to_f16(*reinterpret_cast<const uint2 *>(row + 8 * c), d, h);
         *reinterpret_cast<int4 *>((which ? dV : dK) + (size_t) r * ld + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
 
-// async copy of q8 K/V rows r < np (positions row0 + r) into the staging layout (rows >= np: zero scales)
-__device__ __forceinline__ void kv_stage(uint8_t * dst, size_t row0, int rows, int np) {
-    const int8_t * Kq = static_cast<const int8_t *>(cB.kc), * Vq = static_cast<const int8_t *>(cB.vc);
+// async copy of q8 / q4 K/V rows r < np (slot rows row0 + r) into the staging layout (rows >= np: zero scales)
+__device__ __forceinline__ void kv_stage(uint8_t * dst, const int8_t * Kq, const int8_t * Vq, const __half * Ks, const __half * Vs,
+                                         size_t row0, int rows, int np, bool kq4, bool vq4) {
     for (int i = threadIdx.x; i < 2 * rows * 17; i += blockDim.x) {
         const int which = i / (rows * 17), r = (i / 17) % rows, c = i % 17;
         uint8_t * d = dst + (size_t) (which * rows + r) * KVQ_ROW + 16 * c;
         if (r < np) {
             const size_t row = row0 + r;
-            if (c < 16) cp_async16(d, (which ? Vq : Kq) + row * HD + 16 * c);
-            else cp_async16(d, (which ? cB.vsc : cB.ksc) + row * (HD / 32));
+            const bool q4 = which ? vq4 : kq4;
+            if (c < 16) {
+                if (!q4 || c < 8) cp_async16(d, (which ? Vq : Kq) + row * (q4 ? HD / 2 : HD) + 16 * c);
+            } else {
+                cp_async16(d, (which ? Vs : Ks) + row * (HD / 32));
+            }
         } else if (c == 16) {
             *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
         }
@@ -1549,15 +1607,20 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     int nch, CS;
     attn_dims(n + T, nch, CS);
     const size_t ctx = cB.ctx;
-    const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    const uint8_t * Kc = static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rowb;
-    const uint8_t * Vc = static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rowb;
+    // bytes and 128-byte lines per K / V row (fp16 256 x 2, q8 256, q4 128)
+    const int rk = cB.kvq8 ? HD * cB.kvb[0][slot] / 8 : HD * 2, rv = cB.kvq8 ? HD * cB.kvb[1][slot] / 8 : HD * 2;
+    const int lk = rk / 128, lv = rv / 128, lines = max(lk, lv);
+    const uint8_t * Kc = cB.kvq8 ? reinterpret_cast<const uint8_t *>(cB.kvp[0][slot])
+                                 : static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rk;
+    const uint8_t * Vc = cB.kvq8 ? reinterpret_cast<const uint8_t *>(cB.kvp[1][slot])
+                                 : static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rv;
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
-            const size_t off = ((size_t) g * ctx + c0 + i / lines) * rowb + (i % lines) * 128;
-            pf_l2(Kc + off);
-            pf_l2(Vc + off);
+            const size_t pos = (size_t) g * ctx + c0 + i / lines;
+            const int l = i % lines;
+            if (l < lk) pf_l2(Kc + pos * rk + l * 128);
+            if (l < lv) pf_l2(Vc + pos * rv + l * 128);
         }
     }
 }
@@ -1621,11 +1684,13 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
     __half * Kc = static_cast<__half *>(cB.kc) + slot0 * HD;
     __half * Vc = static_cast<__half *>(cB.vc) + slot0 * HD;
+    const bool kq4 = Q8 && cB.kvb[0][slot] == 4, vq4 = Q8 && cB.kvb[1][slot] == 4; // MK_KV per-slot formats
     const int mt = warp >> 3, wn = warp & 7; // MMA work split: warp -> (row tile, column group)
 
     auto issue_tile = [&](int g, int tb, int np_, int st) {
         if constexpr (Q8) {
-            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, slot0 + (size_t) g * ctx + tb, TP, np_);
+            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, cB.kvp[0][slot], cB.kvp[1][slot], cB.kvs[0][slot], cB.kvs[1][slot],
+                     (size_t) g * ctx + tb, TP, np_, kq4, vq4);
             asm volatile("cp.async.commit_group;" ::: "memory");
             return;
         }
@@ -1687,6 +1752,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
                     for (int k = 0; k < 8; k++)
                         v[k] = lane < 4 ? v[k] * rc[k2][k].x - o[k] * rc[k2][k].y : o[k] * rc[k2][k].y + v[k] * rc[k2][k].x;
                 }
+                if (Q8 && cB.kvr[slot]) fwht256(v); // K of this slot is stored rotated (MK_KV "4r")
                 __half2 hq2[4];
 #pragma unroll
                 for (int k = 0; k < 4; k++) hq2[k] = __floats2half2_rn(v[2 * k] * 0.0625f, v[2 * k + 1] * 0.0625f);
@@ -1709,19 +1775,19 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            const size_t row = slot0 + (size_t) g * ctx + pp;
+            const size_t row = slot0 + (size_t) g * ctx + pp, srow = (size_t) g * ctx + pp;
 #if MK_KV_EMU
             if (Q8 && cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot]);
             else
 #endif
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
+            if constexpr (Q8) kv_store(0, slot, srow, v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
 #if MK_KV_EMU
             if (Q8 && cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot]);
             else
 #endif
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
+            if constexpr (Q8) kv_store(1, slot, srow, v);
             else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
         }
         if (tid < 32) {
@@ -1751,7 +1817,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             }
             __syncthreads();
             if constexpr (Q8) { // q8 stage -> the fp16 tile
-                kv_tile_to_f16(sKVq + st * 2 * TP * KVQ_ROW, sKV, sKV + TP * LDH, TP, LDH);
+                kv_tile_to_f16(sKVq + st * 2 * TP * KVQ_ROW, sKV, sKV + TP * LDH, TP, LDH, kq4, vq4);
                 __syncthreads();
             }
             // S = Q K^T : warp -> row tile mt, positions 8*wn .. 8*wn+7
@@ -3256,12 +3322,70 @@ struct MKEngine::Impl {
             // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime
             const bool q8 = kv_mode == 1 || (kv_mode < 0 && rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b);
             hb.kvq8 = q8;
-            hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-            hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+            // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default) or q4 (kv_store_q4), e.g. "V*=4,K16=4r":
+            // comma-separated <K|V|*><slot>=<8|4>[r], slot 0..15 = attention layer 4 slot + 3, 16 = MTP block, * or
+            // empty = all slots; r (K only): K and the queries Hadamard-rotated
+            const size_t srows = (size_t) NKV * ctx; // rows of one slot
+            for (int s = 0; s < N_ATT_SLOTS; s++) {
+                hb.kvb[0][s] = hb.kvb[1][s] = 8;
+                hb.kvr[s] = 0;
+            }
+            if (const char * spec = getenv("MK_KV")) {
+                if (!q8) throw std::runtime_error("MK_KV needs the q8 KV cache (--kv q8)");
+                const std::string str = spec;
+                size_t i = 0;
+                while (i < str.size()) {
+                    size_t j = str.find(',', i);
+                    if (j == std::string::npos) j = str.size();
+                    const std::string tok = str.substr(i, j - i);
+                    i = j + 1;
+                    if (tok.empty()) continue;
+                    const size_t e = tok.find('=');
+                    if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV: bad item " + tok);
+                    const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
+                    if (md != "8" && md != "4" && md != "8r" && md != "4r") throw std::runtime_error("MK_KV: expected 8, 4, 8r or 4r in " + tok);
+                    const bool rot = md.size() == 2;
+                    if (rot && tok[0] == 'V') throw std::runtime_error("MK_KV: rotation (r) is for K only: " + tok);
+                    const bool all = sl.empty() || sl == "*";
+                    const int slot = all ? -1 : std::stoi(sl);
+                    if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV: bad slot in " + tok);
+                    for (int w = 0; w < 2; w++)
+                        if (tok[0] == '*' || tok[0] == "KV"[w])
+                            for (int s = 0; s < N_ATT_SLOTS; s++)
+                                if (all || s == slot) {
+                                    hb.kvb[w][s] = md[0] - '0';
+                                    if (w == 0) hb.kvr[s] = rot;
+                                }
+                }
+            }
+            size_t vbytes[2] = {0, 0};
+            int n4 = 0;
+            for (int w = 0; w < 2; w++)
+                for (int s = 0; s < N_ATT_SLOTS; s++) {
+                    vbytes[w] += srows * HD * hb.kvb[w][s] / 8;
+                    n4 += hb.kvb[w][s] == 4 || (w == 0 && hb.kvr[s]);
+                }
+            hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
+            hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
             hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
             hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
-                    rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, ctx);
+            size_t off[2] = {0, 0};
+            for (int s = 0; s < N_ATT_SLOTS; s++)
+                for (int w = 0; w < 2; w++) { // slots packed in order: all-q8 gives the same addresses as [slot][head][ctx][HD]
+                    hb.kvp[w][s] = static_cast<int8_t *>(w ? hb.vc : hb.kc) + off[w];
+                    hb.kvs[w][s] = q8 ? (w ? hb.vsc : hb.ksc) + s * srows * (HD / 32) : nullptr;
+                    off[w] += srows * HD * hb.kvb[w][s] / 8;
+                }
+            const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2) / 1e9 : rows * HD * 4.0 / 1e9;
+            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
+            if (n4) {
+                std::string k, v;
+                for (int s = 0; s < N_ATT_SLOTS; s++) {
+                    k += hb.kvb[0][s] == 4 ? (hb.kvr[s] ? 'R' : '4') : (hb.kvr[s] ? 'r' : '8');
+                    v += hb.kvb[1][s] == 4 ? '4' : '8';
+                }
+                fprintf(stderr, "[mk] MK_KV bits per slot (layers 3, 7, .., 63, MTP; R = 4 rotated, r = 8 rotated): K %s  V %s\n", k.c_str(), v.c_str());
+            }
         }
         mem_mark("KV cache");
         hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
@@ -3333,6 +3457,9 @@ struct MKEngine::Impl {
             for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[1][q]);
             fprintf(stderr, "\n");
             if (!hb.kvq8) throw std::runtime_error("MK_KV_EMU_SPEC needs the q8 KV cache (--kv q8)");
+            for (int w = 0; w < 2; w++)
+                for (int s = 0; s < N_ATT_SLOTS; s++)
+                    if (hb.kvb[w][s] != 8 || hb.kvr[s]) throw std::runtime_error("MK_KV_EMU_SPEC needs an all-q8 cache (no MK_KV)");
 #else
             (void) spec;
             throw std::runtime_error("MK_KV_EMU_SPEC needs a build with -DMK_KV_EMU=1");
@@ -3606,6 +3733,9 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_ATTN")) attn_old = atoi(e) == 1;
         if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
         if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
+        for (int w = 0; w < 2; w++)
+            for (int s = 0; s < N_ATT_SLOTS; s++)
+                if (attn_old && hb.kvb[w][s] != 8) throw std::runtime_error("MK_ATTN=1 (the original prefill attention) reads q8_0 only: no MK_KV");
         mem_mark("prefill kernel attributes");
         pf_ready = true;
     }

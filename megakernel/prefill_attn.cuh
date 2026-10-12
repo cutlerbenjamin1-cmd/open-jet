@@ -232,17 +232,29 @@ struct A2Q8 {
     uint2 q[3];
     __half d[3];
 };
-__device__ __forceinline__ void a2_ld_q8(A2Q8 & r, const int8_t * rows, const __half * sc, int np) {
+// q4 (MK_KV): rows of HD / 2 bytes, chunk c = one word (kv_store_q4's nibble order) in q[k].x
+__device__ __forceinline__ void a2_ld_q8(A2Q8 & r, const int8_t * rows, const __half * sc, int np, bool q4 = false) {
 #pragma unroll
     for (int k = 0; k < 3; k++) {
         const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
         r.q[k] = make_uint2(0, 0);
         r.d[k] = __ushort_as_half(0);
         if (i < A2_K * 32 && p < np) {
-            r.q[k] = __ldg(reinterpret_cast<const uint2 *>(rows + (size_t) p * HD) + c);
+            if (q4) r.q[k].x = __ldg(reinterpret_cast<const unsigned *>(rows + (size_t) p * (HD / 2)) + c);
+            else r.q[k] = __ldg(reinterpret_cast<const uint2 *>(rows + (size_t) p * HD) + c);
             r.d[k] = sc[(size_t) p * (HD / 32) + (c >> 2)];
         }
     }
+}
+// 8 q4 values (nibble n = q + 8) + fp16 scale -> 4 fp16 pairs: 0x6400 | n is 1024 + n, minus 1032 is q exactly; d * q
+// rounded once to fp16, bit-identical to q4_to_f16 (decode)
+__device__ __forceinline__ void a2_q4h(unsigned w, __half d, __half2 (&h)[4]) {
+    const unsigned lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+    const __half2 off = __half2half2(__ushort_as_half(0x6408)), dd = __half2half2(d);
+    h[0] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4140)), off), dd);
+    h[1] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4342)), off), dd);
+    h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(hi, 0x64646464u, 0x4140)), off), dd);
+    h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(hi, 0x64646464u, 0x4342)), off), dd);
 }
 // 8 q8 values + fp16 scale -> 4 fp16 pairs, bit-identical to q8_to_f16: 0x6400 | (q ^ 0x80) is 1152 + q exactly,
 // and d * q is rounded once to fp16 either way (exact in fp32 there).  No I2F (quarter rate on sm_86).
@@ -255,17 +267,18 @@ __device__ __forceinline__ void a2_q8h(uint2 q, __half d, __half2 (&h)[4]) {
     h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(y, 0x64646464u, 0x4342)), off), dd);
 }
 // chunk k of the tile -> fp16 rows in shared memory
-__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k) {
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k, bool q4 = false) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
         __half2 h[4];
-        a2_q8h(r.q[k], r.d[k], h);
+        if (q4) a2_q4h(r.q[k].x, r.d[k], h);
+        else a2_q8h(r.q[k], r.d[k], h);
         *reinterpret_cast<int4 *>(dst + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
-__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst) {
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, bool q4) {
 #pragma unroll
-    for (int k = 0; k < 3; k++) a2_st_q8(r, dst, k);
+    for (int k = 0; k < 3; k++) a2_st_q8(r, dst, k, q4);
 }
 // fp16 K or V tile -> shared memory (cp.async, one commit group); rows >= np zeroed
 __device__ __forceinline__ void a2_cp_f16(__half * dst, const __half * src, int np) {
@@ -303,12 +316,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     const int ntile = pmax / A2_K + 1;
     const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
     const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
-    const int8_t * Kq = static_cast<const int8_t *>(cB.kc) + row0 * HD;
-    const int8_t * Vq = static_cast<const int8_t *>(cB.vc) + row0 * HD;
+    // q8 cache: the slot's K / V in their MK_KV formats (q8_0 or q4: rows of HD or HD / 2 bytes)
+    const bool kq4 = Q8 && cB.kvb[0][slot] == 4, vq4 = Q8 && cB.kvb[1][slot] == 4;
+    const int kst = kq4 ? HD / 2 : HD, vst = vq4 ? HD / 2 : HD;
+    const int8_t * Kq = cB.kvp[0][slot] + (size_t) g * cB.ctx * kst;
+    const int8_t * Vq = cB.kvp[1][slot] + (size_t) g * cB.ctx * vst;
     const __half * Kh = static_cast<const __half *>(cB.kc) + row0 * HD;
     const __half * Vh = static_cast<const __half *>(cB.vc) + row0 * HD;
-    const __half * Ks = cB.ksc + row0 * (HD / 32);
-    const __half * Vs = cB.vsc + row0 * (HD / 32);
+    const __half * Ks = cB.kvs[0][slot] + (size_t) g * cB.ctx * (HD / 32);
+    const __half * Vs = cB.kvs[1][slot] + (size_t) g * cB.ctx * (HD / 32);
 
     for (int i = tid; i < 6 * A2_Q * 32; i += A2_NT) { // 96 rows x 32 chunks of 16 B
         const int r = i >> 5, c = i & 31, h = r / A2_Q, tt = r % A2_Q;
@@ -321,9 +337,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     if (it0 < it1) {
         const int kb = it0 * A2_K, np = min(A2_K, pmax + 1 - kb);
         if constexpr (Q8) {
-            a2_ld_q8(rq, Kq + (size_t) kb * HD, Ks + (size_t) kb * (HD / 32), np);
-            a2_st_q8(rq, sK);
-            a2_ld_q8(rq, Vq + (size_t) kb * HD, Vs + (size_t) kb * (HD / 32), np);
+            a2_ld_q8(rq, Kq + (size_t) kb * kst, Ks + (size_t) kb * (HD / 32), np, kq4);
+            a2_st_q8(rq, sK, kq4);
+            a2_ld_q8(rq, Vq + (size_t) kb * vst, Vs + (size_t) kb * (HD / 32), np, vq4);
         } else {
             a2_cp_f16(sK, Kh + (size_t) kb * HD, np);
         }
@@ -362,7 +378,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
             mma16816(s[1], a[0], a[1], a[2], a[3], b[2], b[3]);
             // V(it) -> sV (free since the barrier above) between the MMAs, late enough for the loads to have landed
             if constexpr (Q8)
-                if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2);
+                if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2, vq4);
         }
         // causal mask, row maxima over the pair
         float mx0 = -INFINITY, mx1 = -INFINITY;
@@ -433,7 +449,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
         m1 = mn1;
         const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth; // A fragments of positions 0-15 / 16-31
         if constexpr (Q8) {
-            if (it + 1 < it1) a2_ld_q8(rq, Kq + (size_t) kn * HD, Ks + (size_t) kn * (HD / 32), npn);
+            if (it + 1 < it1) a2_ld_q8(rq, Kq + (size_t) kn * kst, Ks + (size_t) kn * (HD / 32), npn, kq4);
         } else {
             pf::cpa_wait<0>(); // V(it)
         }
@@ -463,7 +479,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                     mma16816(o[2 * j + 1], A.x, A.y, A.z, A.w, b[2], b[3]);
                     // K(it + 1) -> sK (free since the barrier above) late in the loop
                     if constexpr (Q8)
-                        if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1);
+                        if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1, kq4);
                 }
             }
         } else {
@@ -488,12 +504,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                 o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
                 o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
                 if constexpr (Q8)
-                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4); // K(it + 1) -> sK late in the loop
+                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4, kq4); // K(it + 1) -> sK late in the loop
             }
         }
         if constexpr (Q8) {
             if (nxt) {
-                a2_ld_q8(rq, Vq + (size_t) kn * HD, Vs + (size_t) kn * (HD / 32), npn);
+                a2_ld_q8(rq, Vq + (size_t) kn * vst, Vs + (size_t) kn * (HD / 32), npn, vq4);
             }
         }
     }
