@@ -1962,12 +1962,14 @@ __device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d
     return *reinterpret_cast<const unsigned *>(&r);
 }
 
-// one commit group's copies: K rows of a tile (kn valid rows, kn < 0: none) -> K stage dk, V rows of a tile -> dv;
-// rows >= the valid count get zero scales (their values are never used: masked S, P = 0)
-__device__ __forceinline__ void aq_issue(uint8_t * dk, size_t krow0, int kn, uint8_t * dv, size_t vrow0, int vn, int slot) {
+// one commit group's copies, issued by NTH threads (this one is thread t of them): K rows of a tile (kn valid rows,
+// kn < 0: none) -> K stage dk, V rows of a tile -> dv; rows >= the valid count get zero scales (their values are
+// never used: masked S, P = 0)
+template <int NTH>
+__device__ __forceinline__ void aq_issue(int t, uint8_t * dk, size_t krow0, int kn, uint8_t * dv, size_t vrow0, int vn, int slot) {
 #pragma unroll
-    for (int k = 0; k < (2 * ATP * 17 + NT - 1) / NT; k++) {
-        const int i = threadIdx.x + NT * k;
+    for (int k = 0; k < (2 * ATP * 17 + NTH - 1) / NTH; k++) {
+        const int i = t + NTH * k;
         if (i < 2 * ATP * 17) {
             const int which = i >= ATP * 17, j = which ? i - ATP * 17 : i, r = j / 17, c = j - 17 * r;
             const int np = which ? vn : kn;
@@ -2098,9 +2100,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         const int ntl = (c1 - c0 + TP - 1) / TP;
         const size_t grow = (size_t) g * ctx + c0;
         auto tnp = [&](int t) { return t < ntl ? min(TP, c1 - c0 - t * TP) : -1; }; // valid rows of tile t, -1: none
-        aq_issue(kring, grow, tnp(0), vring, grow, -1, slot);
+        aq_issue<NT>(tid, kring, grow, tnp(0), vring, grow, -1, slot);
         asm volatile("cp.async.commit_group;" ::: "memory");
-        aq_issue(kring + AQ_STG, grow + TP, tnp(1), vring, grow, tnp(0), slot);
+        aq_issue<NT>(tid, kring + AQ_STG, grow + TP, tnp(1), vring, grow, tnp(0), slot);
         asm volatile("cp.async.commit_group;" ::: "memory");
         asm volatile("cp.async.wait_group 1;" ::: "memory");
         __syncthreads();
@@ -2251,10 +2253,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 }
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
-            // interval jt - 1); then wait for K(jt + 1) and V(jt)
-            if (jt + 1 < ntl)
-                aq_issue(kring + ((jt + 2) % NSK) * AQ_STG, grow + (jt + 2) * TP, tnp(jt + 2), vring + ((jt + 1) % NSV) * AQ_STG,
-                         grow + (jt + 1) * TP, tnp(jt + 1), slot);
+            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains: -5% per tile at T >= 3);
+            // then wait for K(jt + 1) and V(jt)
+            if (jt + 1 < ntl && warp >= 4)
+                aq_issue<NT - 128>(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, grow + (jt + 2) * TP, tnp(jt + 2),
+                                   vring + ((jt + 1) % NSV) * AQ_STG, grow + (jt + 1) * TP, tnp(jt + 1), slot);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
