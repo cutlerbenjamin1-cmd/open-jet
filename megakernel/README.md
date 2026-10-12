@@ -276,7 +276,9 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   (S of tile j, softmax of tile j - 1 and P V of tile j - 2 on specialised warps), the raw q8 K and V
   tiles stream through cp.async rings and both MMA operands are converted from int8 in registers.
   Same arithmetic as the simple loop (bit-identical output), ~2x faster at 100K context: 650-750 GB/s
-  of KV per call; decode +18.7% at 101.6K depth, +7.3% at 38K (`bench/dattn_bench.cu`).
+  of KV per call; decode +18.7% at 101.6K depth, +7.3% at 38K (`bench/dattn_bench.cu`). Chunks of a
+  single tile (context <= 640) keep the simple loop, which has no pipeline to fill; q4 `MK_KV` cache
+  slots run the pipelined kernel too (`attn_core_q8m`, q4 fragments with the simple loop's values).
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent
   tokens (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers
   ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the
