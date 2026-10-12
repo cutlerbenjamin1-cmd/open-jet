@@ -25,9 +25,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -2766,52 +2769,156 @@ struct MKEngine::Impl {
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
-    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore is one ~8 ms PCIe copy per
-    // prompt). MK_CK_DEVICE=1 keeps it in device memory.
+    // The checkpoint lives in pinned host memory (0.16 GB of VRAM saved; a save or restore moves 0.17 GB over PCIe,
+    // 8-13 ms). MK_CK_DEVICE=1 keeps it in device memory.
+    // Neither copy is on the critical path (F9). Save: a device-to-device snapshot into the idle batched-prefill
+    // scratch on stream 0 (~0.4 ms), then the device-to-host copy on the non-blocking stream ck_st, which runs
+    // under the first decode launch (the decode kernels never touch the prefill scratch). Restore: the host-to-device
+    // copy runs on ck_st in CK_NG groups of DeltaNet layers; the next prefill's stream 0 waits for a group's event
+    // only before the first kernel that reads that group's state (pf_run: dn_prep of the group's first layer), so the
+    // copy overlaps the embedding / GEMMs of the layers before it. Same bytes, same order of use: bit-identical.
+    // If the scratch is too small for the snapshot (MK_PF_CAP below ~640), the save copies straight from the state
+    // and stream 0 waits for it before the state is next modified (still off the prompt's critical path).
     float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
     void * ck_host = nullptr;
     Ctl ck_ctl;
     int ck_pos = -1;
-    double ck_ms = 0; // last save / restore copy time (MK_MEMLOG)
+    double ck_ms = 0; // last save / restore enqueue time (MK_MEMLOG)
+    static constexpr size_t CK_NS = (size_t) 48 * NVH * 128 * 128, CK_NC = (size_t) 48 * CONV_RING * QKV, CK_NH = (size_t) H_RING * D;
+    static constexpr int CK_NG = 5;
+    static constexpr int ck_gb[CK_NG + 1] = {0, 1, 4, 12, 24, 48}; // restore group g: DeltaNet layers [ck_gb[g], ck_gb[g + 1])
+    cudaStream_t ck_st = nullptr;
+    cudaEvent_t ck_ev_src = nullptr, ck_ev_saved = nullptr, ck_ev_grp[CK_NG] = {};
+    bool ck_saving = false;      // a save's device-to-host copy may still be running on ck_st
+    bool ck_save_direct = false; // ... and it reads the live state (no snapshot): stream 0 must wait before modifying it
+    int ck_rs_next = CK_NG;      // first restore group stream 0 has not waited for (CK_NG: no restore pending)
+    struct CkChunk { char * dev; char * scr; char * host; size_t n; };
+    std::vector<CkChunk> ck_plan; // snapshot: state -> prefill scratch (stream 0) -> pinned host (ck_st)
+
     // Allocated at construction: cudaHostAlloc of the 0.16 GB takes 0.1-0.5 s under WSL2, which used to land in the
     // first prompt's time (inside the first ck_save).
     void ck_alloc() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
         const char * cd = getenv("MK_CK_DEVICE");
-        if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (ns + nc + nh) * 4, cudaHostAllocDefault) == cudaSuccess) {
+        if (!(cd && cd[0] == '1') && cudaHostAlloc(&ck_host, (CK_NS + CK_NC + CK_NH) * 4, cudaHostAllocDefault) == cudaSuccess) {
             ck_dstate = static_cast<float *>(ck_host);
-            ck_conv = ck_dstate + ns;
-            ck_hhist = ck_conv + nc;
+            ck_conv = ck_dstate + CK_NS;
+            ck_hhist = ck_conv + CK_NC;
+            CK(cudaStreamCreateWithFlags(&ck_st, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&ck_ev_src, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ck_ev_saved, cudaEventDisableTiming));
+            for (auto & e : ck_ev_grp) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         } else {
             cudaGetLastError();
             ck_host = nullptr;
-            ck_dstate = dalloc<float>(ns, false);
-            ck_conv = dalloc<float>(nc, false);
-            ck_hhist = dalloc<float>(nh, false);
+            ck_dstate = dalloc<float>(CK_NS, false);
+            ck_conv = dalloc<float>(CK_NC, false);
+            ck_hhist = dalloc<float>(CK_NH, false);
         }
         mem_mark(ck_host ? "DeltaNet checkpoint (host)" : "DeltaNet checkpoint");
     }
+    // snapshot plan over the prefill scratch buffers (after pf_init); empty when they are too small
+    void ck_make_plan() {
+        ck_plan.clear();
+        if (!ck_host) return;
+        const size_t cap = hp.cap;
+        const std::pair<void *, size_t> scr[] = {
+            {hp.y0, cap * FF * 4}, {hp.y1, cap * FF * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
+            {hp.xm, cap * D * 4},  {hp.dq, cap * QKV * 2}, {hp.xh, cap * 2 * D * 2}, {hp.qh, cap * NH * HD * 2}};
+        const std::tuple<void *, void *, size_t> reg[] = {
+            {hb.dstate, ck_dstate, CK_NS * 4}, {hb.conv, ck_conv, CK_NC * 4}, {hb.h_hist, ck_hhist, CK_NH * 4}};
+        size_t si = 0, so = 0; // scratch buffer, offset in it
+        for (const auto & r : reg) {
+            size_t done = 0;
+            while (done < std::get<2>(r)) {
+                while (si < std::size(scr) && scr[si].second - so < 256) si++, so = 0;
+                if (si == std::size(scr)) {
+                    ck_plan.clear();
+                    return;
+                }
+                const size_t n = std::min(std::get<2>(r) - done, (scr[si].second - so) & ~(size_t) 255);
+                ck_plan.push_back({static_cast<char *>(std::get<0>(r)) + done, static_cast<char *>(scr[si].first) + so,
+                                   static_cast<char *>(std::get<1>(r)) + done, n});
+                done += n;
+                so += n;
+            }
+        }
+    }
+    // host: the last save's device-to-host copy has finished (the watchdog covers the wait)
+    void ck_wait_saved() {
+        if (!ck_saving) return;
+        wait_event(ck_ev_saved, "the checkpoint save", std::max(wd_limit, 120.0));
+        ck_saving = ck_save_direct = false;
+    }
+    // stream 0: before modifying the live state, wait for a save that reads it directly (no snapshot)
+    void ck_guard_state() {
+        if (!(ck_saving && ck_save_direct)) return;
+        CK(cudaStreamWaitEvent(0, ck_ev_saved, 0));
+        ck_save_direct = false;
+    }
+    // stream 0: wait for the restore groups up to the one holding DeltaNet layer dl (-1: all of them)
+    void ck_wait_restore(int dl = -1) {
+        if (ck_rs_next >= CK_NG || (dl >= 0 && dl < ck_gb[ck_rs_next])) return;
+        int g = CK_NG - 1;
+        if (dl >= 0)
+            while (ck_gb[g] > dl) g--;
+        CK(cudaStreamWaitEvent(0, ck_ev_grp[g], 0));
+        ck_rs_next = g + 1;
+    }
     void ck_save() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        ck_wait_restore();
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpyAsync(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault, 0));
-        wait_device("the checkpoint save", std::max(wd_limit, 120.0));
-        CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        if (!ck_host) { // device checkpoint: stream-ordered device copies
+            CK(cudaMemcpyAsync(ck_dstate, hb.dstate, CK_NS * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(ck_conv, hb.conv, CK_NC * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, CK_NH * 4, cudaMemcpyDeviceToDevice, 0));
+        } else {
+            ck_wait_saved(); // the previous save still reading the scratch / writing the host buffer (normally long done)
+            for (const auto & c : ck_plan) CK(cudaMemcpyAsync(c.scr, c.dev, c.n, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaEventRecord(ck_ev_src, 0));
+            CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
+            if (!ck_plan.empty()) {
+                for (const auto & c : ck_plan) CK(cudaMemcpyAsync(c.host, c.scr, c.n, cudaMemcpyDeviceToHost, ck_st));
+            } else {
+                CK(cudaMemcpyAsync(ck_dstate, hb.dstate, CK_NS * 4, cudaMemcpyDeviceToHost, ck_st));
+                CK(cudaMemcpyAsync(ck_conv, hb.conv, CK_NC * 4, cudaMemcpyDeviceToHost, ck_st));
+                CK(cudaMemcpyAsync(ck_hhist, hb.h_hist, CK_NH * 4, cudaMemcpyDeviceToHost, ck_st));
+                ck_save_direct = true;
+            }
+            CK(cudaEventRecord(ck_ev_saved, ck_st));
+            ck_saving = true;
+        }
+        ck_ctl = hctl; // prefill() read ctl back after its last launch: the host copy is the device's
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (memlog) fprintf(stderr, "[mk-mem] checkpoint save %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
+        if (memlog)
+            fprintf(stderr, "[mk-mem] checkpoint save enqueued in %.2f ms (%s)\n", ck_ms,
+                    !ck_host ? "device" : ck_plan.empty() ? "host, direct" : "host, via the prefill scratch");
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        ck_wait_restore();
         const auto t0 = std::chrono::steady_clock::now();
-        CK(cudaMemcpyAsync(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault, 0));
-        CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault, 0));
-        wait_device("the checkpoint restore", std::max(wd_limit, 120.0));
+        if (!ck_host) {
+            ck_guard_state();
+            CK(cudaMemcpyAsync(hb.dstate, ck_dstate, CK_NS * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(hb.conv, ck_conv, CK_NC * 4, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyDeviceToDevice, 0));
+        } else {
+            ck_wait_saved();
+            // stream 0's earlier work on the state is complete before ck_st overwrites it
+            CK(cudaEventRecord(ck_ev_src, 0));
+            CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
+            CK(cudaMemcpyAsync(hb.h_hist, ck_hhist, CK_NH * 4, cudaMemcpyHostToDevice, ck_st)); // group 0
+            constexpr size_t SL = (size_t) NVH * 128 * 128, CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
+            for (int g = 0; g < CK_NG; g++) {
+                const size_t l0 = ck_gb[g], nl = ck_gb[g + 1] - ck_gb[g];
+                CK(cudaMemcpyAsync(hb.conv + l0 * CL, ck_conv + l0 * CL, nl * CL * 4, cudaMemcpyHostToDevice, ck_st));
+                CK(cudaMemcpyAsync(hb.dstate + l0 * SL, ck_dstate + l0 * SL, nl * SL * 4, cudaMemcpyHostToDevice, ck_st));
+                CK(cudaEventRecord(ck_ev_grp[g], ck_st));
+            }
+            ck_rs_next = 0;
+        }
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
+        if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore enqueued in %.2f ms (%s)\n", ck_ms, ck_host ? "host" : "device");
         hctl = ck_ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -2865,16 +2972,24 @@ struct MKEngine::Impl {
             return;
         }
         CK(cudaEventRecord(wd_ev, 0));
+        wait_event(wd_ev, what, limit);
+    }
+    // the same deadline for an event recorded elsewhere (the checkpoint copy stream)
+    void wait_event(cudaEvent_t ev, const char * what, double limit) {
+        if (limit <= 0.0) {
+            CK(cudaEventSynchronize(ev));
+            return;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         for (;;) {
-            const cudaError_t e = cudaEventQuery(wd_ev);
+            const cudaError_t e = cudaEventQuery(ev);
             if (e == cudaSuccess) return;
             if (e != cudaErrorNotReady) CK(e);
             const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (el > limit) {
                 const cudaError_t le = cudaPeekAtLastError();
                 fprintf(stderr,
-                        "[mk] watchdog: the GPU did not finish %s within %.0f s (mode %d, T %d, position %d, committed %d, "
+                        "[mk] watchdog: the GPU did not finish %s within %g s (mode %d, T %d, position %d, committed %d, "
                         "launches %ld, last CUDA error: %s). The device or its driver is stuck: exiting with code 3.\n",
                         what, limit, wd_mode, wd_T, hctl.n, hctl.dn_c, launches_seen, cudaGetErrorString(le));
                 fflush(stderr);
@@ -3547,6 +3662,7 @@ struct MKEngine::Impl {
         // the DeltaNet checkpoint and the batched-prefill scratch are allocated here, not inside the first prompt's time
         ck_alloc();
         pf_init();
+        ck_make_plan();
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
@@ -3596,8 +3712,16 @@ struct MKEngine::Impl {
 #endif
         print_profile();
         mem_mark("at exit");
+        ck_wait_saved(); // a checkpoint copy may still read the scratch / write the host buffer
+        ck_wait_restore();
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         cudaStreamSynchronize(0);
+        if (ck_st) {
+            cudaStreamSynchronize(ck_st);
+            cudaStreamDestroy(ck_st);
+            for (cudaEvent_t e : {ck_ev_src, ck_ev_saved}) cudaEventDestroy(e);
+            for (cudaEvent_t e : ck_ev_grp) cudaEventDestroy(e);
+        }
         if (embd_host) cudaFreeHost(embd_host);
         if (ck_host) cudaFreeHost(ck_host);
     }
@@ -3611,6 +3735,8 @@ struct MKEngine::Impl {
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
         void * args[] = {&L};
+        ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
+        ck_guard_state();
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
@@ -3957,9 +4083,9 @@ struct MKEngine::Impl {
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
                 int first = 0) {
         pf_init();
+        ck_wait_saved(); // the scratch may still be the source of the last checkpoint save
+        ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
-        if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
-        else CK(cudaMemcpy(hp.h, hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         for (int c0 = 0; c0 < N; c0 += cap) {
             const int T = std::min(cap, N - c0), n = n0 + c0;
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
@@ -3978,6 +4104,7 @@ struct MKEngine::Impl {
                 } else {
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
                     pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
+                    ck_wait_restore(dl); // this layer's conv ring / state may still be arriving from the checkpoint
                     pf_time("dn_prep", [&] { pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A); pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl); });
                     pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl); });
                     pf_time("dn_out", [&] { pk_dn_out<<<T, 256>>>(W.snorm); });
@@ -4015,6 +4142,10 @@ struct MKEngine::Impl {
                 }
                 continue;
             }
+            if (c0 == 0) { // hp.h row 0: the hidden state before the chunk, read only by pk_mtp_in (after every restore wait)
+                if (n0 == 0) CK(cudaMemsetAsync(hp.h, 0, D * sizeof(float), 0));
+                else CK(cudaMemcpyAsync(hp.h, hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+            }
             pf_time("mtp", [&] {
                 pk_final_h<<<T, 256>>>(T, n);
                 pk_mtp_in<<<T, 256>>>();
@@ -4034,6 +4165,8 @@ struct MKEngine::Impl {
     }
 
     void reset() {
+        ck_wait_restore();
+        ck_guard_state();
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
@@ -4273,6 +4406,7 @@ int MKEngine::step(std::vector<int> & out) {
 std::vector<float> MKEngine::last_hidden() {
     std::vector<float> h(D);
     const int pos = p_->hctl.dn_c - 1;
+    p_->ck_wait_restore();
     CK(cudaMemcpy(h.data(), p_->hb.h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
 }
