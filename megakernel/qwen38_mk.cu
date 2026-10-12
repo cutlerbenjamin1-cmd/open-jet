@@ -49,6 +49,11 @@
 #ifndef MK_KV_EMU
 #define MK_KV_EMU 0
 #endif
+// MK_DA_ROUTE=1 (default): on the q8 cache, chunks of one K/V tile (L_ctx <= ATT_BUCKET) run attn_core_t (no pipeline
+// fill: faster there; same partials as attn_core_q8). 0 = attn_core_q8 for every all-q8 slot (A/B builds).
+#ifndef MK_DA_ROUTE
+#define MK_DA_ROUTE 1
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -1966,7 +1971,8 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 //   per position feeds 4 tiles. Each output element is the same MMA dot product (same operand values, same k order),
 //   only its column slot in the MMA differs.
 // - The softmax keeps attn_core_t's float operations and its butterfly sum tree (position bit 4 first, then 3 .. 0).
-// q4 / emulated-format slots (MK_KV) keep attn_core_t; MK_DATTN=0 selects attn_core_t for every slot.
+// q4 / emulated-format slots (MK_KV), chunks of a single tile (L_ctx <= ATT_BUCKET, MK_DA_ROUTE) and MK_DATTN=0 keep
+// attn_core_t.
 
 // d * q rounded once to fp16 for the two int8 values in bytes 0 and 1 of u: 0x6400 | (q ^ 0x80) is the fp16 1152 + q,
 // minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value)
@@ -2313,10 +2319,14 @@ __device__ __noinline__ void attn_core_q8(const LayerW & W, int slot, int n) {
     attn_core_q8_t<T>(W, slot, n);
 }
 
+// q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET; MK_DA_ROUTE), attn_core_t for
+// one-tile chunks (the pipeline fill does not pay there), q4 MK_KV slots and MK_DATTN=0. Every choice gives the same
+// partials. One call site per kernel: attn_core_t is force-inlined, a second site would duplicate it.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
     if (cB.kvq8) {
-        if (cB.dattn && cB.kvb[0][slot] == 8 && cB.kvb[1][slot] == 8) attn_core_q8<T>(W, slot, n);
+        if (cB.dattn && (!MK_DA_ROUTE || n + T > ATT_BUCKET) && cB.kvb[0][slot] == 8 && cB.kvb[1][slot] == 8)
+            attn_core_q8<T>(W, slot, n);
         else attn_core_t<T, true>(W, slot, n);
     } else {
         attn_core_t<T, false>(W, slot, n);
