@@ -3625,7 +3625,7 @@ struct MKEngine::Impl {
         hb.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
         hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
-        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
+        hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
@@ -4216,6 +4216,14 @@ struct MKEngine::Impl {
         pf_report();
     }
 
+    // cB.logits ([MAXT][VOCAB] fp32, 5 MB): only scoring launches (Launch::score == 2) write it
+    void logits_alloc() {
+        if (hb.logits) return;
+        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
+        CK(cudaMemcpyToSymbol(cB, &hb.logits, sizeof(hb.logits), offsetof(Bufs, logits)));
+        mem_mark("scoring logits");
+    }
+
     void reset() {
         ck_wait_restore();
         ck_guard_state();
@@ -4393,6 +4401,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     const int N = (int) tokens.size();
     if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
     reset();
+    p_->logits_alloc();
     mk_from = std::min(std::max(mk_from, 0), N);
     if (mk_from > 0)
         p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
