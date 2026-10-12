@@ -81,6 +81,17 @@ int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, 
     }
 }
 
+// draft-depth policy "key=value,..." (MKEngine::set_policy); returns 0, or -1 on a bad spec
+int mk_set_policy(void * hp, const char * spec) {
+    try {
+        static_cast<Handle *>(hp)->eng->set_policy(spec ? spec : "");
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
 // appends tokens to the sequence; returns the first generated token (negative on error)
 int mk_prefill(void * hp, const int * toks, int n) {
     try {
@@ -135,6 +146,14 @@ void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     *cycles = s.cycles;
     *drafted = s.drafted;
     *accepted = s.accepted;
+}
+
+// the last step: tokens verified (T), drafts produced for the next step, drafts accepted
+void mk_last(void * hp, int * T, int * nd, int * acc) {
+    const auto & s = static_cast<Handle *>(hp)->eng->stats;
+    *T = s.last_T;
+    *nd = s.last_nd;
+    *acc = s.last_acc;
 }
 
 } // extern "C"

@@ -9,6 +9,7 @@ struct MKStats {
     long cycles = 0;
     long drafted = 0;
     long accepted = 0;
+    int last_T = 0, last_nd = 0, last_acc = 0; // the last step: tokens verified, drafts produced, accepted
 };
 
 class MKEngine {
@@ -28,6 +29,9 @@ class MKEngine {
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
     void set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed);
+    // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
+    // MK_POLICY sets it at construction.
+    void set_policy(const std::string & spec);
     // Drops emitted tokens beyond `len` sequence positions (e.g. those generated after an
     // end-of-turn token within the last cycle) before the next prefill.
     void truncate(int len);

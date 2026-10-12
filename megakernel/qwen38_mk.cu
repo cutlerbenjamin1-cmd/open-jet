@@ -33,6 +33,12 @@
 #include "gguf.h"
 #include "qwen38_mk.h"
 
+// MK_SPEC_LOG=1: the draft head keeps its top logits, and with MK_SPEC_LOG_FILE=<path> every decode
+// cycle appends a JSON line (drafts + their MTP top logits, verify rows, outcome). Analysis only.
+#ifndef MK_SPEC_LOG
+#define MK_SPEC_LOG 0
+#endif
+
 #define CK(x)                                                                                   \
     do {                                                                                        \
         cudaError_t e_ = (x);                                                                   \
@@ -138,7 +144,14 @@ struct Ctl {
     int mtp_R, mtp_logits, mtp_P;
     int mtp_pos[8], mtp_tok[8];
     int tgt[8];
-    int pad[8];
+    // draft confidence: dconf[k] = the MTP's own softmax probability of draft k + 1 (tok[k + 1]) over the
+    // draft vocabulary, dchain = their running product; nd_prod = drafts this launch produced (the
+    // early-stop gate may end drafting before Launch::ndraft), nd_stop = the gate fired
+    float dconf[8];
+    float dchain;
+    int nd_prod, nd_stop;
+    int dsmp; // the drafts in tok[1..] were sampled from q' (cB.dq; speculative sampling with sampled drafts)
+    int pad[4];
 };
 
 struct Bufs {
@@ -154,6 +167,9 @@ struct Bufs {
     float *h_hist, *hm;
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
     float2 * blk_best; // per block: best (logit, id) per row, or the TOPK_MAX best when sampling
+    float2 * blk_lse;  // per block: (max, sum of exp) of the draft logits (draft confidence)
+    float2 * dlog;     // MK_SPEC_LOG: per draft [MAXT][TOPK_MAX + 1]: its top logits (logit, token id), then (lse, best)
+    float2 * dq;       // sampled drafts: per draft [MAXT][TOPK_MAX] its proposal q' as (prob, token id), then (0, -1)
     float2 * cand;     // [MAXT][TOPK_MAX] best (logit, id) of the main lm_head rows, descending (sampling)
     float * logits;    // [MAXT][VOCAB] main lm_head logits of a scoring launch (Launch::score == 2)
     unsigned * bar;
@@ -173,6 +189,14 @@ struct Launch {
     float temp, top_p, min_p;
     int top_k; // <= TOPK_MAX
     unsigned long long seed;
+    // draft early stop on the MTP's confidence f (its softmax top-1 probability, or with gate_chain the
+    // running product over this launch's drafts), per draft index k: f < gate_drop[k] drops the draft and
+    // stops drafting, f < gate_stop[k] keeps it and stops. All 0: off (always Launch::ndraft drafts).
+    float gate_drop[4], gate_stop[4];
+    int gate_chain;
+    // sampling: draft from the MTP's own sampling distribution q' and verify with min(1, p / q') plus the
+    // residual max(0, p - q') (distribution-exact; higher acceptance than argmax drafts at temp 1)
+    int spec_smp;
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
 
@@ -1728,10 +1752,14 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 
 // lm_head over TL rows (qn rows t0..t0+TL-1) with greedy argmax; returns true in the single
 // block that finished last, which holds the reduced argmax in s_tok.  TOPK: additionally keeps the
-// TOPK_MAX best logits of each row in cB.cand (for sampling).  FULL: additionally stores every
-// logit of each row in cB.logits (scoring).
-template <int TL, bool TOPK = false, bool FULL = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok) {
+// TOPK_MAX best logits of each row in cand (default cB.cand; for sampling).  FULL: additionally stores
+// every logit of each row in cB.logits (scoring).  LSE (TL == 1): also the log-sum-exp of the row's
+// true logits; the last block leaves misc[LM_LSE] = lse and misc[LM_BEST] = the best true logit.
+// Draft rows: s_tok and the TOPK ids are token ids (mapped through cW.draft_ids).
+constexpr int LM_LSE = 240, LM_BEST = 241, LM_WLSE = 208; // misc() slots ([LM_WLSE, +2 * NW): per-warp lse)
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr) {
+    static_assert(!LSE || TL == 1, "LSE: one row");
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
@@ -1745,12 +1773,19 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         bv[t] = -INFINITY;
         bi[t] = TOPK ? -1 : 0;
     }
+    float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
         mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
         wsum_acc<TL, 2>(a);
+        if constexpr (LSE) {
+            const float v0 = a[0][0] * m[0], v1 = a[1][0] * m[0];
+            const float mx = fmaxf(lm_m, fmaxf(v0, v1));
+            lm_s = lm_s * __expf(lm_m - mx) + __expf(v0 - mx) + __expf(v1 - mx);
+            lm_m = mx;
+        }
         if constexpr (FULL) {
             if (lane == 0) {
 #pragma unroll
@@ -1769,6 +1804,12 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                 if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r; }
                 if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1; }
             }
+        }
+    }
+    if constexpr (LSE) {
+        if (lane == 0) {
+            m[LM_WLSE + 2 * warp] = lm_m;
+            m[LM_WLSE + 2 * warp + 1] = lm_s;
         }
     }
     if constexpr (TOPK) {
@@ -1810,6 +1851,14 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             cB.blk_best[blockIdx.x * MAXT + tid] = make_float2(b, __int_as_float(ix));
         }
     }
+    if constexpr (LSE) { // block's (max, sum of exp); the per-warp values were published before a barrier above
+        if (tid == NT - 1) {
+            float M = -INFINITY, S = 0.f;
+            for (int w = 0; w < NW; w++) M = fmaxf(M, m[LM_WLSE + 2 * w]);
+            for (int w = 0; w < NW; w++) S += m[LM_WLSE + 2 * w + 1] * __expf(m[LM_WLSE + 2 * w] - M);
+            cB.blk_lse[blockIdx.x] = make_float2(M, S);
+        }
+    }
     __threadfence();
     __syncthreads();
     int * s_last = reinterpret_cast<int *>(m + 200);
@@ -1817,6 +1866,17 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     __syncthreads();
     if (!s_last[0]) return false;
     __threadfence();
+    if constexpr (LSE) {
+        if (tid == NT - 1) {
+            float M = -INFINITY, S = 0.f;
+            for (int k = 0; k < (int) gridDim.x; k++) M = fmaxf(M, __ldcg(&cB.blk_lse[k]).x);
+            for (int k = 0; k < (int) gridDim.x; k++) {
+                const float2 e = __ldcg(&cB.blk_lse[k]);
+                S += e.y * __expf(e.x - M);
+            }
+            m[LM_LSE] = M + __logf(S);
+        }
+    }
     if constexpr (TOPK) {
         if (warp < TL) {
             float v = -INFINITY;
@@ -1826,9 +1886,13 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                     const float2 e = __ldcg(&cB.blk_best[((size_t) k * MAXT + warp) * TOPK_MAX + j]);
                     if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
                 }
-            cB.cand[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
+            if (draft && cW.draft_ids && id >= 0) id = cW.draft_ids[id];
+            (cand ? cand : cB.cand)[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
             const int best = __shfl_sync(0xffffffffu, id, 0);
-            if (lane == 0) s_tok[warp] = best;
+            if (lane == 0) {
+                s_tok[warp] = best;
+                if (LSE) m[LM_BEST] = v;
+            }
         }
     } else if (tid < TL) {
         float b = -INFINITY;
@@ -1839,6 +1903,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             if (e.x > b || (e.x == b && id < ix)) { b = e.x; ix = id; }
         }
         s_tok[tid] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
+        if (LSE) m[LM_BEST] = b * m[0];
     }
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
@@ -1898,11 +1963,47 @@ __device__ int cand_draw(const float2 * c, const float (&p)[TOPK_MAX], int K, in
     return last;
 }
 
-// Sampled targets for the verified rows (speculative sampling with point-mass drafts): draft token d
-// at row i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i
-// without d (the residual distribution), and the rows after it are dropped.  Rows with no draft to
-// verify (the bonus row, the last prompt row) are drawn from p_i.  tg then drives the greedy
-// acceptance logic of main_control unchanged.
+// q'(id) of a sampled draft's proposal list (prob, id) ... terminated by id -1. Sums every entry of the
+// token: the draft head can hold a token twice (dv_add pads the draft vocabulary to an even row count with
+// a duplicate), and the proposal probability of the token is then the sum.
+__device__ __forceinline__ float dq_prob(const float2 * q, int id) {
+    float s = 0.f;
+    for (int j = 0; j < TOPK_MAX; j++) {
+        const int qi = __float_as_int(q[j].y);
+        if (qi < 0) break;
+        if (qi == id) s += q[j].x;
+    }
+    return s;
+}
+
+// Sampled draft (single thread): q' = the sampling distribution (top_k, top_p, min_p, temp) of the draft
+// head's top logits src; writes q' to dst as (prob, token id) terminated by (0, -1) (dst may alias src) and
+// draws the draft from it with its own random stream, keyed by the draft's absolute position.
+__device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, unsigned long long pos) {
+    float p[TOPK_MAX];
+    const int K = cand_probs(src, P, p);
+    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
+    int pick = -1, last = __float_as_int(src[0].y);
+    for (int j = 0; j < K; j++) {
+        const float2 e = src[j];
+        last = __float_as_int(e.y);
+        if (pick < 0) {
+            x -= p[j];
+            if (x < 0.f) pick = last;
+        }
+        dst[j] = make_float2(p[j], e.y);
+    }
+    if (K < TOPK_MAX) dst[K] = make_float2(0.f, __int_as_float(-1));
+    return pick >= 0 ? pick : last;
+}
+
+// Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
+// i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i without d.
+// Sampled drafts (Ctl::dsmp, d ~ q'_i): accepted with probability min(1, p_i(d) / q'_i(d)); on
+// rejection drawn from the residual norm(max(0, p_i - q'_i)).  Either way the output is distributed
+// exactly as p, and the rows after a rejection are dropped.  Rows with no draft to verify (the bonus
+// row, the last prompt row) are drawn from p_i.  tg then drives the greedy acceptance logic of
+// main_control unchanged.
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
@@ -1910,6 +2011,29 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
     for (int i = 0; i < tl; i++) {
         const float2 * cd = cB.cand + i * TOPK_MAX;
         const int K = cand_probs(cd, P, p);
+        if (P.mode == MODE_DECODE && i < T - 1 && c->dsmp) {
+            const int d = c->tok[i + 1];
+            const float2 * q = cB.dq + i * TOPK_MAX;
+            float pd = 0.f;
+            for (int j = 0; j < K; j++)
+                if (__float_as_int(cd[j].y) == d) pd += p[j];
+            if (urand(P.seed, 2 * (n + i)) * dq_prob(q, d) < pd) {
+                tg[i] = d;
+                continue;
+            }
+            float r[TOPK_MAX], rs = 0.f;
+            for (int j = 0; j < K; j++) rs += (r[j] = fmaxf(0.f, p[j] - dq_prob(q, __float_as_int(cd[j].y))));
+            float x = urand(P.seed, 2 * (n + i) + 1) * (rs > 0.f ? rs : 1.f);
+            int pick = __float_as_int(cd[0].y);
+            for (int j = 0; j < K; j++) {
+                if (rs > 0.f && r[j] <= 0.f) continue;
+                pick = __float_as_int(cd[j].y);
+                x -= rs > 0.f ? r[j] : p[j];
+                if (x < 0.f) break;
+            }
+            tg[i] = pick;
+            return;
+        }
         if (P.mode == MODE_DECODE && i < T - 1) {
             const int d = c->tok[i + 1];
             float pd = 0.f;
@@ -2037,7 +2161,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
 
 // one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row.
 template <int R>
-__device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/, unsigned & epoch) {
+__device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/,
+                                     unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -2092,8 +2217,32 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
     if (logits) {
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
         int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
-        if (lm_head<1>(R - 1, true, sm, s_tok) && threadIdx.x == 0) {
-            cB.ctl->tok[1 + (draft_row ? draft_idx : 0)] = s_tok[0];
+        const int k = draft_row ? draft_idx : 0; // this pass produces draft k + 1 (tok[k + 1])
+        // sampled drafts need the draft head's top logits (TOPK path); argmax drafts only the reduction
+#if MK_SPEC_LOG
+        float2 * const tl = cB.dlog + k * (TOPK_MAX + 1);
+        const bool lastb = lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl);
+#else
+        float2 * const tl = cB.dq + k * TOPK_MAX;
+        const bool lastb = P.spec_smp ? lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl)
+                                      : lm_head<1, false, false, true>(R - 1, true, sm, s_tok);
+#endif
+        if (lastb && threadIdx.x == 0) {
+            Ctl * c = cB.ctl;
+            const float * mm = misc(sm);
+            const float conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
+            const float chain = (k == 0 ? 1.f : c->dchain) * conf;
+#if MK_SPEC_LOG
+            cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
+#endif
+            const float f = P.gate_chain ? chain : conf;
+            c->tok[1 + k] = P.spec_smp ? draft_sample(P, tl, cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
+                                       : s_tok[0];
+            c->dsmp = P.spec_smp;
+            c->dconf[k] = conf;
+            c->dchain = chain;
+            c->nd_prod = f < P.gate_drop[k] ? k : k + 1;
+            c->nd_stop = f < P.gate_stop[k] || f < P.gate_drop[k];
             __threadfence();
         }
         gsync(epoch, PH_MTP_LMHEAD);
@@ -2153,16 +2302,17 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         const bool last_pass = done + R == Rtot;
         const bool want = lg && last_pass && P.ndraft > 0;
         switch (R) {
-            case 1: mtp_pass<1>(done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(done, false, 0, want, sm, epoch); break;
+            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
+            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
+            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
+            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
+            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
         }
         done += R;
     }
     if (lg) {
-        for (int i = 1; i < P.ndraft; i++) mtp_pass<1>(0, true, i, true, sm, epoch);
+        // nd_stop is written before the PH_MTP_LMHEAD barrier, so every block takes the same exit
+        for (int i = 1; i < P.ndraft && !vc->nd_stop; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
     }
 }
 
@@ -2314,9 +2464,28 @@ struct MKEngine::Impl {
     float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
     int smp_top_k = TOPK_MAX;
     unsigned long long smp_seed = 0;
-    int ndraft;          // MTP drafts the next launch produces
+    int ndraft;          // MTP drafts the next launch produces (at most; the gate may stop earlier)
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
+    int last_acc = 0;    // drafts the last decode cycle accepted
+    // draft-depth policy (MKEngine::set_policy)
+    struct Policy {
+        int depth = 0;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
+                             // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
+        int dmin = 1;
+        float gate_drop[4] = {0.f, 0.f, 0.f, 0.f}, gate_stop[4] = {0.f, 0.f, 0.f, 0.f}; // on-device early stop
+        int gate_chain = 0;
+        int h1 = 0; // sampling: sampled drafts (Launch::spec_smp)
+    } pol;
+#if MK_SPEC_LOG
+    FILE * slog = nullptr;               // MK_SPEC_LOG_FILE: one JSON line per decode cycle
+    std::vector<float2> slog_q;          // dlog of the drafts the next cycle verifies
+    void slog_drafts() {
+        if (!slog) return;
+        slog_q.resize((size_t) MAXT * (TOPK_MAX + 1));
+        CK(cudaMemcpy(slog_q.data(), hb.dlog, slog_q.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+    }
+#endif
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
@@ -2797,6 +2966,9 @@ struct MKEngine::Impl {
         }
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
+        hb.blk_lse = dalloc<float2>((size_t) nsm);
+        hb.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
+        hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
         hb.bar = dalloc<unsigned>(4);
@@ -2814,7 +2986,50 @@ struct MKEngine::Impl {
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
     }
 
+#if MK_SPEC_LOG
+    // one JSON line per decode cycle: start position n, T, accepted a, the verified drafts d, the verify
+    // rows' targets tg, per draft its MTP [lse, best logit, (logit, id) x TOPK_MAX], and when sampling the
+    // main rows' candidates p [(logit, id) x TOPK_MAX]
+    void slog_cycle(int n0, int T, const int * drafts, const Ctl & c) {
+        if (!slog) return;
+        const bool smp = smp_temp > 0.f;
+        std::vector<float2> cand;
+        if (smp) {
+            cand.resize((size_t) T * TOPK_MAX);
+            CK(cudaMemcpy(cand.data(), hb.cand, cand.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+        }
+        auto id_of = [](float y) { int v; memcpy(&v, &y, 4); return v; };
+        fprintf(slog, "{\"n\":%d,\"T\":%d,\"a\":%d,\"nd\":%d,\"d\":[", n0, T, c.n_acc, nd_avail);
+        for (int i = 1; i < T; i++) fprintf(slog, "%s%d", i > 1 ? "," : "", drafts[i]);
+        fprintf(slog, "],\"tg\":[");
+        for (int i = 0; i < T; i++) fprintf(slog, "%s%d", i ? "," : "", c.tgt[i]);
+        fprintf(slog, "],\"q\":[");
+        for (int i = 0; i + 1 < T; i++) {
+            const float2 * q = slog_q.data() + (size_t) i * (TOPK_MAX + 1);
+            fprintf(slog, "%s[%.7g,%.7g", i ? "," : "", q[TOPK_MAX].x, q[TOPK_MAX].y);
+            for (int j = 0; j < TOPK_MAX; j++) fprintf(slog, ",%.7g,%d", q[j].x, id_of(q[j].y));
+            fprintf(slog, "]");
+        }
+        fprintf(slog, "]");
+        if (smp) {
+            fprintf(slog, ",\"p\":[");
+            for (int i = 0; i < T; i++) {
+                fprintf(slog, "%s[", i ? "," : "");
+                for (int j = 0; j < TOPK_MAX; j++)
+                    fprintf(slog, "%s%.7g,%d", j ? "," : "", cand[(size_t) i * TOPK_MAX + j].x, id_of(cand[(size_t) i * TOPK_MAX + j].y));
+                fprintf(slog, "]");
+            }
+            fprintf(slog, "]");
+        }
+        fprintf(slog, "}\n");
+        slog_drafts(); // the drafts this launch produced, verified by the next cycle
+    }
+#endif
+
     ~Impl() {
+#if MK_SPEC_LOG
+        if (slog) fclose(slog);
+#endif
         print_profile();
         for (void * p : allocs) cudaFree(p);
         if (embd_host) cudaFreeHost(embd_host);
@@ -2822,6 +3037,12 @@ struct MKEngine::Impl {
 
     void launch(int mode, int T, int last, int score = 0) {
         Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
+        for (int k = 0; k < 4; k++) {
+            L.gate_drop[k] = pol.gate_drop[k];
+            L.gate_stop[k] = pol.gate_stop[k];
+        }
+        L.gate_chain = pol.gate_chain;
+        L.spec_smp = smp_temp > 0.f && pol.h1;
         void * args[] = {&L};
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
@@ -3189,6 +3410,44 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
     reset();
+    if (const char * pol = getenv("MK_POLICY")) set_policy(pol);
+#if MK_SPEC_LOG
+    if (const char * f = getenv("MK_SPEC_LOG_FILE")) p_->slog = fopen(f, "a");
+#endif
+}
+
+// "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
+// stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
+// sampling); "" = defaults
+void MKEngine::set_policy(const std::string & spec) {
+    Impl::Policy pol;
+    float dk[4] = {-1.f, -1.f, -1.f, -1.f}, sk[4] = {-1.f, -1.f, -1.f, -1.f}; // per-draft overrides
+    size_t i = 0;
+    while (i < spec.size()) {
+        size_t j = spec.find(',', i);
+        if (j == std::string::npos) j = spec.size();
+        const std::string kv = spec.substr(i, j - i);
+        i = j + 1;
+        if (kv.empty()) continue;
+        const size_t e = kv.find('=');
+        if (e == std::string::npos) throw std::runtime_error("policy: expected key=value, got " + kv);
+        const std::string k = kv.substr(0, e), v = kv.substr(e + 1);
+        if (k == "depth") pol.depth = std::stoi(v);
+        else if (k == "dmin") pol.dmin = std::stoi(v);
+        else if (k == "drop") for (float & x : pol.gate_drop) x = std::stof(v);
+        else if (k == "stop") for (float & x : pol.gate_stop) x = std::stof(v);
+        else if (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0) && k[4] >= '1' &&
+                 k[4] <= '4') // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
+            (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
+        else if (k == "chain") pol.gate_chain = std::stoi(v);
+        else if (k == "h1") pol.h1 = std::stoi(v);
+        else throw std::runtime_error("policy: unknown key " + k);
+    }
+    for (int j = 0; j < 4; j++) {
+        if (dk[j] >= 0.f) pol.gate_drop[j] = dk[j];
+        if (sk[j] >= 0.f) pol.gate_stop[j] = sk[j];
+    }
+    p_->pol = pol;
 }
 
 MKEngine::~MKEngine() { delete p_; }
@@ -3242,9 +3501,13 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
         i += T;
     }
-    p_->nd_avail = p_->ndraft;
+    p_->nd_avail = p_->ndraft > 0 ? std::min(p_->ndraft, c.nd_prod) : 0;
     p_->all_acc = true;
+    p_->last_acc = p_->nd_avail;
     CK(cudaGetLastError());
+#if MK_SPEC_LOG
+    p_->slog_drafts();
+#endif
     p_->ck_save();
     seq.push_back(c.out[0]);
     return c.out[0];
@@ -3337,19 +3600,36 @@ int MKEngine::step(std::vector<int> & out) {
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
     const int T = att_cap_T(c.n, 1 + p_->nd_avail);
-    // Draft depth: after a cycle that rejected a draft, draft one token less (but at least 3), since a
-    // deeper draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.
-    p_->ndraft = (!p_->all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
+    // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
+    // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
+    // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
+    const Impl::Policy & pol = p_->pol;
+    int nd = n_draft_;
+    if (pol.depth == 0) nd = (!p_->all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
+    else if (pol.depth == 2) nd = std::min(n_draft_, std::max(std::min(pol.dmin, n_draft_), 1 + p_->last_acc));
+    p_->ndraft = nd;
+#if MK_SPEC_LOG
+    const int n0 = c.n;
+    int drafts[MAXT];
+    for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
+#endif
     p_->launch(MODE_DECODE, T, 0);
-    p_->nd_avail = p_->ndraft;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    p_->nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
+#if MK_SPEC_LOG
+    p_->slog_cycle(n0, T, drafts, c);
+#endif
     for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
     p_->seq.insert(p_->seq.end(), c.out, c.out + c.n_out);
     p_->dv_add(c.out, c.n_out);
     p_->all_acc = c.n_acc == T - 1;
+    p_->last_acc = c.n_acc;
     stats.cycles++;
     stats.drafted += T - 1;
     stats.accepted += c.n_acc;
+    stats.last_T = T;
+    stats.last_nd = p_->nd_avail;
+    stats.last_acc = c.n_acc;
     return c.n_out;
 }
 
