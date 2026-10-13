@@ -1934,46 +1934,63 @@ __device__ __forceinline__ unsigned kv_spread4(unsigned x) {
     }
     return 0u;
 }
-// One staged q4 .. q7 K / V row (kv_store_q4 / kv_store_qn's layout: lane word w = the low nibbles of values 8 w .. 8 w + 7,
-// then at 128 + w (BITS - 4) their high bits) expanded IN PLACE to the q8 layout: 256 int8 values q = n - 2^(BITS - 1), the
-// scales untouched. The fp16 product d q is the same number the low-bit decode computes (qn_to_f16 / a2_qnh), so every
-// consumer of the q8 layout (aq_q8x2, a8_imma with the scale applied after the int8 dot) sees exactly the low-bit values.
-// One warp per row: every lane reads its word and high bits before any lane writes (the output overlaps the input).
+// Staged q4 .. q7 K / V rows (kv_store_q4 / kv_store_qn's layout: lane word w = the low nibbles of values 8 w .. 8 w + 7, then
+// at 128 + w (BITS - 4) their high bits) expanded IN PLACE to the q8 layout: 256 int8 values q = n - 2^(BITS - 1), the scales
+// untouched. The fp16 product d q is the same number the low-bit decode computes (qn_to_f16 / a2_qnh), so every consumer of
+// the q8 layout (aq_q8x2, a8_imma with the scale applied after the int8 dot) sees exactly the low-bit values.
+// One warp per row, up to 3 rows (r0, r0 + rs, r0 + 2 rs, all < np) per call, loads of all rows first (one shared-memory
+// latency instead of a load -> ALU -> store chain per row), then every lane has read its words before any lane writes (the
+// output overlaps the input).
 template <int BITS>
-__device__ __forceinline__ void kv_row_expand(uint8_t * row) {
+__device__ __forceinline__ void kv_rows_expand(uint8_t * st, int np, int r0, int rs, int ld) {
     constexpr int HB = BITS - 4;
     const int lane = threadIdx.x & 31;
-    const unsigned wd = *reinterpret_cast<const unsigned *>(row + 4 * lane);
-    unsigned hi = 0u;
-    if constexpr (HB == 1) hi = row[128 + lane];
-    if constexpr (HB == 2) hi = *reinterpret_cast<const unsigned short *>(row + 128 + 2 * lane);
-    if constexpr (HB == 3) hi = (unsigned) row[128 + 3 * lane] | ((unsigned) row[129 + 3 * lane] << 8) | ((unsigned) row[130 + 3 * lane] << 16);
-    __syncwarp();
-    unsigned lo = wd & 0x0f0f0f0fu, hv = (wd >> 4) & 0x0f0f0f0fu; // values 0 .. 3 / 4 .. 7 (biased, n = q + 2^(BITS-1))
-    if constexpr (HB > 0) {
-        lo |= kv_spread4<HB>(hi);
-        hv |= kv_spread4<HB>(hi >> (4 * HB));
+    unsigned wd[3], hi[3];
+#pragma unroll
+    for (int k = 0; k < 3; k++) {
+        const int r = r0 + k * rs;
+        wd[k] = 0u;
+        hi[k] = 0u;
+        if (r < np) {
+            const uint8_t * row = st + r * ld;
+            wd[k] = *reinterpret_cast<const unsigned *>(row + 4 * lane);
+            if constexpr (HB == 1) hi[k] = row[128 + lane];
+            if constexpr (HB == 2) hi[k] = *reinterpret_cast<const unsigned short *>(row + 128 + 2 * lane);
+            if constexpr (HB == 3) hi[k] = (unsigned) row[128 + 3 * lane] | ((unsigned) row[129 + 3 * lane] << 8) | ((unsigned) row[130 + 3 * lane] << 16);
+        }
     }
-    // per byte n - 2^(BITS-1) mod 256, without borrows between bytes (n < 128: bit 7 is free to absorb them)
-    constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
-    lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
-    hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
-    *reinterpret_cast<uint2 *>(row + 8 * lane) = make_uint2(lo, hv);
+    __syncwarp();
+#pragma unroll
+    for (int k = 0; k < 3; k++) {
+        const int r = r0 + k * rs;
+        if (r < np) {
+            unsigned lo = wd[k] & 0x0f0f0f0fu, hv = (wd[k] >> 4) & 0x0f0f0f0fu; // values 0 .. 3 / 4 .. 7 (biased, n = q + 2^(BITS-1))
+            if constexpr (HB > 0) {
+                lo |= kv_spread4<HB>(hi[k]);
+                hv |= kv_spread4<HB>(hi[k] >> (4 * HB));
+            }
+            // per byte n - 2^(BITS-1) mod 256, without borrows between bytes (n < 128: bit 7 is free to absorb them)
+            constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
+            lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
+            hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
+            *reinterpret_cast<uint2 *>(st + r * ld + 8 * lane) = make_uint2(lo, hv);
+        }
+    }
 }
 // rows r0, r0 + rs, .. < np of a staged low-bit tile (row stride ld bytes) -> q8 layout; bits is block-uniform
 __device__ __forceinline__ void kv_tile_expand(uint8_t * st, int bits, int np, int r0, int rs, int ld) {
     switch (bits) {
     case 4:
-        for (int r = r0; r < np; r += rs) kv_row_expand<4>(st + r * ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<4>(st, np, r, rs, ld);
         break;
     case 5:
-        for (int r = r0; r < np; r += rs) kv_row_expand<5>(st + r * ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<5>(st, np, r, rs, ld);
         break;
     case 6:
-        for (int r = r0; r < np; r += rs) kv_row_expand<6>(st + r * ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<6>(st, np, r, rs, ld);
         break;
     case 7:
-        for (int r = r0; r < np; r += rs) kv_row_expand<7>(st + r * ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<7>(st, np, r, rs, ld);
         break;
     default:
         break;
