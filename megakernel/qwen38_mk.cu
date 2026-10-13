@@ -137,6 +137,9 @@ constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (A
 // attn_core_q8 (decode attention, all-q8 slots): q8 K / V ring stages, double-buffered S and P
 constexpr int AQ_NSK = 3, AQ_NSV = 4; // K(t) is issued in interval t - 2 and read in t; V(t) issued in t - 1, read in t + 2
 constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued in t - 3, expanded to int8 in t - 1, read in t
+#ifndef MK_XP_SM
+#define MK_XP_SM 0 // MIX tile expansion: rows per tile done by the softmax warps (0: all 12 non-S warps round-robin)
+#endif
 constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
                                       // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
@@ -2810,13 +2813,19 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     // are expanded to int8 for interval jt + 1: K(jt + 1) (S warps) and V(jt - 1) (P V warps), one row per
                     // warp per step (their stages are not touched by any copy in flight)
                     if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    // row split of each tile: MK_XP_SM = 0: rows round-robin over the 12 warps; else rows 0 .. MK_XP_SM - 1 go to
+                    // the (lightly loaded) softmax warps 12-15, the rest to the P V warps 4-11
+                    int r0, rs, r1;
+                    if constexpr (MK_XP_SM == 0) { r0 = warp - 4; rs = NW - 4; r1 = TP; }
+                    else if (warp >= 12) { r0 = warp - 12; rs = 4; r1 = MK_XP_SM; }
+                    else { r0 = MK_XP_SM + warp - 4; rs = 8; r1 = TP; }
                     if (jt + 1 < ntl) {
                         const int kb_ = kv_tbits(0, slot, c0 + (jt + 1) * TP, wsr);
-                        if (kb_ != 8) kv_tile_expand(kring + ((jt + 1) % NSK) * AQ_STG, kb_, tnp(jt + 1), warp - 4, NW - 4, KVQ_ROW);
+                        if (kb_ != 8) kv_tile_expand(kring + ((jt + 1) % NSK) * AQ_STG, kb_, min(tnp(jt + 1), r1), r0, rs, KVQ_ROW);
                     }
                     if (jt >= 1 && jt - 1 < ntl) {
                         const int vb_ = kv_tbits(1, slot, c0 + (jt - 1) * TP, wsr);
-                        if (vb_ != 8) kv_tile_expand(vring + ((jt - 1) % NSV) * AQ_STG, vb_, tnp(jt - 1), warp - 4, NW - 4, KVQ_ROW);
+                        if (vb_ != 8) kv_tile_expand(vring + ((jt - 1) % NSV) * AQ_STG, vb_, min(tnp(jt - 1), r1), r0, rs, KVQ_ROW);
                     }
                 } else {
                     if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
@@ -5453,8 +5462,10 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
-        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
-        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int dev = 0, nsm = 0, occ = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
@@ -5472,7 +5483,7 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
         if (attn_s8) {
             int occ8 = 0;
-            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false, false>, A2_NT, A8_SMEM));
             if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
         }
         mem_mark("prefill kernel attributes");
@@ -5498,8 +5509,14 @@ struct MKEngine::Impl {
             // pk_attn8 reads K in any MK_KV format (low-bit tiles are expanded to int8 in its staging) and any V format
             // (a8_cv_v converts); rotated K stays on pk_attn2 (its Q is rotated in fp16)
             const bool s8 = attn_pv16 && !hb.kvr[slot];
-            if (s8 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-            else if (s8 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
+            if (s8 && attn_s8 == 1) {
+                if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            } else if (s8 && attn_s8 == 2) {
+                if (kl) pk_attn8<true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else pk_attn8<true, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            }
             else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
         } else {

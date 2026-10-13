@@ -695,7 +695,9 @@ __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, 
 
 // scores in log2 units: log2 e is folded into the Q scales, P = exp2(s - m)
 constexpr float A8_L2E = 1.4426950408889634f;
-template <bool QROW>
+// KLOW: the slot's K is low-bit (q4..q7): its tiles are expanded to int8 in the staging. The KLOW = false instantiation is the
+// plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot).
+template <bool QROW, bool KLOW>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part) {
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
@@ -731,13 +733,16 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         const __half *tks, *tvs;
         const int kb_ = kv_src(0, slot, g, it * A2_K, wsr, tk, tks);
         const int vb = kv_src(1, slot, g, it * A2_K, wsr, tv, tvs);
-        a8_issue(st, tk, tv, tvs, 0, np, kb_, vb);
+        a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kb_ : 8, vb);
         return a8_ld_ks(tks, 0, np);
     };
     auto expand_k = [&](int it, int r0, int rs) { // low-bit K rows r0, r0 + rs, .. of tile it (landed) -> int8 in place
-        const int kb_ = kbt(it);
-        if (kb_ != 8) kv_tile_expand(asm_ + (it % A8_NS) * A8_STG, kb_, min(A2_K, pmax + 1 - it * A2_K), r0, rs, A8_KLD);
+        if constexpr (KLOW) {
+            const int kb_ = kbt(it);
+            if (kb_ != 8) kv_tile_expand(asm_ + (it % A8_NS) * A8_STG, kb_, min(A2_K, pmax + 1 - it * A2_K), r0, rs, A8_KLD);
+        }
     };
+    (void) kbt;
 
     // ring prologue: tiles it0 .. it0 + A8_NS - 2
 #pragma unroll
