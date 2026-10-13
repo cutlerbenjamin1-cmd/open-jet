@@ -19,7 +19,7 @@
 namespace pf {
 
 constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20;
+constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21;
 // kvalues_iq4nl + 128 as bytes (the Q8_0 path's offset)
 constexpr unsigned IQ4U_T0 = 0x3F2D1801u, IQ4U_T1 = 0x766A5D4Fu, IQ4U_T2 = 0xA6998D81u, IQ4U_T3 = 0xF1D9C5B5u;
 
@@ -42,9 +42,14 @@ template <> struct WT<TIQ4NL> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 5; };
 template <> struct WT<TQ6K> { static constexpr int BLK = 192, NCH = 3; }; // + the meta stream (W.d), see load
 template <> struct WT<TQ80> { static constexpr int BLK = 256, NCH = 4; };
+// native Q3_K / IQ3_S (rows_q3k / rows_iq3s): the 16 B of index / low bits of the stage's two units; the rest (Q3_K: high
+// bits 8 B + Q6_K-style meta 4 + 4 B; IQ3_S: signs 8 B + the block's 16 B meta) is copied by the first BM threads, see load
+template <> struct WT<TQ3K> { static constexpr int BLK = 96, NCH = 1; };
+template <> struct WT<TIQ3S> { static constexpr int BLK = 96, NCH = 1; };
 
 template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, int & inc) {
-    if constexpr (TYPE == TQ4K || TYPE == TIQ4 || TYPE == TIQ4NL) { off = c == 0 ? 0 : 16 * c; inc = c == 0 ? 0 : 32; }
+    if constexpr (TYPE == TQ3K || TYPE == TIQ3S) { off = 0; inc = 16; }
+    else if constexpr (TYPE == TQ4K || TYPE == TIQ4 || TYPE == TIQ4NL) { off = c == 0 ? 0 : 16 * c; inc = c == 0 ? 0 : 32; }
     else if constexpr (TYPE == TQ5K) { off = c < 3 ? 16 * c : 48 + 16 * (c - 3); inc = c < 3 ? 0 : 32; }
     else if constexpr (TYPE == TQ6K) { off = c < 2 ? 16 * c : 128; inc = c < 2 ? 32 : 16; }
     else { off = 16 * c; inc = 64; }
@@ -95,6 +100,10 @@ template <> struct HT<TIQ4NL> { static constexpr int SR = 48, NS = 4; static con
 template <> struct HT<TQ5K> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
 template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = 4; static constexpr bool SEP = false; };
 template <> struct HT<TQ80> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
+// Q3_K row: [lows 16 | highs 8 | sc 4 | d pair 4 | pad 16]; IQ3_S row: [index lows 16 | meta 16 | signs 8 | pad 8]
+// (48 B rows: the 8 row groups g of a fragment load hit distinct banks, as Q4_K's)
+template <> struct HT<TQ3K> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
+template <> struct HT<TIQ3S> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
 constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps of 16 rows, each over all NB tokens
 // NB: tokens per CTA (BN = 128 or, for short prompts, 64 / 32; picked per GEMM by the host, see Impl::pf_nb).
@@ -162,6 +171,9 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const uint8_t * esrc = reinterpret_cast<const uint8_t *>(W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd);
     const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
+    // Q3_K / IQ3_S: the row's value stream (high bits / signs at 64 + 8 p of each block) and its smem row
+    const uint8_t * vsrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb;
+    const unsigned rdst = (tid & (BM - 1)) * SR;
     const __half * xsrc[XIT];
     unsigned xdst[XIT];
 #pragma unroll
@@ -189,6 +201,17 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             }
         } else if constexpr (TYPE == TQ80) {
             if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
+        } else if constexpr (TYPE == TQ3K) { // high bits of the stage's two units | sc[4p..4p+3] | the pair's two d
+            if (tid < BM) {
+                cpa8(s + rdst + 16, vsrc + sb * BLK + 64 + 8 * p);
+                cpa4(s + rdst + 24, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
+                cpa4(s + rdst + 28, esrc + (sb >> 1) * 36 + 32);
+            }
+        } else if constexpr (TYPE == TIQ3S) { // the block's meta (qh[8] | scales[4] | d) | signs of the stage's two units
+            if (tid < BM) {
+                cpa16(s + rdst + 16, esrc + sb * 16);
+                cpa8(s + rdst + 32, vsrc + sb * BLK + 64 + 8 * p);
+            }
         }
 #pragma unroll
         for (int k = 0; k < XIT; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
@@ -223,6 +246,16 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         } else if constexpr (TYPE == TIQ4NL) { // header: the fp16 d of the 8 sub-blocks
             const __half dd = *reinterpret_cast<const __half *>(row + 4 * p + 2 * j);
             a = b = __half2half2(dd);
+        } else if constexpr (TYPE == TQ3K) { // as Q6_K: (S_lo, S_lo), (S_hi, S_hi) of sub-block j, the same roundings
+            const unsigned sc4 = *reinterpret_cast<const unsigned *>(row + 24), dd = *reinterpret_cast<const unsigned *>(row + 28);
+            const float d = __half2float(__ushort_as_half((unsigned short) (dd >> (16 * ((st >> 2) & 1)))));
+            const unsigned sp = sc4 >> (16 * j);
+            a = __float2half2_rn(d * (float) (int8_t) (sp & 0xff));
+            b = __float2half2_rn(d * (float) (int8_t) ((sp >> 8) & 0xff));
+        } else if constexpr (TYPE == TIQ3S) { // d (1 + 2 s) of sub-block 2p + j, for both 16-halves
+            const unsigned sc = *reinterpret_cast<const unsigned *>(row + 24);
+            const float d = __half2float(*reinterpret_cast<const __half *>(row + 28));
+            a = b = __float2half2_rn(d * (float) (int) (1 + 2 * ((sc >> (8 * p + 4 * j)) & 0xfu)));
         } else if constexpr (TYPE == TQ6K) {
             uint8_t * mrow = const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
             const int2 meta = *reinterpret_cast<const int2 *>(mrow);
@@ -266,7 +299,10 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     auto rawq = [&](int st) {
         const uint8_t * sw = sm + (st % NSH) * STG;
         const int p = st & 3;
-        constexpr float OFF = TYPE == TQ6K ? -1056.f : (TYPE == TQ80 || TYPE == TIQ4 || TYPE == TIQ4NL) ? -1152.f : -1024.f;
+        constexpr float OFF = TYPE == TQ6K || TYPE == TIQ3S ? -1056.f
+                            : TYPE == TQ3K                  ? -1028.f
+                            : (TYPE == TQ80 || TYPE == TIQ4 || TYPE == TIQ4NL) ? -1152.f
+                                                                               : -1024.f;
         const __half2 off2 = __float2half2_rn(OFF);
 #pragma unroll
         for (int mi = 0; mi < HMI; mi++) {
@@ -304,6 +340,34 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             iq4_lut(w2, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][0][1] = lo; wd[1][0][1] = hi;
             iq4_lut(w1, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][1][0] = lo; wd[1][1][0] = hi;
             iq4_lut(w3, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][1][1] = lo; wd[1][1][1] = hi;
+        } else if constexpr (TYPE == TQ3K) { // u3 = lows | high << 2 (the value is u3 - 4: OFF)
+#pragma unroll
+            for (int kk = 0; kk < 2; kk++)
+#pragma unroll
+                for (int r = 0; r < 2; r++) {
+                    const uint8_t * rr = r ? rb : ra;
+                    const unsigned x = *reinterpret_cast<const unsigned *>(rr + 8 * kk);
+                    const unsigned y = *reinterpret_cast<const unsigned *>(rr + 8 * kk + 4);
+                    const unsigned h = *reinterpret_cast<const unsigned *>(rr + 16 + 4 * kk);
+                    wd[0][kk][r] = ((x >> (2 * t4)) & 0x03030303u) | (((h >> t4) & 0x01010101u) << 2);
+                    wd[1][kk][r] = ((y >> (2 * t4)) & 0x03030303u) | (((h >> (4 + t4)) & 0x01010101u) << 2);
+                }
+        } else if constexpr (TYPE == TIQ3S) { // 32 +- grid (the value: OFF)
+#pragma unroll
+            for (int kk = 0; kk < 2; kk++)
+#pragma unroll
+                for (int r = 0; r < 2; r++) {
+                    const uint8_t * rr = r ? rb : ra;
+                    const unsigned qh = rr[16 + 2 * p + kk];
+                    const unsigned sg = *reinterpret_cast<const unsigned *>(rr + 32 + 4 * kk);
+#pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        const unsigned qs = rr[8 * kk + 4 * j + t4];
+                        const unsigned gv = iq3s_grid(qs | (((qh >> (4 * j + t4)) & 1u) << 8));
+                        const unsigned m = ((sg >> (4 * j + t4)) & 0x01010101u) * 0xffu;
+                        wd[j][kk][r] = 0x20202020u + (gv ^ m) - m;
+                    }
+                }
         } else if constexpr (TYPE == TQ6K) {
             const int z = (g >> 1) & 3; // rows g and g + 8 share the swizzle
             const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + 16 * z + 4 * t4);
@@ -383,7 +447,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                         const __half2 v = u2h(vq[mi][j][kk][2 * hh + r]);
                         __half2 o;
                         if constexpr (TYPE == TQ4K || TYPE == TQ5K) o = __hfma2(v, u2h(sc.x), u2h(sc.y));
-                        else if constexpr (TYPE == TQ6K) o = __hmul2(v, u2h(kk ? sc.y : sc.x));
+                        else if constexpr (TYPE == TQ6K || TYPE == TQ3K || TYPE == TIQ3S) o = __hmul2(v, u2h(kk ? sc.y : sc.x));
                         else o = __hmul2(v, u2h(sc.x));
                         a[mi][j][kk][2 * hh + r] = h2u(o);
                     }

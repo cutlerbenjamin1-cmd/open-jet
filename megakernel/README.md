@@ -194,13 +194,16 @@ the MTP block can be any of:
 | Q4_K, Q5_K | as stored |
 | Q6_K, Q8_0 | re-laid-out at load (values unchanged) |
 | IQ4_XS | re-laid-out at load into Q4_K-shaped 144-byte blocks, 4-bit indices mapped to int8 weights with `__byte_perm` |
-| Q3_K, IQ3_S | re-encoded at load as Q6_K, exactly |
+| Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM
+feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at
+~0.54x the bytes |
 | IQ4_NL | re-encoded at load as Q8_0, exactly |
 
 `token_embd` must be Q4_K and `output` Q6_K; `ssm_alpha` / `ssm_beta` are dequantized to F32 at load
 (they are folded into fp32 rows with the norm weight). The exact re-encodes keep every weight's
 value (both formats store a small integer times the same fp16 `d` and an integer sub-block scale),
-and the loader checks each re-encoded row bit for bit against ggml's dequantization of the original.
+and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's dequantization of the
+original.
 A file with any other type is refused, naming the first tensor that does not match, and open-jet
 starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
 
