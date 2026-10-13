@@ -343,7 +343,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
     // q8 cache: the slot's K / V tiles in their MK_KV formats (rows of HD bits / 8 bytes), or the MK_KV_WIN q8 ring for
     // tiles at positions >= wsr (kv_src per tile); kbi / vbi = the bits of the K / V tile in flight (rq)
-    const int wsr = Q8 ? kv_ws(n0 + T) : 0;
+    const int wsr = Q8 ? kv_ws(n0 + T) : 0, wsm = Q8 ? kv_wsm(wsr) : 0;
     int kbi = 8, vbi = 8;
     const int8_t * tq = nullptr;
     const __half * ts = nullptr;
@@ -361,10 +361,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     if (it0 < it1) {
         const int kb = it0 * A2_K, np = min(A2_K, pmax + 1 - kb);
         if constexpr (Q8) {
-            kbi = kv_src(0, slot, g, kb, wsr, tq, ts);
+            kbi = kv_src(0, slot, g, kb, wsr, wsm, tq, ts);
             a2_ld_q8(rq, tq, ts, np, kbi);
             a2_st_q8(rq, sK, kbi);
-            vbi = kv_src(1, slot, g, kb, wsr, tq, ts);
+            vbi = kv_src(1, slot, g, kb, wsr, wsm, tq, ts);
             a2_ld_q8(rq, tq, ts, np, vbi);
         } else {
             a2_cp_f16(sK, Kh + (size_t) kb * HD, np);
@@ -476,7 +476,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
         const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth; // A fragments of positions 0-15 / 16-31
         if constexpr (Q8) {
             if (it + 1 < it1) {
-                kbi = kv_src(0, slot, g, kn, wsr, tq, ts);
+                kbi = kv_src(0, slot, g, kn, wsr, wsm, tq, ts);
                 a2_ld_q8(rq, tq, ts, npn, kbi);
             }
         } else {
@@ -538,7 +538,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
         }
         if constexpr (Q8) {
             if (nxt) {
-                vbi = kv_src(1, slot, g, kn, wsr, tq, ts);
+                vbi = kv_src(1, slot, g, kn, wsr, wsm, tq, ts);
                 a2_ld_q8(rq, tq, ts, npn, vbi);
             }
         }
@@ -725,21 +725,22 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
     // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
     // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.
-    const int wsr = kv_ws(n0 + T);
+    const int wsr = kv_ws(n0 + T), wsm = kv_wsm(wsr);
     auto kbt = [&](int it) { return kv_tbits(0, slot, it * A2_K, wsr); };
     auto vbt = [&](int it) { return kv_tbits(1, slot, it * A2_K, wsr); };
     auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
         const int8_t *tk, *tv;
         const __half *tks, *tvs;
-        const int kb_ = kv_src(0, slot, g, it * A2_K, wsr, tk, tks);
-        const int vb = kv_src(1, slot, g, it * A2_K, wsr, tv, tvs);
+        const int kb_ = kv_src(0, slot, g, it * A2_K, wsr, wsm, tk, tks);
+        const int vb = kv_src(1, slot, g, it * A2_K, wsr, wsm, tv, tvs);
         a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kb_ : 8, vb);
         return a8_ld_ks(tks, 0, np);
     };
     auto expand_k = [&](int it, int r0, int rs) { // low-bit K rows r0, r0 + rs, .. of tile it (landed) -> int8 in place
         if constexpr (KLOW) {
+            // all A2_K rows: rows >= np were zeroed by a8_issue_k (finite values, masked by the causal test)
             const int kb_ = kbt(it);
-            if (kb_ != 8) kv_tile_expand(asm_ + (it % A8_NS) * A8_STG, kb_, min(A2_K, pmax + 1 - it * A2_K), r0, rs, A8_KLD);
+            if (kb_ != 8) kv_tile_expand<true>(asm_ + (it % A8_NS) * A8_STG, kb_, A2_K, r0, rs, A8_KLD);
         }
     };
     (void) kbt;
@@ -867,9 +868,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         for (int ni = 0; ni < 2; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
 #pragma unroll
         for (int b = 0; b < 8; b++) {
-            // K(it + 1) -> int8, one row per warp at b = 0, 2, 4 (its stage landed before this tile's barrier and is first
-            // read by tile it + 1's S MMAs)
-            if ((b == 0 || b == 2 || b == 4) && cvn) expand_k(it + 1, warp + (A2_NT / 32) * (b >> 1), 3 * (A2_NT / 32));
+            // K(it + 1) -> int8: rows warp, warp + 12, warp + 24 in one call at b = 0 (loads of all rows first; its stage
+            // landed before this tile's barrier and is first read by tile it + 1's S MMAs)
+            if (b == 0 && cvn) expand_k(it + 1, warp, A2_NT / 32);
             unsigned kf[4];
             pf::ldsm_x4(kf, ka + 32 * b);
             int d0[4], d1[4];

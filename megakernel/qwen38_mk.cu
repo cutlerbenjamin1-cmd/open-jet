@@ -140,6 +140,9 @@ constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued 
 #ifndef MK_XP_SM
 #define MK_XP_SM 0 // MIX tile expansion: rows per tile done by the softmax warps (0: all 12 non-S warps round-robin)
 #endif
+#ifndef MK_AQ_EARLY
+#define MK_AQ_EARLY 1 // MIX: issue the interval's K / V copies at the top of the interval (0: after the MMA work, as q8)
+#endif
 constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
                                       // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
@@ -1699,10 +1702,15 @@ __device__ __forceinline__ int kv_ws(int L_ctx) {
 __device__ __forceinline__ int kv_tbits(int w, int slot, int p0, int ws) {
     return (cB.kvrp[w][slot] != nullptr && p0 >= ws) ? 8 : cB.kvb[w][slot];
 }
-// the tile's rows: q / s = values / scales of its first row (ring or main buffer), returns its bits
-__device__ __forceinline__ int kv_src(int w, int slot, int g, int p0, int ws, const int8_t *& q, const __half *& s) {
+// ws % kvrc for kv_src (computed once per launch / item: a runtime integer modulo is ~25 dependent instructions)
+__device__ __forceinline__ int kv_wsm(int ws) { return cB.kvrc > 0 ? ws % cB.kvrc : 0; }
+// the tile's rows: q / s = values / scales of its first row (ring or main buffer), returns its bits. wsm = kv_wsm(ws):
+// a ring tile's row is p0 % kvrc = wsm + (p0 - ws) folded once (positions ws .. L_ctx - 1 span at most kvrc rows)
+__device__ __forceinline__ int kv_src(int w, int slot, int g, int p0, int ws, int wsm, const int8_t *& q, const __half *& s) {
     if (cB.kvrp[w][slot] != nullptr && p0 >= ws) {
-        const size_t rr = (size_t) g * cB.kvrc + p0 % cB.kvrc;
+        int r0 = wsm + (p0 - ws);
+        if (r0 >= cB.kvrc) r0 -= cB.kvrc;
+        const size_t rr = (size_t) g * cB.kvrc + r0;
         q = cB.kvrp[w][slot] + rr * HD;
         s = cB.kvrs[w][slot] + rr * (HD / 32);
         return 8;
@@ -1921,10 +1929,10 @@ template <int HB>
 __device__ __forceinline__ unsigned kv_spread4(unsigned x) {
     if constexpr (HB == 1) return ((x & 0xfu) * 0x02040810u) & 0x10101010u; // bit k -> bit 8 k + 4 (no two products collide)
     if constexpr (HB == 2) {
-        x &= 0xffu;
-        x = (x | (x << 12)) & 0x000f000fu; // fields 0, 1 at 0 .. 3; 2, 3 at 16 .. 19
-        x = (x | (x << 6)) & 0x03030303u;  // one field per byte
-        return x << 4;
+        // two IMAD + two LOP3 (the shifted copies never overlap, so the multiply is the OR): x * 0x10010 puts fields
+        // 0, 1 at bits 4 .. 7 and 2, 3 at 20 .. 23 (mask), then * 0x41 moves field 1 to 12 .. 13 and 3 to 28 .. 29
+        x = ((x & 0xffu) * 0x10010u) & 0x00f000f0u;
+        return (x * 0x41u) & 0x30303030u;
     }
     if constexpr (HB == 3) {
         x &= 0xfffu;
@@ -1941,7 +1949,9 @@ __device__ __forceinline__ unsigned kv_spread4(unsigned x) {
 // One warp per row, up to 3 rows (r0, r0 + rs, r0 + 2 rs, all < np) per call, loads of all rows first (one shared-memory
 // latency instead of a load -> ALU -> store chain per row), then every lane has read its words before any lane writes (the
 // output overlaps the input).
-template <int BITS>
+// SIGNED = false leaves the biased bytes n (0 .. 2^BITS - 1) in place: the fp16 consumers subtract the bias for free in
+// their magic-number conversion (aq_q8x2 / aq_q8x2p with the tile's xm / sub); the int8 IMMA consumer (pk_attn8) needs q.
+template <int BITS, bool SIGNED = true>
 __device__ __forceinline__ void kv_rows_expand(uint8_t * st, int np, int r0, int rs, int ld) {
     constexpr int HB = BITS - 4;
     const int lane = threadIdx.x & 31;
@@ -1969,28 +1979,32 @@ __device__ __forceinline__ void kv_rows_expand(uint8_t * st, int np, int r0, int
                 lo |= kv_spread4<HB>(hi[k]);
                 hv |= kv_spread4<HB>(hi[k] >> (4 * HB));
             }
-            // per byte n - 2^(BITS-1) mod 256, without borrows between bytes (n < 128: bit 7 is free to absorb them)
-            constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
-            lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
-            hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
+            if constexpr (SIGNED) {
+                // per byte n - 2^(BITS-1) mod 256, without borrows between bytes (n < 128: bit 7 is free to absorb them)
+                constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
+                lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
+                hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
+            }
             *reinterpret_cast<uint2 *>(st + r * ld + 8 * lane) = make_uint2(lo, hv);
         }
     }
 }
-// rows r0, r0 + rs, .. < np of a staged low-bit tile (row stride ld bytes) -> q8 layout; bits is block-uniform
+// rows r0, r0 + rs, .. < np of a staged low-bit tile (row stride ld bytes) -> q8 layout (SIGNED: int8 q; else the biased
+// bytes n, see kv_rows_expand); bits is block-uniform
+template <bool SIGNED = true>
 __device__ __forceinline__ void kv_tile_expand(uint8_t * st, int bits, int np, int r0, int rs, int ld) {
     switch (bits) {
     case 4:
-        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<4>(st, np, r, rs, ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<4, SIGNED>(st, np, r, rs, ld);
         break;
     case 5:
-        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<5>(st, np, r, rs, ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<5, SIGNED>(st, np, r, rs, ld);
         break;
     case 6:
-        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<6>(st, np, r, rs, ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<6, SIGNED>(st, np, r, rs, ld);
         break;
     case 7:
-        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<7>(st, np, r, rs, ld);
+        for (int r = r0; r < np; r += 3 * rs) kv_rows_expand<7, SIGNED>(st, np, r, rs, ld);
         break;
     default:
         break;
@@ -2211,13 +2225,14 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     __half * Kc = static_cast<__half *>(cB.kc) + slot0 * HD;
     __half * Vc = static_cast<__half *>(cB.vc) + slot0 * HD;
     const int wsr = Q8 ? kv_ws(L_ctx) : 0; // MK_KV_WIN: tiles at positions >= wsr come from the q8 ring (kv_src)
+    const int wsm = Q8 ? kv_wsm(wsr) : 0;
     const int mt = warp >> 3, wn = warp & 7; // MMA work split: warp -> (row tile, column group)
 
     auto issue_tile = [&](int g, int tb, int np_, int st) {
         if constexpr (Q8) {
             const int8_t *tk, *tv;
             const __half *tks, *tvs;
-            const int kb_ = kv_src(0, slot, g, tb, wsr, tk, tks), vb_ = kv_src(1, slot, g, tb, wsr, tv, tvs);
+            const int kb_ = kv_src(0, slot, g, tb, wsr, wsm, tk, tks), vb_ = kv_src(1, slot, g, tb, wsr, wsm, tv, tvs);
             kv_stage(sKVq + st * 2 * TP * KVQ_ROW, tk, tv, tks, tvs, TP, np_, kb_, vb_);
             asm volatile("cp.async.commit_group;" ::: "memory");
             return;
@@ -2469,19 +2484,27 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 // single tile (L_ctx <= ATT_BUCKET) and MK_DATTN=0 run attn_core_t (same partials).
 
 // d * q rounded once to fp16 for the two int8 values in bytes 0 and 1 of u: 0x6400 | (q ^ 0x80) is the fp16 1152 + q,
-// minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value)
-__device__ __forceinline__ unsigned aq_q8x2(unsigned u, __half2 d) {
-    const unsigned h = __byte_perm(u ^ 0x8080u, 0x64646464u, 0x4140);
-    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+// minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value).
+// xm / sub generalise it to a tile of biased bytes n = q + 2^(b-1) (MIX, kv_rows_expand<_, false>): xm = 0, sub = 1024 +
+// 2^(b-1) (aq_sub) gives n - 2^(b-1) = q, the very same fp16 q; the all-q8 path's constants fold at compile time.
+__device__ __forceinline__ unsigned aq_q8x2(unsigned u, __half2 d, unsigned xm = 0x8080u, unsigned sub = 0x64806480u) {
+    const unsigned h = __byte_perm(u ^ xm, 0x64646464u, 0x4140);
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), *reinterpret_cast<const __half2 *>(&sub));
     const __half2 r = __hmul2(q, d);
     return *reinterpret_cast<const unsigned *>(&r);
 }
-// the same for bytes 0 / 2 or 1 / 3 of y (selector 0x4140 / 0x4342 after the caller's interleave)
-__device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d) {
+// the same for bytes 0 / 2 or 1 / 3 of y (selector 0x4140 / 0x4342 after the caller's interleave; the caller applied xm)
+__device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d, unsigned sub = 0x64806480u) {
     const unsigned h = __byte_perm(y, 0x64646464u, sel);
-    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), *reinterpret_cast<const __half2 *>(&sub));
     const __half2 r = __hmul2(q, d);
     return *reinterpret_cast<const unsigned *>(&r);
+}
+// the magic-number subtrahend (as a half2 bit pattern) for a tile of bits b: q8 tiles hold q ^ 0x80 after xm (1152),
+// expanded low-bit tiles hold n = q + 2^(b-1) (1024 + 2^(b-1): 0x6400 | 2^(b-1), exact below 2048)
+__device__ __forceinline__ unsigned aq_sub(int bits) {
+    const unsigned s = bits == 8 ? 0x6480u : 0x6400u | (1u << (bits - 1));
+    return s * 0x10001u;
 }
 // one commit group's copies, issued by NTH threads (this one is thread t of them): K rows of a tile (kn valid rows,
 // kn < 0: none) -> K stage dk, V rows of a tile -> dv; rows >= the valid count get zero scales (their values are
@@ -2543,7 +2566,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     (void) slot0;
     // MK_KV per-slot formats (MIX only): tiles are copied in the slot's format (per tile: kv_tbits, since with MK_KV_WIN the
     // tiles at positions >= wsr are the ring's q8 copies) and the low-bit ones expanded to int8 in their stage before use
-    const int wsr = MIX ? kv_ws(L_ctx) : 0;
+    const int wsr = MIX ? kv_ws(L_ctx) : 0, wsm = MIX ? kv_wsm(wsr) : 0;
 
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c = item % nch;
@@ -2641,8 +2664,8 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             const __half *ks, *vs;
             int kb_ = 8, vb_ = 8;
             if constexpr (MIX) {
-                kb_ = kv_src(0, slot, g, c0 + tk * TP, wsr, kq, ks);
-                vb_ = kv_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, vq, vs);
+                kb_ = kv_src(0, slot, g, c0 + tk * TP, wsr, wsm, kq, ks);
+                vb_ = kv_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, vq, vs);
             } else { // all-q8 slot: the plain layout
                 const size_t kr = (size_t) g * ctx + c0 + tk * TP, vr = (size_t) g * ctx + c0 + max(tv, 0) * TP;
                 kq = cB.kvp[0][slot] + kr * HD;
@@ -2661,9 +2684,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
-            const int kb0 = kv_tbits(0, slot, c0, wsr); // K(0) -> int8 now (all warps); K(1) in interval 0
+            const int kb0 = kv_tbits(0, slot, c0, wsr); // K(0) -> bytes now (all warps); K(1) in interval 0
             if (kb0 != 8) {
-                kv_tile_expand(kring, kb0, tnp(0), warp, NW, KVQ_ROW);
+                kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
                 __syncthreads();
             }
         } else {
@@ -2684,6 +2707,12 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
         for (int jt = 0; jt < ntl + 2; jt++) {
+            // MIX: the copies of K(jt + 3) (into the stage of K(jt - 1)) and V(jt + 1) (into the stage of V(jt - 3), both read
+            // in interval jt - 1) go out FIRST, by warps 4-15: a tile then has two whole intervals to land instead of one
+            // (the all-q8 kernel issues after its MMA work; its intervals are DRAM-bound, so the lead time does not show)
+            if constexpr (MIX && MK_AQ_EARLY) {
+                if (warp >= 4 && jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+            }
             if (warp < 4) {
                 // ---- S(jt) = Q K(jt)^T: B = positions 8 wn + g8 (all 16 k-steps converted first), all row tiles
                 if (jt < ntl) {
@@ -2691,13 +2720,17 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const uint8_t * krow = kring + (jt % NSK) * AQ_STG + (8 * wn + g8) * KVQ_ROW;
                     const uint4 scv = *reinterpret_cast<const uint4 *>(krow + 256);
                     const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
-                    unsigned kb[HD / 16][2]; // (MIX: a low-bit tile was expanded to this layout in interval jt - 1)
+                    // MIX: a low-bit tile was expanded to biased bytes n = q + 2^(b-1) in interval jt - 1; its xm / sub make
+                    // the conversion below yield the same fp16 q (aq_q8x2). All-q8: the constants fold.
+                    const int kbj = MIX ? kv_tbits(0, slot, c0 + jt * TP, wsr) : 8;
+                    const unsigned kxm = kbj == 8 ? 0x8080u : 0u, ksub = aq_sub(kbj);
+                    unsigned kb[HD / 16][2];
 #pragma unroll
                     for (int ks = 0; ks < HD / 16; ks++) {
                         const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
                         const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
-                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd);
-                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd);
+                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd, kxm, ksub);
+                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub);
                     }
                     float s[MT][4];
 #pragma unroll
@@ -2741,25 +2774,27 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                         }
                     }
                     const unsigned paddr = (unsigned) __cvta_generic_to_shared(sP + b * 32 * LDP + (lane & 15) * LDP + (lane >> 4) * 8);
-                    // (MIX: a low-bit V tile was expanded to the q8 layout in interval jt - 1)
+                    // (MIX: a low-bit V tile was expanded to biased bytes in interval jt - 1: xm / sub as for K)
                     const uint8_t * vst = vring + (jp % NSV) * AQ_STG + 32 * wn + 4 * g8;
                     const uint8_t * vsc = vring + (jp % NSV) * AQ_STG + 256 + 2 * wn;
+                    const int vbj = MIX ? kv_tbits(1, slot, c0 + jp * TP, wsr) : 8;
+                    const unsigned vxm = vbj == 8 ? 0x80808080u : 0u, vsub = aq_sub(vbj);
 #pragma unroll
                     for (int ks = 0; ks < TP / 16; ks++) {
                         unsigned bf[2][4]; // [b0 / b1][tile jj]
 #pragma unroll
                         for (int h = 0; h < 2; h++) {
                             const int p = 16 * ks + 2 * tig + 8 * h; // k rows p, p + 1 of the fragment
-                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ 0x80808080u;
-                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ 0x80808080u;
+                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ vxm;
+                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ vxm;
                             const unsigned sw = (unsigned) *reinterpret_cast<const unsigned short *>(vsc + p * KVQ_ROW) |
                                                 ((unsigned) *reinterpret_cast<const unsigned short *>(vsc + (p + 1) * KVQ_ROW) << 16);
                             const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
                             const unsigned y0 = __byte_perm(xa, xb, 0x5140), y1 = __byte_perm(xa, xb, 0x7362);
-                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd);
-                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd);
-                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd);
-                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd);
+                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd, vsub);
+                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd, vsub);
+                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd, vsub);
+                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd, vsub);
                         }
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
@@ -2826,10 +2861,13 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             // then wait for K(jt + 1) and V(jt)
             if (warp >= 4) {
                 if constexpr (MIX) {
-                    // K(jt + 3) into the stage of K(jt - 1); then the low-bit tiles that landed at the end of interval jt - 1
-                    // are expanded to int8 for interval jt + 1: K(jt + 1) (S warps) and V(jt - 1) (P V warps), one row per
-                    // warp per step (their stages are not touched by any copy in flight)
-                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    // K(jt + 3) into the stage of K(jt - 1) (unless issued at the top of the interval, MK_AQ_EARLY); then the
+                    // low-bit tiles that landed at the end of interval jt - 1 are expanded to bytes for interval jt + 1: K(jt + 1)
+                    // (S warps) and V(jt - 1) (P V warps), up to 3 rows per warp per call; all TP rows (rows >= np hold stale
+                    // but finite bytes under zero scales: masked S, P = 0). Their stages are not touched by any copy in flight.
+                    if constexpr (!MK_AQ_EARLY) {
+                        if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    }
                     // row split of each tile: MK_XP_SM = 0: rows round-robin over the 12 warps; else rows 0 .. MK_XP_SM - 1 go to
                     // the (lightly loaded) softmax warps 12-15, the rest to the P V warps 4-11
                     int r0, rs, r1;
@@ -2838,11 +2876,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     else { r0 = MK_XP_SM + warp - 4; rs = 8; r1 = TP; }
                     if (jt + 1 < ntl) {
                         const int kb_ = kv_tbits(0, slot, c0 + (jt + 1) * TP, wsr);
-                        if (kb_ != 8) kv_tile_expand(kring + ((jt + 1) % NSK) * AQ_STG, kb_, min(tnp(jt + 1), r1), r0, rs, KVQ_ROW);
+                        if (kb_ != 8) kv_tile_expand<false>(kring + ((jt + 1) % NSK) * AQ_STG, kb_, r1, r0, rs, KVQ_ROW);
                     }
                     if (jt >= 1 && jt - 1 < ntl) {
                         const int vb_ = kv_tbits(1, slot, c0 + (jt - 1) * TP, wsr);
-                        if (vb_ != 8) kv_tile_expand(vring + ((jt - 1) % NSV) * AQ_STG, vb_, min(tnp(jt - 1), r1), r0, rs, KVQ_ROW);
+                        if (vb_ != 8) kv_tile_expand<false>(vring + ((jt - 1) % NSV) * AQ_STG, vb_, r1, r0, rs, KVQ_ROW);
                     }
                 } else {
                     if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
