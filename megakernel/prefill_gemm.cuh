@@ -133,9 +133,15 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // GLU: W2 holds the up matrix (same type and shape as W = gate); the CTA computes 64 gate rows
 // (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16. Only for
 // types whose rows carry their own scales (Q6_K / Q8_0 read them through W alone).
-template <int TYPE, bool GLU = false, int NB = BN>
+// LAY 1 (MK_WV): W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
+// Q4_K / Q5_K / IQ4_XS are fragment-ordered there (a row's 16-byte chunk of qh / qs is two 8-byte pieces 16 B apart,
+// IQ4_XS's 8-byte header is copied to its slot of the pair-header chunk), IQ4_NL / Q8_0 (and Q8_0's scales) are
+// tile-major whole blocks. Shared memory receives the same bytes as from the row-major layout.
+template <int TYPE, bool GLU = false, int NB = BN, int LAY = 0>
 __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
     static_assert(!GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "fused gate / up needs in-row scales");
+    static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80, "wv layout types");
+    constexpr bool FMT = LAY && (TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4); // fragment-ordered
     static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
     static_assert(NB * (BM + 4) * 4 <= hm_smem<TYPE, NB>(), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256;
@@ -151,21 +157,48 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     uint2 * sws = reinterpret_cast<uint2 *>(sm + NSH * STG); // [2][2 j][BM] fp16 scale pairs
 
     constexpr int WCH = BM * NCH, WIT = (WCH + 255) / 256;
+    constexpr int UB = 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     const uint8_t * wsrc[WIT];
     int winc[WIT];
     unsigned wdst[WIT];
-    bool wq[WIT]; // IQ4_XS: an index chunk (not the pair's header), at + 128 in the odd block of a pair
+    bool wq[WIT]; // IQ4_XS: an index chunk (not the pair's header), at + 128 in the odd block of a pair (LAY: not a header)
 #pragma unroll
     for (int k = 0; k < WIT; k++) {
         const int i = tid + k * 256, r = i / NCH, c = i % NCH;
         int off, inc;
         chunk_src<TYPE>(c, off, inc);
         const int rr = i < WCH ? r : 0;
-        wsrc[k] = GLU ? (rr < BM / 2 ? W.w : W2) + (size_t) (row0 + (rr & (BM / 2 - 1))) * W.rb + off
-                      : W.w + (size_t) (row0 + rr) * W.rb + off;
-        winc[k] = inc;
+        if constexpr (LAY) {
+            const uint8_t * mb = GLU ? (rr < BM / 2 ? W.w : W2) : W.w;
+            const int rowm = row0 + (GLU ? (rr & (BM / 2 - 1)) : rr), q16 = rowm & 15, gg = q16 & 7, hf = q16 >> 3;
+            const uint8_t * ub = mb + (size_t) (rowm >> 4) * (W.K >> 8) * UB;
+            if constexpr (FMT) {
+                int o2, i2 = 0;
+                if (c == 0) o2 = TYPE == TIQ4 ? 16 * gg + 8 * hf : 32 * gg + 16 * hf; // header
+                else if (TYPE == TQ5K && c < 3) o2 = 256 + 64 * gg + 32 * (c - 1) + 8 * hf; // qh
+                else { // qs of 64-group p: + 512 p
+                    o2 = (TYPE == TQ4K ? 256 : TYPE == TQ5K ? 768 : 128) + 64 * gg + 32 * (TYPE == TQ5K ? c - 3 : c - 1) + 8 * hf;
+                    i2 = 512;
+                }
+                wsrc[k] = ub + o2;
+                winc[k] = i2;
+            } else {
+                wsrc[k] = ub + q16 * BLK + off;
+                winc[k] = inc;
+            }
+        } else {
+            wsrc[k] = GLU ? (rr < BM / 2 ? W.w : W2) + (size_t) (row0 + (rr & (BM / 2 - 1))) * W.rb + off
+                          : W.w + (size_t) (row0 + rr) * W.rb + off;
+            winc[k] = inc;
+        }
         wq[k] = c != 0;
         wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
+    }
+    // LAY Q8_0: the thread's row of the tile-major scale stream (16 B per row and super-block)
+    const uint8_t * dsrc8 = nullptr;
+    if constexpr (LAY && TYPE == TQ80) {
+        const int rowm = row0 + (tid & (BM - 1));
+        dsrc8 = reinterpret_cast<const uint8_t *>(W.d) + ((size_t) (rowm >> 4) * (W.K >> 8) * 16 + (rowm & 15)) * 16;
     }
     // Q6_K: the row's meta stream (pairs of blocks: sc even | sc odd | d even | d odd, 36 B)
     const uint8_t * esrc = reinterpret_cast<const uint8_t *>(W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd);
@@ -189,7 +222,18 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
 #pragma unroll
         for (int k = 0; k < WIT; k++)
             if (WCH % 256 == 0 || tid + k * 256 < WCH) {
-                if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
+                if constexpr (FMT) {
+                    const uint8_t * src = wsrc[k] + (size_t) sb * UB;
+                    if (!wq[k]) {
+                        if constexpr (TYPE == TIQ4) cpa8(s + wdst[k] + 8 * (sb & 1), src);
+                        else cpa16(s + wdst[k], src);
+                    } else {
+                        cpa8(s + wdst[k], src + p * winc[k]);
+                        cpa8(s + wdst[k] + 8, src + p * winc[k] + 16);
+                    }
+                } else if constexpr (LAY) {
+                    cpa16(s + wdst[k], wsrc[k] + (size_t) sb * UB + p * winc[k]);
+                } else if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
                     cpa16(s + wdst[k], wsrc[k] + (size_t) (sb >> 1) * 272 + (wq[k] && (sb & 1) ? 128 : 0) + p * winc[k]);
                 else
                     cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
@@ -200,7 +244,10 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                 cpa4(s + edst + 4, esrc + (sb >> 1) * 36 + 32);
             }
         } else if constexpr (TYPE == TQ80) {
-            if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
+            if (tid < BM) {
+                if constexpr (LAY) cpa4(s + edst, dsrc8 + (size_t) sb * 256 + 4 * p);
+                else cpa4(s + edst, dsrc + 2 * st);
+            }
         } else if constexpr (TYPE == TQ3K) { // high bits of the stage's two units | sc[4p..4p+3] | the pair's two d
             if (tid < BM) {
                 cpa8(s + rdst + 16, vsrc + sb * BLK + 64 + 8 * p);
