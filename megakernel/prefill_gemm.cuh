@@ -133,9 +133,20 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // GLU: W2 holds the up matrix (same type and shape as W = gate); the CTA computes 64 gate rows
 // (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16. Only for
 // types whose rows carry their own scales (Q6_K / Q8_0 read them through W alone).
-template <int TYPE, bool GLU = false, int NB = BN>
+// LAY 1 (MK_WV): W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
+// Q4_K / Q5_K / IQ4_XS are fragment-ordered there (FMT: a 16-B chunk of qh / qs holds 8 B of rows g and g + 8), IQ4_NL /
+// Q8_0 (and Q8_0's scales) are tile-major whole blocks (shared memory receives the same bytes as from the row-major layout).
+// FMT stage layout: the FM chunks land whole (one cp.async 16 each): per 16-row tile a 512-B region of qs (Q5_K: and qh)
+// chunks, chunk (g, tq) at fmt_off = 128 (2 (g & 1) + (tq >> 1)) + 16 (2 (g >> 1) + (tq & 1)), then the headers (16 B per
+// row; IQ4_XS: 16 B per row pair g / g + 8). rawq's 32-bit reads are bank-conflict-free because odd-g lanes read their
+// chunks' second half (row g + 8) as their "row A": the lane's MMA rows are g + 8 (g & 1) and the other one, which the
+// scales and the epilogue follow (the same products and sums per row: exact).
+template <int TYPE, bool GLU = false, int NB = BN, int LAY = 0>
 __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
     static_assert(!GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "fused gate / up needs in-row scales");
+    static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80 || TYPE == TQ6K ||
+                      TYPE == TQ3K || TYPE == TIQ3S, "wv layout types");
+    constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
     static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
     static_assert(NB * (BM + 4) * 4 <= hm_smem<TYPE, NB>(), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256;
@@ -150,22 +161,63 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const unsigned sbase = (unsigned) __cvta_generic_to_shared(sm);
     uint2 * sws = reinterpret_cast<uint2 *>(sm + NSH * STG); // [2][2 j][BM] fp16 scale pairs
 
-    constexpr int WCH = BM * NCH, WIT = (WCH + 255) / 256;
+    // FMT stage layout (see above): Q5_K qh regions at FQH, qs regions at FQS, headers at FHO; FCPT chunks per tile and stage
+    constexpr int FQH = 0, FQS = TYPE == TQ5K ? BM * 32 : 0, FHO = FQS + BM * 32;
+    constexpr int FNQ = TYPE == TQ5K ? 64 : 32, FCPT = FNQ + (TYPE == TIQ4 ? 8 : 16);
+    static_assert(!FMT || FHO + BM * 16 <= SR * BM, "FMT stage layout fits the stage's weight part");
+    constexpr int WCH = FMT ? BM / 16 * FCPT : BM * NCH, WIT = (WCH + 255) / 256;
+    constexpr int UB = 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     const uint8_t * wsrc[WIT];
     int winc[WIT];
     unsigned wdst[WIT];
-    bool wq[WIT]; // IQ4_XS: an index chunk (not the pair's header), at + 128 in the odd block of a pair
+    bool wq[WIT]; // IQ4_XS: an index chunk (not the pair's header), at + 128 in the odd block of a pair (LAY: not a header)
 #pragma unroll
     for (int k = 0; k < WIT; k++) {
         const int i = tid + k * 256, r = i / NCH, c = i % NCH;
         int off, inc;
         chunk_src<TYPE>(c, off, inc);
         const int rr = i < WCH ? r : 0;
-        wsrc[k] = GLU ? (rr < BM / 2 ? W.w : W2) + (size_t) (row0 + (rr & (BM / 2 - 1))) * W.rb + off
-                      : W.w + (size_t) (row0 + rr) * W.rb + off;
-        winc[k] = inc;
+        if constexpr (LAY) {
+            const uint8_t * mb = GLU ? (rr < BM / 2 ? W.w : W2) : W.w;
+            const int rowm = row0 + (GLU ? (rr & (BM / 2 - 1)) : rr), q16 = rowm & 15, gg = q16 & 7, hf = q16 >> 3;
+            const uint8_t * ub = mb + (size_t) (rowm >> 4) * (W.K >> 8) * UB;
+            if constexpr (FMT) { // whole FM chunks: thread i -> (tile t, chunk cc); 8 consecutive threads -> 8 bank quads
+                const int ii = i < WCH ? i : 0, t = ii / FCPT, cc = ii % FCPT;
+                const uint8_t * mbt = GLU ? (t < BM / 32 ? W.w : W2) : W.w;
+                const int trow = row0 + 16 * (GLU ? (t & (BM / 32 - 1)) : t);
+                const uint8_t * ubt = mbt + (size_t) (trow >> 4) * (W.K >> 8) * UB;
+                int o2, i2 = 0, d2;
+                if (cc < FNQ) { // qs chunk (Q5_K: cc < 32 qh, then qs) of lane (gq, tq), stored at fmt_off(gq, tq)
+                    const int qq = cc & 31, q = qq & 7, rs = qq >> 3, gq = 2 * (q >> 1) + (rs & 1), tq = 2 * (rs >> 1) + (q & 1);
+                    const bool qh = TYPE == TQ5K && cc < 32;
+                    o2 = (qh ? 256 : TYPE == TQ4K ? 256 : TYPE == TQ5K ? 768 : 128) + 16 * (4 * gq + tq);
+                    i2 = qh ? 0 : 512; // qs of 64-group p: + 512 p
+                    d2 = (qh ? FQH : FQS) + 512 * t + 128 * (2 * (rs & 1) + (rs >> 1)) + 16 * q;
+                } else { // header: Q4_K / Q5_K row h of the tile (FM chunk 2 (h & 7) + (h >> 3)); IQ4_XS rows h, h + 8 (chunk h)
+                    const int h = cc - FNQ;
+                    o2 = TYPE == TIQ4 ? 16 * h : 16 * (2 * (h & 7) + (h >> 3));
+                    d2 = FHO + 16 * ((TYPE == TIQ4 ? 8 : 16) * t + h);
+                }
+                wsrc[k] = ubt + o2;
+                winc[k] = i2;
+                wdst[k] = d2;
+            } else {
+                wsrc[k] = ub + q16 * BLK + off;
+                winc[k] = inc;
+            }
+        } else {
+            wsrc[k] = GLU ? (rr < BM / 2 ? W.w : W2) + (size_t) (row0 + (rr & (BM / 2 - 1))) * W.rb + off
+                          : W.w + (size_t) (row0 + rr) * W.rb + off;
+            winc[k] = inc;
+        }
         wq[k] = c != 0;
-        wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
+        if constexpr (!FMT) wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
+    }
+    // LAY Q8_0: the thread's row of the tile-major scale stream (16 B per row and super-block)
+    const uint8_t * dsrc8 = nullptr;
+    if constexpr (LAY && TYPE == TQ80) {
+        const int rowm = row0 + (tid & (BM - 1));
+        dsrc8 = reinterpret_cast<const uint8_t *>(W.d) + ((size_t) (rowm >> 4) * (W.K >> 8) * 16 + (rowm & 15)) * 16;
     }
     // Q6_K: the row's meta stream (pairs of blocks: sc even | sc odd | d even | d odd, 36 B)
     const uint8_t * esrc = reinterpret_cast<const uint8_t *>(W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd);
@@ -173,6 +225,15 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     // Q3_K / IQ3_S: the row's value stream (high bits / signs at 64 + 8 p of each block) and its smem row
     const uint8_t * vsrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb;
+    // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
+    // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
+    constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
+    if constexpr (LAY && (TYPE == TQ6K || TYPE == TQ3K || TYPE == TIQ3S)) {
+        const int rowm = row0 + (tid & (BM - 1)), nb = W.K >> 8;
+        esrc = reinterpret_cast<const uint8_t *>(W.d) + ((size_t) (rowm >> 4) * (TYPE == TIQ3S ? nb : nb / 2) * 16 + (rowm & 15)) *
+                                                            (TYPE == TIQ3S ? 16 : 36);
+        vsrc = W.w + ((size_t) (rowm >> 4) * nb * 16 + (rowm & 15)) * BLK;
+    }
     const unsigned rdst = (tid & (BM - 1)) * SR;
     const __half * xsrc[XIT];
     unsigned xdst[XIT];
@@ -189,28 +250,33 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
 #pragma unroll
         for (int k = 0; k < WIT; k++)
             if (WCH % 256 == 0 || tid + k * 256 < WCH) {
-                if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
+                if constexpr (LAY) { // (FMT: whole FM chunks to the FMT stage layout)
+                    cpa16(s + wdst[k], wsrc[k] + (size_t) sb * UB + p * winc[k]);
+                } else if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
                     cpa16(s + wdst[k], wsrc[k] + (size_t) (sb >> 1) * 272 + (wq[k] && (sb & 1) ? 128 : 0) + p * winc[k]);
                 else
                     cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
             }
         if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
             if (tid < BM) {
-                cpa4(s + edst, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
-                cpa4(s + edst + 4, esrc + (sb >> 1) * 36 + 32);
+                cpa4(s + edst, esrc + (sb >> 1) * EST + 16 * (sb & 1) + 4 * p);
+                cpa4(s + edst + 4, esrc + (sb >> 1) * EST + 32);
             }
         } else if constexpr (TYPE == TQ80) {
-            if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
+            if (tid < BM) {
+                if constexpr (LAY) cpa4(s + edst, dsrc8 + (size_t) sb * 256 + 4 * p);
+                else cpa4(s + edst, dsrc + 2 * st);
+            }
         } else if constexpr (TYPE == TQ3K) { // high bits of the stage's two units | sc[4p..4p+3] | the pair's two d
             if (tid < BM) {
-                cpa8(s + rdst + 16, vsrc + sb * BLK + 64 + 8 * p);
-                cpa4(s + rdst + 24, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
-                cpa4(s + rdst + 28, esrc + (sb >> 1) * 36 + 32);
+                cpa8(s + rdst + 16, vsrc + sb * VST + 64 + 8 * p);
+                cpa4(s + rdst + 24, esrc + (sb >> 1) * EST + 16 * (sb & 1) + 4 * p);
+                cpa4(s + rdst + 28, esrc + (sb >> 1) * EST + 32);
             }
         } else if constexpr (TYPE == TIQ3S) { // the block's meta (qh[8] | scales[4] | d) | signs of the stage's two units
             if (tid < BM) {
-                cpa16(s + rdst + 16, esrc + sb * 16);
-                cpa8(s + rdst + 32, vsrc + sb * BLK + 64 + 8 * p);
+                cpa16(s + rdst + 16, esrc + sb * EST);
+                cpa8(s + rdst + 32, vsrc + sb * VST + 64 + 8 * p);
             }
         }
 #pragma unroll
@@ -220,7 +286,9 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     // fp16 scales of stage st -> sws[st & 1][j][row] (thread = (row, j)):
     //   Q4_K / Q5_K: (S, S, -M, -M);  Q6_K: (S_lo, S_lo, S_hi, S_hi);  Q8_0: (d, d, d, d)
     auto scales = [&](int st) {
-        const uint8_t * row = sm + (st % NSH) * STG + (tid >> 1) * SR;
+        const int hr = tid >> 1; // FMT: the headers at FHO (IQ4_XS: row pair chunk (tile, hr & 7), half hr >> 3 & 1)
+        const uint8_t * row = sm + (st % NSH) * STG +
+                              (!FMT ? hr * SR : TYPE == TIQ4 ? FHO + 16 * (8 * (hr >> 4) + (hr & 7)) + 8 * ((hr >> 3) & 1) : FHO + 16 * hr);
         const int j = tid & 1, p = st & 3;
         __half2 a, b;
         if constexpr (TYPE == TQ4K || TYPE == TQ5K) {
@@ -239,7 +307,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             a = __float2half2_rn(dm.x * (float) sc);
             b = __float2half2_rn(-dm.y * (float) m);
         } else if constexpr (TYPE == TIQ4) { // the pair's two GGUF headers: fp16 d | u16 scales_h | u8 scales_l[4]
-            const int2 hd = *reinterpret_cast<const int2 *>(row + 8 * ((st >> 2) & 1));
+            const int2 hd = *reinterpret_cast<const int2 *>(row + (FMT ? 0 : 8 * ((st >> 2) & 1)));
             const float d = __half2float(__ushort_as_half((unsigned short) (hd.x & 0xffff)));
             const unsigned sl = ((unsigned) hd.y >> (8 * p + 4 * j)) & 0xfu, sh = ((unsigned) hd.x >> (16 + 4 * p + 2 * j)) & 3u;
             a = b = __float2half2_rn(d * (float) ((int) (sl | (sh << 4)) - 32));
@@ -309,32 +377,38 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         const int rw = HWR * wm + 16 * mi + g;
         const uint8_t * ra = sw + rw * SR;
         const uint8_t * rb = ra + 8 * SR;
+        // FMT: word (half, sec) = bytes 16 half + 4 t4 .. of the 32-B group of the lane's row A (sec 0: g + 8 (g & 1)) / B
+        const int od = g & 1;
+        auto fw = [&](int fr, int half, int sec) {
+            return *reinterpret_cast<const unsigned *>(sw + fr + 512 * (rw >> 4) + 128 * (2 * od + half) +
+                                                       16 * (2 * (g >> 1) + (t4 >> 1)) + 8 * (od ^ sec) + 4 * (t4 & 1));
+        };
         // weight words: wd[j][kk][r] = 4 values of elements 16 kk + 4 t4 .. of sub-block j, row g + 8 r
         unsigned wd[2][2][2];
         if constexpr (TYPE == TQ4K || TYPE == TQ5K) {
             constexpr int QO = TYPE == TQ4K ? 16 : 48;
-            const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + QO + 4 * t4);
-            const unsigned w1 = *reinterpret_cast<const unsigned *>(ra + QO + 16 + 4 * t4);
-            const unsigned w2 = *reinterpret_cast<const unsigned *>(rb + QO + 4 * t4);
-            const unsigned w3 = *reinterpret_cast<const unsigned *>(rb + QO + 16 + 4 * t4);
+            const unsigned w0 = FMT ? fw(FQS, 0, 0) : *reinterpret_cast<const unsigned *>(ra + QO + 4 * t4);
+            const unsigned w1 = FMT ? fw(FQS, 1, 0) : *reinterpret_cast<const unsigned *>(ra + QO + 16 + 4 * t4);
+            const unsigned w2 = FMT ? fw(FQS, 0, 1) : *reinterpret_cast<const unsigned *>(rb + QO + 4 * t4);
+            const unsigned w3 = FMT ? fw(FQS, 1, 1) : *reinterpret_cast<const unsigned *>(rb + QO + 16 + 4 * t4);
             wd[0][0][0] = w0 & M4; wd[0][0][1] = w2 & M4; wd[0][1][0] = w1 & M4; wd[0][1][1] = w3 & M4;
             wd[1][0][0] = (w0 >> 4) & M4; wd[1][0][1] = (w2 >> 4) & M4;
             wd[1][1][0] = (w1 >> 4) & M4; wd[1][1][1] = (w3 >> 4) & M4;
             if constexpr (TYPE == TQ5K) {
-                const unsigned h0 = *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4) >> (2 * p);
-                const unsigned h1 = *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4) >> (2 * p);
-                const unsigned h2 = *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4) >> (2 * p);
-                const unsigned h3 = *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4) >> (2 * p);
+                const unsigned h0 = (FMT ? fw(FQH, 0, 0) : *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4)) >> (2 * p);
+                const unsigned h1 = (FMT ? fw(FQH, 1, 0) : *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4)) >> (2 * p);
+                const unsigned h2 = (FMT ? fw(FQH, 0, 1) : *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4)) >> (2 * p);
+                const unsigned h3 = (FMT ? fw(FQH, 1, 1) : *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4)) >> (2 * p);
                 wd[0][0][0] |= (h0 & 0x01010101u) << 4; wd[0][0][1] |= (h2 & 0x01010101u) << 4;
                 wd[0][1][0] |= (h1 & 0x01010101u) << 4; wd[0][1][1] |= (h3 & 0x01010101u) << 4;
                 wd[1][0][0] |= (h0 & 0x02020202u) << 3; wd[1][0][1] |= (h2 & 0x02020202u) << 3;
                 wd[1][1][0] |= (h1 & 0x02020202u) << 3; wd[1][1][1] |= (h3 & 0x02020202u) << 3;
             }
         } else if constexpr (TYPE == TIQ4 || TYPE == TIQ4NL) { // indices -> kvalues + 128 (low nibbles: sub-block 0, high: 1)
-            const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4);
-            const unsigned w1 = *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4);
-            const unsigned w2 = *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4);
-            const unsigned w3 = *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4);
+            const unsigned w0 = FMT ? fw(FQS, 0, 0) : *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4);
+            const unsigned w1 = FMT ? fw(FQS, 1, 0) : *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4);
+            const unsigned w2 = FMT ? fw(FQS, 0, 1) : *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4);
+            const unsigned w3 = FMT ? fw(FQS, 1, 1) : *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4);
             int lo, hi;
             iq4_lut(w0, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][0][0] = lo; wd[1][0][0] = hi;
             iq4_lut(w2, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][0][1] = lo; wd[1][0][1] = hi;
@@ -428,8 +502,8 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         for (int j = 0; j < 2; j++) {
             uint2 sA, sB;
             if constexpr (HT<TYPE>::SEP) {
-                sA = ws[j * BM + rw];
-                sB = ws[j * BM + rw + 8];
+                sA = ws[j * BM + rw + (FMT ? 8 * (g & 1) : 0)]; // FMT: the lane's rows A / B (rawq)
+                sB = ws[j * BM + rw + (FMT ? 8 - 8 * (g & 1) : 8)];
             } else { // Q6_K: (S_j0, S_j1) in the row -> broadcast pairs
                 const int z = (g >> 1) & 3;
                 const __half2 qa = *reinterpret_cast<const __half2 *>(ra + 16 * (3 ^ z) + 8 + 4 * j);
@@ -501,10 +575,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
 #pragma unroll
     for (int ni = 0; ni < HNI; ni++) {
         const int r = HWR * wm + 16 * mi + g, tk = HWT * wn + 8 * ni + 2 * t4;
-        se[tk * ELD + r] = acc[mi][ni][0];
-        se[(tk + 1) * ELD + r] = acc[mi][ni][1];
-        se[tk * ELD + r + 8] = acc[mi][ni][2];
-        se[(tk + 1) * ELD + r + 8] = acc[mi][ni][3];
+        const int rA = r + (FMT ? 8 * (g & 1) : 0), rB = r + (FMT ? 8 - 8 * (g & 1) : 8); // FMT: rows A / B (rawq)
+        se[tk * ELD + rA] = acc[mi][ni][0];
+        se[(tk + 1) * ELD + rA] = acc[mi][ni][1];
+        se[tk * ELD + rB] = acc[mi][ni][2];
+        se[(tk + 1) * ELD + rB] = acc[mi][ni][3];
     }
     __syncthreads();
     if constexpr (GLU) {
