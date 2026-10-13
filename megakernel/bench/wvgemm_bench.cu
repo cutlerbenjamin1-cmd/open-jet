@@ -68,6 +68,7 @@ struct DpArgs {
     QB q;
     float * out;
     int M;
+    float * park; // k_dp4a_k2: per-lane partial sums between the two K slices [M / 2][2][T][32]
 };
 template <int T, int IT, int TYPE>
 __global__ void __launch_bounds__(NT, 1) k_dp4a(DpArgs A) {
@@ -98,6 +99,67 @@ __global__ void __launch_bounds__(NT, 1) k_dp4a(DpArgs A) {
             for (int t = 0; t < T; t++)
                 if ((lane >> 1) == t) A.out[(size_t) t * A.M + 2 * it + (lane & 1)] = (lane & 1) ? a[1][t] : a[0][t];
         }
+        gsync(epoch);
+    }
+}
+
+// The activations of all K do not fit at this T (ffn_down, T >= 5): two K slices of ITS0 = ceil(IT / 2) and IT - ITS0
+// lane units, each filled in turn; the per-lane partial sums of a warp's items are parked in global memory (L2) between
+// the slices (the engine's T = 5 resid32 parks them in shared memory). Same arithmetic order per lane as k_dp4a.
+template <int T, int ITS, int TYPE>
+__device__ __forceinline__ void dp_slice(const DpArgs & A, const Mat & m, int u0, bool first, bool last, uint8_t * sm) {
+    constexpr int US = 32 * ITS;
+    SX sx;
+    sx.xa = reinterpret_cast<int4 *>(sm);
+    sx.xb = sx.xa + T * US;
+    sx.xm = reinterpret_cast<uint2 *>(sx.xb + T * US);
+    sx.U = US;
+    __syncthreads(); // the previous slice's readers are done
+    for (int i = threadIdx.x; i < T * US; i += NT) {
+        const int t = i / US, u = u0 + (i - t * US);
+        cp16(sx.xa + i, A.q.xa + ((size_t) t * A.q.U + u) * 16);
+        cp16(sx.xb + i, A.q.xb + ((size_t) t * A.q.U + u) * 16);
+    }
+    for (int i = threadIdx.x; i < T * US / 2; i += NT) {
+        const int t = (2 * i) / US, u = u0 + (2 * i - t * US);
+        cp16(sx.xm + 2 * i, A.q.meta + (size_t) t * A.q.U + u);
+    }
+    cp_wait();
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    for (int it = gwarp(); it < A.M / 2; it += nwarps()) {
+        float a[2][T];
+        float * pk = A.park + (size_t) it * 2 * T * 32 + lane;
+        if (first) zero_acc<T, 2>(a);
+        else {
+#pragma unroll
+            for (int k = 0; k < 2; k++)
+#pragma unroll
+                for (int t = 0; t < T; t++) a[k][t] = __ldcg(pk + (k * T + t) * 32);
+        }
+        mrows<T, ITS, 2, TYPE>(m, 2 * it, sx, a, u0);
+        if (last) {
+            wsum_acc<T, 2>(a);
+#pragma unroll
+            for (int t = 0; t < T; t++)
+                if ((lane >> 1) == t) A.out[(size_t) t * A.M + 2 * it + (lane & 1)] = (lane & 1) ? a[1][t] : a[0][t];
+        } else {
+#pragma unroll
+            for (int k = 0; k < 2; k++)
+#pragma unroll
+                for (int t = 0; t < T; t++) __stcg(pk + (k * T + t) * 32, a[k][t]);
+        }
+    }
+}
+template <int T, int IT, int TYPE>
+__global__ void __launch_bounds__(NT, 1) k_dp4a_k2(DpArgs A) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    constexpr int I0 = (IT + 1) / 2, I1 = IT - I0;
+    unsigned epoch = 0;
+    for (int L = 0; L < A.nlay; L++) {
+        const Mat m = A.mats[L];
+        dp_slice<T, I0, TYPE>(A, m, 0, true, false, sm);
+        dp_slice<T, I1, TYPE>(A, m, 32 * I0, false, true, sm);
         gsync(epoch);
     }
 }
@@ -143,7 +205,26 @@ template <int TYPE> struct WV;
 #ifndef WV_LD256
 #define WV_LD256 0
 #endif
-#if WV_LD256
+#ifndef WV_NOPOL
+#define WV_NOPOL 0 // 1: weight loads without the evict-first L2 policy
+#endif
+#if WV_NOPOL
+__device__ __forceinline__ int4 wld4(const void * p) {
+    int4 r;
+    asm("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+__device__ __forceinline__ int2 wld2(const void * p) {
+    int2 r;
+    asm("ld.global.nc.L1::no_allocate.v2.s32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+}
+__device__ __forceinline__ int wld1(const void * p) {
+    int r;
+    asm("ld.global.nc.L1::no_allocate.s32 %0, [%1];" : "=r"(r) : "l"(p));
+    return r;
+}
+#elif WV_LD256
 __device__ __forceinline__ int4 wld4(const void * p) {
     int4 r;
     asm("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.s32 {%0,%1,%2,%3}, [%4], %5;"
@@ -167,13 +248,35 @@ __device__ __forceinline__ int wld1(const void * p) { return ldw1(p); }
 #endif
 __device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 
+// block idx (of BS bytes) of row `row`: the engine's row-major layout, or (WV_TILEMAJ, a timing experiment: the same
+// bytes at other addresses) tile-major: the 16 rows of a 16-row tile stored block-interleaved, unit (tile, idx) = 16 x BS
+// contiguous bytes
+#ifndef WV_TILEMAJ
+#define WV_TILEMAJ 0
+#endif
+__device__ __forceinline__ const uint8_t * wblk(const Mat & m, int row, int idx, int BS) {
+#if WV_TILEMAJ
+    return m.w + (((size_t) (row >> 4) * (m.rb / BS) + idx) * 16 + (row & 15)) * BS;
+#else
+    return m.w + (size_t) row * m.rb + (size_t) idx * BS;
+#endif
+}
+// the meta stream (Mat::d) likewise, in MB-byte entries idx
+__device__ __forceinline__ const uint8_t * wmeta(const Mat & m, int row, int idx, int MB) {
+    const uint8_t * d = reinterpret_cast<const uint8_t *>(m.d);
+#if WV_TILEMAJ
+    return d + (((size_t) (row >> 4) * (2 * m.nd / MB) + idx) * 16 + (row & 15)) * MB;
+#else
+    return d + (size_t) row * 2 * m.nd + (size_t) idx * MB;
+#endif
+}
 template <> struct WV<T_Q4K> { // native 144 B: d, dmin | scales[12] | qs[128]
     static constexpr bool S16 = false;
     static constexpr int MIN = 1;
     struct Raw { int4 h; int2 q[4]; };
     struct Sc { unsigned s0, s1, m0, m1; float d, nd, dm, ndm; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * 144;
+        const uint8_t * blk = wblk(m, row, sb, 144);
         r.h = wld4(blk);
 #pragma unroll
         for (int p = 0; p < 4; p++) r.q[p] = wld2(blk + 16 + 32 * p + 8 * tq);
@@ -204,7 +307,7 @@ template <> struct WV<T_Q5K> { // native 176 B: d, dmin | scales[12] | qh[32] | 
     struct Raw { int4 h; int2 qh; int2 q[4]; };
     using Sc = WV<T_Q4K>::Sc;
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * 176;
+        const uint8_t * blk = wblk(m, row, sb, 176);
         r.h = wld4(blk);
         r.qh = wld2(blk + 16 + 8 * tq);
 #pragma unroll
@@ -229,7 +332,7 @@ template <> struct WV<T_IQ4X> { // repacked pairs of blocks, 272 B: hdr0 | hdr1 
     struct Raw { int2 h; int2 q[4]; };
     struct Sc { unsigned sl, sh; float d, nd; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * pr = m.w + (size_t) row * m.rb + (sb >> 1) * 272;
+        const uint8_t * pr = wblk(m, row, sb >> 1, 272);
         r.h = wld2(pr + 8 * (sb & 1));
 #pragma unroll
         for (int p = 0; p < 4; p++) r.q[p] = wld2(pr + 16 + 128 * (sb & 1) + 32 * p + 8 * tq);
@@ -260,7 +363,7 @@ template <> struct WV<T_IQ4NL> { // repacked 144 B: d[8] (fp16, one per 32) | qs
     struct Raw { int4 h; int2 q[4]; };
     struct Sc { int4 h; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * 144;
+        const uint8_t * blk = wblk(m, row, sb, 144);
         r.h = wld4(blk);
 #pragma unroll
         for (int p = 0; p < 4; p++) r.q[p] = wld2(blk + 16 + 32 * p + 8 * tq);
@@ -286,8 +389,8 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
     struct Raw { int4 d; int2 q[8]; };
     struct Sc { int4 d; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * rp = m.w + (size_t) row * m.rb + sb * 256;
-        r.d = wld4(m.d + (size_t) row * m.nd + 8 * sb);
+        const uint8_t * rp = wblk(m, row, sb, 256);
+        r.d = wld4(wmeta(m, row, sb, 16));
 #pragma unroll
         for (int k = 0; k < 8; k++) r.q[k] = wld2(rp + 32 * (2 * (k >> 1) + (tq >> 1)) + 16 * (k & 1) + 8 * (tq & 1));
     }
@@ -309,8 +412,8 @@ template <> struct WV<T_Q6K> {
     struct Raw { int sc[4]; int dd; int2 q[4]; int2 hb[4]; };
     struct Sc { int sc[4]; float d, nd; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * Q6_BLK;
-        const uint8_t * mp = reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + (sb >> 1) * (2 * Q6_META);
+        const uint8_t * blk = wblk(m, row, sb, Q6_BLK);
+        const uint8_t * mp = wmeta(m, row, sb >> 1, 2 * Q6_META);
 #pragma unroll
         for (int k = 0; k < 4; k++) r.sc[k] = wld1(mp + 16 * (sb & 1) + 4 * k); // (meta is only 4-byte aligned)
         r.dd = wld1(mp + 32);
@@ -353,8 +456,8 @@ template <> struct WV<T_Q3K> {
     struct Raw { int sc[4]; int dd; int2 lo[4]; int hi[4]; };
     using Sc = WV<T_Q6K>::Sc;
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * Q3_BLK;
-        const uint8_t * mp = reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + (sb >> 1) * (2 * Q6_META);
+        const uint8_t * blk = wblk(m, row, sb, Q3_BLK);
+        const uint8_t * mp = wmeta(m, row, sb >> 1, 2 * Q6_META);
 #pragma unroll
         for (int k = 0; k < 4; k++) r.sc[k] = wld1(mp + 16 * (sb & 1) + 4 * k);
         r.dd = (int) ((unsigned) wld1(mp + 32) >> (16 * (sb & 1)));
@@ -389,8 +492,8 @@ template <> struct WV<T_IQ3S> {
     struct Raw { int2 qh; int2 sd; int2 ix[4]; int sg[4]; };
     struct Sc { unsigned sc; float d, nd; };
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int row, int sb, int tq) {
-        const uint8_t * blk = m.w + (size_t) row * m.rb + sb * Q3_BLK;
-        const uint8_t * mp = reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + sb * IQ3S_META;
+        const uint8_t * blk = wblk(m, row, sb, Q3_BLK);
+        const uint8_t * mp = wmeta(m, row, sb, IQ3S_META);
         r.qh = wld2(mp);
         r.sd = wld2(mp + 8);
 #pragma unroll
@@ -499,6 +602,72 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
 #ifndef WV_SBU
 #define WV_SBU 1 // super-blocks loaded per batch (PF = 0 only)
 #endif
+#ifndef WV_TILEMAJ
+#define WV_TILEMAJ 0
+#endif
+
+// WV_TILEMAJ == 2 (timing experiment, Q4_K / Q5_K / IQ4_XS): tile-major and fragment-ordered. Unit (tile, sb) = 16 x BS
+// contiguous bytes: headers paired per g (row g | row g + 8) at 32 g (Q4_K / Q5_K, 16 B each) or 16 g (IQ4_XS, 8 B each);
+// Q5_K qh, then the 4 qs groups, each 512 B with lane l = 4 g + tq at 16 l = {row g's 8 B | row g + 8's 8 B}. Every
+// lane load is 16 B and every warp load instruction reads contiguous bytes.
+template <int TYPE>
+__device__ __forceinline__ void wv_load2(typename WV<TYPE>::Raw & r0, typename WV<TYPE>::Raw & r1, const Mat & m, int row0, int sb,
+                                         int g, int tq) {
+#if WV_TILEMAJ == 2
+    if constexpr (TYPE == T_Q4K || TYPE == T_Q5K || TYPE == T_IQ4X) {
+        constexpr int BS = TYPE == T_Q4K ? 144 : TYPE == T_Q5K ? 176 : 136;
+        const uint8_t * u = m.w + ((size_t) (row0 >> 4) * (m.K / 256) + sb) * 16 * BS;
+        const int l = 4 * g + tq;
+        int qo;
+        if constexpr (TYPE == T_IQ4X) {
+            const int4 h = wld4(u + 16 * g);
+            r0.h = make_int2(h.x, h.y);
+            r1.h = make_int2(h.z, h.w);
+            qo = 128;
+        } else {
+            r0.h = wld4(u + 32 * g);
+            r1.h = wld4(u + 32 * g + 16);
+            qo = 256;
+        }
+        if constexpr (TYPE == T_Q5K) {
+            const int4 v = wld4(u + 256 + 16 * l);
+            r0.qh = make_int2(v.x, v.y);
+            r1.qh = make_int2(v.z, v.w);
+            qo = 768;
+        }
+#pragma unroll
+        for (int p = 0; p < 4; p++) {
+            const int4 v = wld4(u + qo + 512 * p + 16 * l);
+            r0.q[p] = make_int2(v.x, v.y);
+            r1.q[p] = make_int2(v.z, v.w);
+        }
+        return;
+    }
+#endif
+    WV<TYPE>::load(r0, m, row0 + g, sb, tq);
+    WV<TYPE>::load(r1, m, row0 + g + 8, sb, tq);
+}
+#ifndef WV_SPS
+#define WV_SPS 1
+#endif
+#ifndef WV_RH
+#define WV_RH 16
+#endif
+#ifndef WV_MODE
+#define WV_MODE 0 // diagnostics: 0 normal, 1 loads only (XOR of the raw words), 2 compute only (raw loaded once)
+#endif
+template <class R> __device__ __forceinline__ int raw_xor(const R & r) {
+    const int * p = reinterpret_cast<const int *>(&r);
+    int x = 0;
+#pragma unroll
+    for (int i = 0; i < (int) (sizeof(R) / 4); i++) x ^= p[i];
+    return x;
+}
+template <class R> __device__ __forceinline__ void raw_opaque(R & r) {
+    int * p = reinterpret_cast<int *>(&r);
+#pragma unroll
+    for (int i = 0; i < (int) (sizeof(R) / 4); i++) asm volatile("" : "+r"(p[i]));
+}
 template <int TYPE, int T, bool X16, int PF>
 __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int nsb, const XSm & xs,
                                         float (&acc)[Cfg<TYPE, T, X16>::NG][4]) {
@@ -516,23 +685,102 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
         int sb = 0;
 #pragma unroll 1
         for (; sb + 1 < nsb; sb += 2) {
-            W::load(a0, m, row0 + g, sb0 + sb, tq);
-            W::load(a1, m, row0 + g + 8, sb0 + sb, tq);
-            W::load(b0, m, row0 + g, sb0 + sb + 1, tq);
-            W::load(b1, m, row0 + g + 8, sb0 + sb + 1, tq);
+            wv_load2<TYPE>(a0, a1, m, row0, sb0 + sb, g, tq);
+            wv_load2<TYPE>(b0, b1, m, row0, sb0 + sb + 1, g, tq);
             wv_sb<TYPE, T, X16>(a0, a1, 8 * sb, xs, xrow, bon, acc);
             wv_sb<TYPE, T, X16>(b0, b1, 8 * sb + 8, xs, xrow, bon, acc);
         }
         if (sb < nsb) {
-            W::load(a0, m, row0 + g, sb0 + sb, tq);
-            W::load(a1, m, row0 + g + 8, sb0 + sb, tq);
+            wv_load2<TYPE>(a0, a1, m, row0, sb0 + sb, g, tq);
             wv_sb<TYPE, T, X16>(a0, a1, 8 * sb, xs, xrow, bon, acc);
         }
     } else {
     typename W::Raw r0, r1, n0, n1;
-    if (PF) {
-        W::load(r0, m, row0 + g, sb0, tq);
-        W::load(r1, m, row0 + g + 8, sb0, tq);
+    if (PF || WV_MODE == 2) {
+        wv_load2<TYPE>(r0, r1, m, row0, sb0, g, tq);
+    }
+    if (WV_MODE == 4 || WV_MODE == 6) { // loads only, coalesced: lane -> 16-byte chunk c = lane + 32 i of the tile's step
+        const int CH = TYPE == T_IQ4X ? 17 : m.rb / (m.K / 256) / 16, bst = 16 * CH;
+        const int nst = TYPE == T_IQ4X ? (nsb + 1) / 2 : nsb, st0 = TYPE == T_IQ4X ? sb0 / 2 : sb0;
+        auto ld = [&](int s, int4 (&v)[9]) {
+#pragma unroll
+            for (int i = 0; i < 9; i++) {
+                const int c = lane + 32 * i, r = c / CH, pc = c - r * CH;
+                v[i] = make_int4(0, 0, 0, 0);
+                if (c < 16 * CH) v[i] = wld4(m.w + (size_t) (row0 + r) * m.rb + (size_t) (st0 + s) * bst + 16 * pc);
+            }
+        };
+        int x = 0;
+        int4 va[9], vb[9];
+        if (WV_MODE == 6) ld(0, va);
+#pragma unroll 1
+        for (int s = 0; s < nst; s++) {
+            if (WV_MODE == 4) ld(s, va);
+            else if (s + 1 < nst) ld(s + 1, vb);
+#pragma unroll
+            for (int i = 0; i < 9; i++) x ^= va[i].x ^ va[i].y ^ va[i].z ^ va[i].w;
+            if (WV_MODE == 6)
+#pragma unroll
+                for (int i = 0; i < 9; i++) va[i] = vb[i];
+        }
+        acc[0][0] += __int_as_float(x & 0x007fffff);
+        return;
+    }
+    if (WV_MODE == 8) { // loads only, coalesced 16-B chunks: WV_SPS super-blocks x WV_RH rows per step (Q4_K / Q5_K)
+        constexpr int SPS = WV_SPS, RH = WV_RH, NV = (RH * 11 * SPS + 31) / 32;
+        const int bps = m.rb / (m.K / 256), CH = bps / 16 * SPS;
+        int x = 0;
+#pragma unroll 1
+        for (int hf = 0; hf < 16 / RH; hf++)
+#pragma unroll 1
+            for (int st = 0; st < nsb / SPS; st++) {
+                int4 v[NV];
+#pragma unroll
+                for (int i = 0; i < NV; i++) {
+                    const int c = lane + 32 * i, r = c / CH, pc = c - r * CH;
+                    v[i] = make_int4(0, 0, 0, 0);
+#if WV_TILEMAJ // as if the matrix were stored tile-major: each (16-row tile, super-block) unit 16 x bps contiguous bytes
+                    if (c < RH * CH) v[i] = wld4(m.w + ((size_t) (row0 / 16) * (m.K / 256) + sb0 + SPS * st) * 16 * bps + (size_t) RH * hf * CH * 16 + 16 * c);
+#else
+                    if (c < RH * CH) v[i] = wld4(m.w + (size_t) (row0 + RH * hf + r) * m.rb + (size_t) (sb0 + SPS * st) * bps + 16 * pc);
+#endif
+                }
+#pragma unroll
+                for (int i = 0; i < NV; i++) x ^= v[i].x ^ v[i].y ^ v[i].z ^ v[i].w;
+            }
+        acc[0][0] += __int_as_float(x & 0x007fffff);
+        return;
+    }
+    if (WV_MODE == 3) { // loads only, the wv pattern, 2 units in flight
+        int x = 0;
+        wv_load2<TYPE>(r0, r1, m, row0, sb0, g, tq);
+#pragma unroll 1
+        for (int sb = 0; sb < nsb; sb++) {
+            if (sb + 1 < nsb) {
+                wv_load2<TYPE>(n0, n1, m, row0, sb0 + sb + 1, g, tq);
+            }
+            x ^= raw_xor(r0) ^ raw_xor(r1);
+            r0 = n0;
+            r1 = n1;
+        }
+        acc[0][0] += __int_as_float(x & 0x007fffff);
+        return;
+    }
+    if (WV_MODE) {
+        int x = 0;
+#pragma unroll 1
+        for (int sb = 0; sb < nsb; sb++) {
+            if (WV_MODE == 1) {
+                wv_load2<TYPE>(r0, r1, m, row0, sb0 + sb, g, tq);
+                x ^= raw_xor(r0) ^ raw_xor(r1);
+            } else {
+                raw_opaque(r0);
+                raw_opaque(r1);
+                wv_sb<TYPE, T, X16>(r0, r1, 8 * sb, xs, xrow, bon, acc);
+            }
+        }
+        acc[0][0] += __int_as_float(x & 0x007fffff);
+        return;
     }
 #if WV_L2PF
     // L2 prefetch of the main weight stream WV_L2PF super-blocks ahead: lane l -> row l & 15, 128-byte line l >> 4
@@ -549,12 +797,10 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
 #endif
         if (PF) {
             if (sb + 1 < nsb) {
-                W::load(n0, m, row0 + g, sb0 + sb + 1, tq);
-                W::load(n1, m, row0 + g + 8, sb0 + sb + 1, tq);
+                wv_load2<TYPE>(n0, n1, m, row0, sb0 + sb + 1, g, tq);
             }
         } else {
-            W::load(r0, m, row0 + g, sb0 + sb, tq);
-            W::load(r1, m, row0 + g + 8, sb0 + sb, tq);
+            wv_load2<TYPE>(r0, r1, m, row0, sb0 + sb, g, tq);
         }
         wv_sb<TYPE, T, X16>(r0, r1, 8 * sb, xs, xrow, bon, acc);
         if (PF) {
@@ -637,6 +883,7 @@ struct WvArgs {
     float * part; // [S][T][M] split-K partial sums
     unsigned * cnt; // [nlay][M / 16] arrival counters (count mod S)
     int M, K, S;
+    float * scr; // v2: [gridDim][NW][2][16][16] partial sums of tiles split between warps of a block
 };
 // Block b < S * G (G = gridDim / S) takes K chunk b / G and the tiles [ntile * bi / G, ntile * (bi + 1) / G) of its
 // group index bi; its warps take those tiles round-robin. S > 1: each chunk writes its partial sums, the last of the S
@@ -686,6 +933,402 @@ __global__ void __launch_bounds__(NT, 1) k_wv(WvArgs A) {
                     }
                 }
             }
+        gsync(epoch);
+    }
+}
+
+// ==================================================================================================================
+// wv v2 (wvgemm2): the same per-MMA arithmetic as k_wv, restructured per warp.
+//  - Activations interleaved per 64-group G (32-blocks j = 2G, 2G + 1): byte 64 G + 16 tq + 8 (j & 1) + i holds element
+//    32 j + 8 tq + i, so one LDS.128 gives the B fragments of the MMAs of both 32-blocks; ld = Kc + 64 (LDS.128 of two
+//    tokens per 8-lane phase hit disjoint banks).
+//  - Token scales: MIN 0 one float4 per (64-group, n, tq) {dx_a, dx_b of j = 2G, then of 2G + 1}; MIN 1 / 2 one float4
+//    per (32-block, n, tq) {dx_a, dx_b, e_a, e_b}, e = dx * qsum (MIN 1) or the accumulator input MAGIC - 32 qsum (MIN 2).
+//    -12582912 dx by FMUL (the product is exact, so fmaf(dx, C, -12582912 dx) is the same number as in k_wv).
+//  - Stream-K inside the block: the block's (tile, super-block) units are split evenly over its 16 warps (k_wv gave
+//    whole tiles to warps: ffn_gu 26.5 tiles per block = 1 or 2 per warp, dn_proj 12.5 = 0 or 1). A tile split between
+//    warps is summed after the block's last unit in warp order: fixed by M, K and the grid, so the same for every T.
+//  - Rolling register prefetch: unit u + 1's header / group words are loaded into the registers of unit u as soon as
+//    those are consumed, so one unit of compute covers the load latency without a second register buffer.
+// ==================================================================================================================
+struct WPtr {
+    const uint8_t * w; // the row's value block (or block pair) of this super-block
+    const uint8_t * d; // the row's meta of this super-block (Q6_K / Q3_K pair, IQ3_S block, Q8_0 scales)
+    int odd;           // super-block parity (block pairs)
+};
+template <int TYPE> struct WVL;
+template <> struct WVL<T_Q4K> {
+    using R = WV<T_Q4K>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) { return {m.w + (size_t) row * m.rb + sb * 144, nullptr, 0}; }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.h = wld4(p.w); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) { r.q[g] = wld2(p.w + 16 + 32 * g + 8 * tq); }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_Q5K> {
+    using R = WV<T_Q5K>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) { return {m.w + (size_t) row * m.rb + sb * 176, nullptr, 0}; }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.h = wld4(p.w); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) { r.q[g] = wld2(p.w + 48 + 32 * g + 8 * tq); }
+    static __device__ __forceinline__ void late(R & r, const WPtr & p, int tq) { r.qh = wld2(p.w + 16 + 8 * tq); }
+};
+template <> struct WVL<T_IQ4X> {
+    using R = WV<T_IQ4X>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) { return {m.w + (size_t) row * m.rb + (sb >> 1) * 272, nullptr, sb & 1}; }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.h = wld2(p.w + 8 * p.odd); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) { r.q[g] = wld2(p.w + 16 + 128 * p.odd + 32 * g + 8 * tq); }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_IQ4NL> {
+    using R = WV<T_IQ4NL>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) { return {m.w + (size_t) row * m.rb + sb * 144, nullptr, 0}; }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.h = wld4(p.w); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) { r.q[g] = wld2(p.w + 16 + 32 * g + 8 * tq); }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_Q8_0> {
+    using R = WV<T_Q8_0>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) {
+        return {m.w + (size_t) row * m.rb + sb * 256, reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd + 8 * sb), 0};
+    }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.d = wld4(p.d); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) {
+#pragma unroll
+        for (int k = 2 * g; k < 2 * g + 2; k++) r.q[k] = wld2(p.w + 32 * (2 * (k >> 1) + (tq >> 1)) + 16 * (k & 1) + 8 * (tq & 1));
+    }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_Q6K> {
+    using R = WV<T_Q6K>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) {
+        return {m.w + (size_t) row * m.rb + sb * Q6_BLK,
+                reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + (sb >> 1) * (2 * Q6_META), sb & 1};
+    }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) r.sc[k] = wld1(p.d + 16 * p.odd + 4 * k);
+        r.dd = (int) ((unsigned) wld1(p.d + 32) >> (16 * p.odd));
+    }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) {
+        r.q[g] = wld2(p.w + 32 * g + 8 * tq);
+        r.hb[g] = wld2(p.w + 128 + 8 * (2 * g + (tq >> 1)));
+    }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_Q3K> {
+    using R = WV<T_Q3K>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) {
+        return {m.w + (size_t) row * m.rb + sb * Q3_BLK,
+                reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + (sb >> 1) * (2 * Q6_META), sb & 1};
+    }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) {
+#pragma unroll
+        for (int k = 0; k < 4; k++) r.sc[k] = wld1(p.d + 16 * p.odd + 4 * k);
+        r.dd = (int) ((unsigned) wld1(p.d + 32) >> (16 * p.odd));
+    }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) {
+        const int u = 2 * g + (tq >> 1);
+        r.lo[g] = wld2(p.w + 8 * u);
+        r.hi[g] = wld1(p.w + 64 + 4 * u);
+    }
+    static __device__ __forceinline__ void late(R &, const WPtr &, int) {}
+};
+template <> struct WVL<T_IQ3S> {
+    using R = WV<T_IQ3S>::Raw;
+    static __device__ __forceinline__ WPtr ptr(const Mat & m, int row, int sb) {
+        return {m.w + (size_t) row * m.rb + sb * Q3_BLK, reinterpret_cast<const uint8_t *>(m.d + (size_t) row * m.nd) + sb * IQ3S_META, 0};
+    }
+    static __device__ __forceinline__ void hdr(R & r, const WPtr & p, int) { r.sd = wld2(p.d + 8); }
+    static __device__ __forceinline__ void grp(R & r, const WPtr & p, int tq, int g) {
+        const int u = 2 * g + (tq >> 1);
+        r.ix[g] = wld2(p.w + 8 * u);
+        r.sg[g] = wld1(p.w + 64 + 4 * u);
+    }
+    static __device__ __forceinline__ void late(R & r, const WPtr & p, int) { r.qh = wld2(p.d); }
+};
+template <int TYPE> __device__ __forceinline__ void wvl_load(typename WV<TYPE>::Raw & r, const WPtr & p, int tq) {
+    WVL<TYPE>::hdr(r, p, tq);
+#pragma unroll
+    for (int g = 0; g < 4; g++) WVL<TYPE>::grp(r, p, tq, g);
+    WVL<TYPE>::late(r, p, tq);
+}
+
+#ifndef WV2_ROLL
+#define WV2_ROLL 1 // 1: rolling prefetch (reload words as consumed), 0: whole next unit loaded at the top
+#endif
+struct XS2 {
+    const int8_t * xq; // [NTOKP][ld], interleaved per 64-group
+    int ld;
+    const float4 * sc; // token scales (see above)
+};
+
+// one super-block of the tile from the raw rows r0 (row g) / r1 (row g + 8); G0 = its first 64-group within the
+// shared-memory chunk. more: reload r0 / r1 from n0 / n1 (the warp's next unit) as their words are consumed.
+template <int TYPE, int T, bool X16>
+__device__ __forceinline__ void wv2_unit(typename WV<TYPE>::Raw & r0, typename WV<TYPE>::Raw & r1, const WPtr & n0, const WPtr & n1,
+                                         const Mat & m, int nrow0, int nsba, bool more, int G0, const XS2 & xs, const int8_t * xrow, bool bon,
+                                         float (&acc)[Cfg<TYPE, T, X16>::NG][4]) {
+    using W = WV<TYPE>;
+    using L = WVL<TYPE>;
+    using C = Cfg<TYPE, T, X16>;
+    constexpr bool PAIR = W::MIN == 0;
+    const int tq = threadIdx.x & 3, h = tq >> 1;
+    typename W::Raw x0, x1;
+    if (!WV2_ROLL && more) wv_load2<TYPE>(x0, x1, m, nrow0, nsba, (threadIdx.x & 31) >> 2, tq);
+    typename W::Sc s0, s1;
+    W::scales(r0, s0);
+    W::scales(r1, s1);
+    if (WV2_ROLL && more) {
+        L::hdr(r0, n0, tq);
+        L::hdr(r1, n1, tq);
+    }
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        int4 bq[C::NG];
+        float4 sp[C::NG];
+#pragma unroll
+        for (int part = 0; part < 2; part++) {
+            const int k = 2 * p + part;
+            int a[4];
+            W::frag(r0, k, tq, a[0], a[2]);
+            W::frag(r1, k, tq, a[1], a[3]);
+            float fA0, gA0, fA1, gA1;
+            W::wsc(s0, k, h, fA0, gA0);
+            W::wsc(s1, k, h, fA1, gA1);
+#pragma unroll
+            for (int n = 0; n < C::NG; n++) {
+                if (part == 0) {
+                    bq[n] = make_int4(0, 0, 0, 0);
+                    if (bon) bq[n] = *reinterpret_cast<const int4 *>(xrow + C::TPG * n * xs.ld + 64 * (G0 + p));
+                    if (PAIR) sp[n] = xs.sc[((G0 + p) * C::NG + n) * 4 + tq];
+                }
+                const float4 e4 = PAIR ? sp[n] : xs.sc[((2 * (G0 + p) + part) * C::NG + n) * 4 + tq];
+                const float dxa = PAIR ? (part ? e4.z : e4.x) : e4.x;
+                const float dxb = PAIR ? (part ? e4.w : e4.y) : e4.y;
+                int ci[4] = {MAGIC, MAGIC, MAGIC, MAGIC};
+                if (W::MIN == 2) {
+                    ci[0] = ci[2] = __float_as_int(e4.z);
+                    ci[1] = ci[3] = __float_as_int(e4.w);
+                }
+                int cc[4];
+                mma16832(cc, a, part ? bq[n].z : bq[n].x, part ? bq[n].w : bq[n].y, ci);
+                const float nma = -FMAGIC * dxa, nmb = -FMAGIC * dxb;
+                acc[n][0] = fmaf(fA0, fmaf(dxa, __int_as_float(cc[0]), nma), acc[n][0]);
+                acc[n][1] = fmaf(fA0, fmaf(dxb, __int_as_float(cc[1]), nmb), acc[n][1]);
+                acc[n][2] = fmaf(fA1, fmaf(dxa, __int_as_float(cc[2]), nma), acc[n][2]);
+                acc[n][3] = fmaf(fA1, fmaf(dxb, __int_as_float(cc[3]), nmb), acc[n][3]);
+                if (W::MIN == 1) {
+                    acc[n][0] = fmaf(-gA0, e4.z, acc[n][0]);
+                    acc[n][1] = fmaf(-gA0, e4.w, acc[n][1]);
+                    acc[n][2] = fmaf(-gA1, e4.z, acc[n][2]);
+                    acc[n][3] = fmaf(-gA1, e4.w, acc[n][3]);
+                }
+            }
+        }
+        if (WV2_ROLL && more) {
+            L::grp(r0, n0, tq, p);
+            L::grp(r1, n1, tq, p);
+        }
+    }
+    if (WV2_ROLL && more) {
+        L::late(r0, n0, tq);
+        L::late(r1, n1, tq);
+    }
+    if (!WV2_ROLL && more) {
+        r0 = x0;
+        r1 = x1;
+    }
+}
+
+// Fill the block's K chunk [k0, k0 + Kc) of T activation rows: values interleaved to xq, scales to sc.
+template <int TYPE, int T, bool X16>
+__device__ void wv2_fill(const QB & q, int k0, int Kc, uint8_t * sm, XS2 & xs) {
+    using C = Cfg<TYPE, T, X16>;
+    constexpr bool PAIR = WV<TYPE>::MIN == 0;
+    const int ld = Kc + 64, NJ = Kc / 32, G00 = k0 / 64;
+    int8_t * xq = reinterpret_cast<int8_t *>(sm);
+    float4 * sc = reinterpret_cast<float4 *>(sm + C::NTOKP * ld);
+    const int u0 = k0 / 32, nu = Kc / 32;
+    // unit u = (b, p, hh): A = elements 16 hh + [0, 16) of 32-block 8 b + 2 p, B the same of the next 32-block; its lane
+    // pieces tq = 2 hh, 2 hh + 1 of 64-group 4 b + p are [A 8 B | B 8 B] at 64 G + 16 tq
+    for (int i = threadIdx.x; i < T * nu; i += NT) {
+        const int t = i / nu, u = u0 + (i - t * nu);
+        const int b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
+        const int4 va = *reinterpret_cast<const int4 *>(q.xa + ((size_t) t * q.U + u) * 16);
+        const int4 vb = *reinterpret_cast<const int4 *>(q.xb + ((size_t) t * q.U + u) * 16);
+        int8_t * d = xq + t * ld + 64 * (4 * b + p - G00) + 32 * hh;
+        *reinterpret_cast<int4 *>(d) = make_int4(va.x, va.y, vb.x, vb.y);
+        *reinterpret_cast<int4 *>(d + 16) = make_int4(va.z, va.w, vb.z, vb.w);
+    }
+    const int NE = PAIR ? NJ / 2 : NJ;
+    for (int i = threadIdx.x; i < NE * C::NG * 4; i += NT) {
+        const int e = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int t, hh = -1;
+            if (C::SPLIT) {
+                t = 4 * n + ((2 * tq) & 3) + k;
+                hh = tq >> 1;
+            } else {
+                t = 8 * n + 2 * tq + k;
+            }
+#pragma unroll
+            for (int jj = 0; jj < (PAIR ? 2 : 1); jj++) {
+                const int jg = u0 + (PAIR ? 2 * e + jj : e), b = jg >> 3, p = (jg >> 1) & 3, part = jg & 1;
+                float dx = 0.f;
+                int qs = 0;
+                if (t < T) {
+                    const uint2 m0 = q.meta[(size_t) t * q.U + 8 * b + 2 * p + (hh < 0 ? 0 : hh)];
+                    const uint2 m1 = q.meta[(size_t) t * q.U + 8 * b + 2 * p + 1];
+                    dx = __half2float(reinterpret_cast<const __half *>(&m0.x)[part]);
+                    const int q0 = reinterpret_cast<const short *>(&m0.y)[part], q1 = reinterpret_cast<const short *>(&m1.y)[part];
+                    qs = hh < 0 ? q0 + q1 : q0;
+                }
+                if (PAIR) {
+                    v[2 * jj + k] = dx;
+                } else {
+                    v[k] = dx;
+                    v[2 + k] = WV<TYPE>::MIN == 2 ? __int_as_float(MAGIC - 32 * qs) : dx * (float) qs;
+                }
+            }
+        }
+        sc[i] = make_float4(v[0], v[1], v[2], v[3]);
+    }
+    __syncthreads();
+    xs.xq = xq;
+    xs.ld = ld;
+    xs.sc = sc;
+}
+template <int TYPE, int T, bool X16>
+constexpr int wv2_smem(int Kc) {
+    return Cfg<TYPE, T, X16>::NTOKP * (Kc + 64) + (WV<TYPE>::MIN == 0 ? Kc / 64 : Kc / 32) * Cfg<TYPE, T, X16>::NG * 4 * 16;
+}
+
+// S > 1: this warp has written chunk kc's sums of `tile` to A.part; the last of the S chunks to arrive adds them in
+// chunk order 0 .. S - 1
+template <int T>
+__device__ __forceinline__ void wv2_merge(const WvArgs & A, int L, int tile) {
+    const int lane = threadIdx.x & 31, S = A.S;
+    __threadfence();
+    __syncwarp();
+    unsigned old = 0;
+    if (lane == 0) old = atomicAdd(A.cnt + (size_t) L * (A.M / 16) + tile, 1u);
+    old = __shfl_sync(0xffffffffu, old, 0);
+    if (old % S == S - 1) {
+        __threadfence();
+        for (int i = lane; i < 16 * T; i += 32) {
+            const int t = i / 16, r = 16 * tile + (i & 15);
+            float s = 0.f;
+            for (int k = 0; k < S; k++) s += __ldcg(A.part + ((size_t) k * T + t) * A.M + r);
+            A.out[(size_t) t * A.M + r] = s;
+        }
+    }
+}
+
+template <int TYPE, int T, bool X16>
+__global__ void __launch_bounds__(NT, 1) k_wv2(WvArgs A) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    using W = WV<TYPE>;
+    using L = WVL<TYPE>;
+    using C = Cfg<TYPE, T, X16>;
+    const int S = A.S, G = gridDim.x / S, b = blockIdx.x;
+    const bool active = b < S * G;
+    const int kc = b / G, bi = b % G, NSB = A.K / 256;
+    const int sb0 = NSB * kc / S, nsb = NSB * (kc + 1) / S - sb0;
+    const int ntile = A.M / 16, t0 = ntile * bi / G, t1 = ntile * (bi + 1) / G;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3, h = tq >> 1;
+    const int nu = (t1 - t0) * nsb, ub = nu * warp / NW, ue = nu * (warp + 1) / NW;
+    float * scr = A.scr + (size_t) b * NW * 2 * 16 * T; // [NW][2][16][T]: slot 0 = a warp's first segment, 1 = its last
+    float * dst = S == 1 ? A.out : A.part + (size_t) kc * T * A.M;
+    unsigned epoch = 0;
+    for (int Ly = 0; Ly < A.nlay; Ly++) {
+        XS2 xs;
+        if (active) wv2_fill<TYPE, T, X16>(A.q, 256 * sb0, 256 * nsb, sm, xs);
+        const Mat m = A.mats[Ly];
+        if (active && ub < ue) {
+            const int8_t * xrow = xs.xq + (C::SPLIT ? (g & 3) : g) * xs.ld + 16 * tq;
+            const bool bon = !C::SPLIT || (g >> 2) == h;
+            int tile = ub / nsb, sb = ub - tile * nsb, seg0 = sb;
+            bool first = true;
+            typename W::Raw r0, r1;
+            if (WV2_ROLL) {
+                wvl_load<TYPE>(r0, L::ptr(m, 16 * (t0 + tile) + g, sb0 + sb), tq);
+                wvl_load<TYPE>(r1, L::ptr(m, 16 * (t0 + tile) + g + 8, sb0 + sb), tq);
+            } else {
+                wv_load2<TYPE>(r0, r1, m, 16 * (t0 + tile), sb0 + sb, g, tq);
+            }
+            float acc[C::NG][4];
+#pragma unroll
+            for (int n = 0; n < C::NG; n++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) acc[n][c] = 0.f;
+#pragma unroll 1
+            for (int u = ub; u < ue; u++) {
+                int ntl = tile, nsbi = sb + 1;
+                if (nsbi == nsb) {
+                    nsbi = 0;
+                    ntl++;
+                }
+                const bool more = u + 1 < ue;
+                const WPtr n0 = L::ptr(m, 16 * (t0 + ntl) + g, sb0 + nsbi), n1 = L::ptr(m, 16 * (t0 + ntl) + g + 8, sb0 + nsbi);
+                wv2_unit<TYPE, T, X16>(r0, r1, n0, n1, m, 16 * (t0 + ntl), sb0 + nsbi, more, 4 * sb, xs, xrow, bon, acc);
+                if (nsbi == 0 || !more) { // the warp's segment [seg0, sb] of `tile` ends here
+                    if (C::SPLIT) {
+#pragma unroll
+                        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+                            for (int c = 0; c < 4; c++) acc[n][c] += __shfl_xor_sync(0xffffffffu, acc[n][c], 2);
+                    }
+                    const bool full = seg0 == 0 && sb == nsb - 1;
+                    float * sp = scr + (size_t) (2 * warp + (first ? 0 : 1)) * 16 * T;
+                    if (!C::SPLIT || tq < 2) {
+#pragma unroll
+                        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+                            for (int c = 0; c < 4; c++) {
+                                const int t = C::SPLIT ? 4 * n + 2 * tq + (c & 1) : 8 * n + 2 * tq + (c & 1);
+                                const int r = g + 8 * (c >> 1);
+                                if (t < T) {
+                                    if (full) dst[(size_t) t * A.M + 16 * (t0 + tile) + r] = acc[n][c];
+                                    else sp[r * T + t] = acc[n][c];
+                                }
+                            }
+                    }
+                    if (full && S > 1) wv2_merge<T>(A, Ly, t0 + tile);
+#pragma unroll
+                    for (int n = 0; n < C::NG; n++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) acc[n][c] = 0.f;
+                    seg0 = 0;
+                    first = false;
+                }
+                tile = ntl;
+                sb = nsbi;
+            }
+        }
+        if (active) {
+            __syncthreads();
+            // a warp whose first unit is inside a tile that started in an earlier warp, and which ends that tile, adds the
+            // tile's pieces in warp order
+            const int tr = ub / nsb;
+            if (ub < ue && ub != tr * nsb && (tr + 1) * nsb <= ue) {
+                const int fu = tr * nsb;
+                int wf = warp - 1;
+                while (wf > 0 && nu * wf / NW > fu) wf--;
+                for (int i = lane; i < 16 * T; i += 32) {
+                    const int r = i / T, t = i - r * T;
+                    float s = 0.f;
+                    for (int w = wf; w <= warp; w++) {
+                        const int wb = nu * w / NW, we = nu * (w + 1) / NW;
+                        if (wb == we) continue;
+                        const int slot = (w == wf && wb != fu) ? 1 : 0;
+                        s += scr[((size_t) (2 * w + slot) * 16 + r) * T + t];
+                    }
+                    dst[(size_t) t * A.M + 16 * (t0 + tr) + r] = s;
+                }
+                if (S > 1) wv2_merge<T>(A, Ly, t0 + tr);
+            }
+        }
         gsync(epoch);
     }
 }
@@ -919,6 +1562,8 @@ template <class F> static float timeit(F f, int reps) {
 
 static int g_nsm = 82;
 static void * g_bar_ptr = nullptr;
+static float * g_park = nullptr; // k_dp4a_k2 [5120 / 2][2][8][32]
+static float * g_scr = nullptr; // k_wv2 split-tile partials [nsm][NW][2][16][16]
 template <class K> static void prep(K k) { CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024)); }
 template <class K, class Args> static void coop(K k, int smem, Args & a) {
     CK(cudaMemsetAsync(g_bar_ptr, 0, 4));
@@ -952,19 +1597,31 @@ static float run_dp4a(int IT, DpArgs & a, int reps) {
     };
     if (IT == 5) return go(k_dp4a<T, 5, TYPE>, 160);
     if (IT == 6) return go(k_dp4a<T, 6, TYPE>, 192);
+    if constexpr (T * 544 * 40 > 99 * 1024) return go(k_dp4a_k2<T, 17, TYPE>, 32 * 9); // two K slices (9 + 8 lane units)
+    else
     return go(k_dp4a<T, 17, TYPE>, 544);
 }
 template <int TYPE>
 static float dp4a_T(int T, int IT, DpArgs & a, int reps) {
     switch (T) {
         case 1: return run_dp4a<1, TYPE>(IT, a, reps);
+#ifndef WV_QUICK
         case 2: return run_dp4a<2, TYPE>(IT, a, reps);
         case 3: return run_dp4a<3, TYPE>(IT, a, reps);
         case 4: return run_dp4a<4, TYPE>(IT, a, reps);
         case 5: return run_dp4a<5, TYPE>(IT, a, reps);
+#ifndef WV_DPMAX5
+        case 6: return run_dp4a<6, TYPE>(IT, a, reps);
+        case 7: return run_dp4a<7, TYPE>(IT, a, reps);
+        case 8: return run_dp4a<8, TYPE>(IT, a, reps);
+#endif
+#endif
     }
     return -1.f;
 }
+#ifndef WV_V2
+#define WV_V2 0 // 1: time / check k_wv2 instead of k_wv
+#endif
 template <int TYPE, int T, int PF>
 static float run_wv(bool q16, WvArgs & a, int reps) {
     const int NSB = a.K / 256, Kc = 256 * ((NSB + a.S - 1) / a.S);
@@ -973,15 +1630,22 @@ static float run_wv(bool q16, WvArgs & a, int reps) {
         prep(kfun);
         return timeit([&] { coop(kfun, smem, a); }, reps);
     };
+#if WV_V2
+    if (q16) return go(k_wv2<TYPE, T, true>, wv2_smem<TYPE, T, true>(Kc));
+    return go(k_wv2<TYPE, T, false>, wv2_smem<TYPE, T, false>(Kc));
+#else
     if (q16) return go(k_wv<TYPE, T, true, PF>, wv_smem<TYPE, T, true>(Kc));
     return go(k_wv<TYPE, T, false, PF>, wv_smem<TYPE, T, false>(Kc));
+#endif
 }
 template <int TYPE, int PF>
 static float wv_T(int T, bool q16, WvArgs & a, int reps) {
 #ifdef WV_QUICK // experiment builds: T = 1, 4, 8 only
     switch (T) {
+#ifndef WV_T8ONLY
         case 1: return run_wv<TYPE, 1, PF>(q16, a, reps);
         case 4: return run_wv<TYPE, 4, PF>(q16, a, reps);
+#endif
         case 8: return run_wv<TYPE, 8, PF>(q16, a, reps);
     }
     return -1.f;
@@ -1026,7 +1690,9 @@ static float dp4a_any(int ty, int T, int IT, DpArgs & a, int reps) {
 #endif
 }
 static float wv_any(int ty, int T, bool q16, WvArgs & a, int reps) {
-#ifdef WV_QUICK
+#if defined(WV_DPONLY)
+    return -1.f;
+#elif defined(WV_QUICK)
     switch (ty) {
         case T_Q4K: return wv_T<T_Q4K, WV_PF>(T, q16, a, reps);
         case T_Q5K: return wv_T<T_Q5K, WV_PF>(T, q16, a, reps);
@@ -1055,11 +1721,66 @@ struct Dev {
     size_t bytes = 0;
     int nlay = 0;
 };
+// Host re-layout of a row-major engine matrix for WV_TILEMAJ (the load-time repack the wv kernel would need):
+// 1: tile-major units (16-row tile, block idx) of 16 whole blocks, value and meta streams alike;
+// 2: Q4_K / Q5_K / IQ4_XS fragment-ordered inside each unit (see wv_load2), the other types as 1.
+static void relayout(int ty, int M, int K, std::vector<uint8_t> & w, std::vector<uint16_t> & d, int mode) {
+    if (!mode) return;
+    const int rb = row_bytes(ty, K), nb = K / 256, ndb = 2 * row_meta_halves(ty, K);
+    std::vector<uint8_t> o(w.size());
+    auto tm = [&](const uint8_t * src, uint8_t * dst, int rowb, int BS) { // whole blocks of BS bytes, tile-major
+        const int nbk = rowb / BS;
+        for (int r = 0; r < M; r++)
+            for (int i = 0; i < nbk; i++)
+                memcpy(dst + (((size_t) (r >> 4) * nbk + i) * 16 + (r & 15)) * BS, src + (size_t) r * rowb + (size_t) i * BS, BS);
+    };
+    const bool fm = mode == 2 && (ty == T_Q4K || ty == T_Q5K || ty == T_IQ4X);
+    if (fm) {
+        const int BS = ty == T_Q4K ? 144 : ty == T_Q5K ? 176 : 136;
+        for (int r = 0; r < M; r++)
+            for (int sb = 0; sb < nb; sb++) {
+                uint8_t * u = o.data() + ((size_t) (r >> 4) * nb + sb) * 16 * BS;
+                const int g = r & 7, half = (r >> 3) & 1;
+                const uint8_t * row = w.data() + (size_t) r * rb;
+                for (int tq = 0; tq < 4; tq++) {
+                    const int l = 4 * g + tq;
+                    if (ty == T_IQ4X) {
+                        const uint8_t * pr = row + (sb >> 1) * 272;
+                        const int odd = sb & 1;
+                        memcpy(u + 16 * g + 8 * half, pr + 8 * odd, 8);
+                        for (int p = 0; p < 4; p++) memcpy(u + 128 + 512 * p + 16 * l + 8 * half, pr + 16 + 128 * odd + 32 * p + 8 * tq, 8);
+                    } else {
+                        const uint8_t * blk = row + (size_t) sb * BS;
+                        memcpy(u + 32 * g + 16 * half, blk, 16);
+                        const int qs = ty == T_Q4K ? 16 : 48, qo = ty == T_Q4K ? 256 : 768;
+                        if (ty == T_Q5K) memcpy(u + 256 + 16 * l + 8 * half, blk + 16 + 8 * tq, 8);
+                        for (int p = 0; p < 4; p++) memcpy(u + qo + 512 * p + 16 * l + 8 * half, blk + qs + 32 * p + 8 * tq, 8);
+                    }
+                }
+            }
+    } else {
+        const int BS = ty == T_Q4K || ty == T_IQ4NL ? 144 : ty == T_Q5K ? 176 : ty == T_IQ4X ? 272 : ty == T_Q6K ? Q6_BLK
+                     : ty == T_Q8_0 ? 256 : Q3_BLK;
+        tm(w.data(), o.data(), rb, BS);
+    }
+    w.swap(o);
+    if (ndb) {
+        const int MB = ty == T_Q6K || ty == T_Q3K ? 2 * Q6_META : 16;
+        std::vector<uint16_t> od(d.size());
+        tm(reinterpret_cast<const uint8_t *>(d.data()), reinterpret_cast<uint8_t *>(od.data()), ndb, MB);
+        d.swap(od);
+    }
+}
+static Dev upload_wd(int ty, int M, int K, int nlay, const std::vector<uint8_t> & w, const std::vector<uint16_t> & d);
 static Dev upload(int ty, int M, int K, int nlay, std::mt19937 & rng) {
-    Dev D;
     std::vector<uint8_t> w;
     std::vector<uint16_t> d;
     make_weights(ty, M, K, w, d, rng);
+    relayout(ty, M, K, w, d, WV_TILEMAJ); // timing: the bytes the wv kernel reads (dp4a reads them as row-major: same cost)
+    return upload_wd(ty, M, K, nlay, w, d);
+}
+static Dev upload_wd(int ty, int M, int K, int nlay, const std::vector<uint8_t> & w, const std::vector<uint16_t> & d) {
+    Dev D;
     const size_t mw = w.size(), md = d.size();
     D.nlay = nlay;
     CK(cudaMalloc(&D.w, mw * nlay));
@@ -1123,7 +1844,12 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
         const Role & R = ROLES[ri];
         Acts X = upload_acts(R.K, 16, R.q16, rng);
         for (int ty : types) {
-            Dev D = upload(ty, R.M, R.K, 1, rng);
+            std::vector<uint8_t> hw;
+            std::vector<uint16_t> hd16;
+            make_weights(ty, R.M, R.K, hw, hd16, rng);
+            Dev D = upload_wd(ty, R.M, R.K, 1, hw, hd16); // row-major: the fp64 reference and dp4a
+            relayout(ty, R.M, R.K, hw, hd16, WV_TILEMAJ);
+            Dev D2 = upload_wd(ty, R.M, R.K, 1, hw, hd16); // the wv kernel's layout
             float * out, * part;
             unsigned * cnt;
             double * ref;
@@ -1141,7 +1867,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             std::vector<std::vector<float>> res;
             for (int T : TS) {
                 CK(cudaMemset(out, 0xff, sizeof(float) * 16 * R.M));
-                WvArgs a{D.dmats, 1, X.q, out, part, cnt, R.M, R.K, R.S};
+                WvArgs a{D2.dmats, 1, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
                 const float ms = wv_any(ty, T, R.q16, a, 0);
                 CK(cudaDeviceSynchronize());
                 std::vector<float> h((size_t) 16 * R.M);
@@ -1164,7 +1890,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             const std::vector<float> & best = res[tref];
             const int Td = 4; // dp4a reference rows
             CK(cudaMemset(out, 0, sizeof(float) * 16 * R.M));
-            DpArgs da{D.dmats, 1, X.q, out, R.M};
+            DpArgs da{D.dmats, 1, X.q, out, R.M, g_park};
             dp4a_any(ty, Td, R.IT, da, 0);
             CK(cudaDeviceSynchronize());
             std::vector<float> hd((size_t) 16 * R.M);
@@ -1195,6 +1921,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             if (tinv_bad || sqrt(ew / n) / rms > 1e-4) bad++;
             cudaFree(out); cudaFree(part); cudaFree(cnt); cudaFree(ref); cudaFree(idot);
             release(D);
+            release(D2);
         }
         cudaFree(X.xa); cudaFree(X.xb); cudaFree(X.meta);
     }
@@ -1222,14 +1949,14 @@ static void timing(const std::vector<int> & roles, const std::vector<int> & type
             CK(cudaMemset(cnt, 0, 4 * (R.M / 16) * nlay));
             const double gb = (double) D.bytes * nlay / 1e9;
             printf("%-9s %-6s %5.1f MB/layer x %2d |", R.name, tname(ty), D.bytes / 1e6, nlay);
-            DpArgs da{D.dmats, nlay, X.q, out, R.M};
+            DpArgs da{D.dmats, nlay, X.q, out, R.M, g_park};
             for (int T : dpT) {
                 const float ms = dp4a_any(ty, T, R.IT, da, reps);
                 if (ms < 0) printf(" dp4a%d    -    ", T);
                 else printf(" dp4a%d %6.1fus %4.0f", T, 1e3 * ms / nlay, gb / ms * 1e3);
             }
             printf(" |");
-            WvArgs a{D.dmats, nlay, X.q, out, part, cnt, R.M, R.K, R.S};
+            WvArgs a{D.dmats, nlay, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
             for (int T : wvT) {
                 const float ms = wv_any(ty, T, R.q16, a, reps);
                 if (ms < 0) printf(" wv%d    -    ", T);
@@ -1269,11 +1996,20 @@ static std::vector<int> parse_list(const char * s, bool roles) {
 int main(int argc, char ** argv) {
     cudaDeviceGetAttribute(&g_nsm, cudaDevAttrMultiProcessorCount, 0);
     CK(cudaGetSymbolAddress(&g_bar_ptr, g_bar));
+    CK(cudaMalloc(&g_scr, sizeof(float) * g_nsm * NW * 2 * 16 * 16));
+    CK(cudaMalloc(&g_park, sizeof(float) * 5120 * 8 * 32));
     const std::string mode = argc > 1 ? argv[1] : "check";
     const std::vector<int> roles = parse_list(argc > 2 ? argv[2] : "all", true);
     const std::vector<int> types = parse_list(argc > 3 ? argv[3] : "all", false);
-    if (argc > 6) // split-K override for every role (timing experiments; T-invariance needs one S per role for all T)
-        for (auto & R : ROLES) R.S = atoi(argv[6]);
+    if (argc > 6) { // split-K override: one value for every role or a list in ROLES order; 0 keeps the role's default
+        const char * q = argv[6];
+        for (int i = 0; i < (int) (sizeof(ROLES) / sizeof(ROLES[0])); i++) {
+            const int v = atoi(q);
+            if (v > 0) ROLES[i].S = v;
+            const char * c = strchr(q, ',');
+            if (c) q = c + 1;
+        }
+    }
     if (mode == "check") return check(roles, types);
     const int reps = argc > 4 ? atoi(argv[4]) : 5;
     std::vector<int> wvT = {1, 2, 4, 8, 16}, dpT = {1, 2, 4, 5};
