@@ -5478,8 +5478,9 @@ struct MKEngine::Impl {
         if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
-            // pk_attn8 reads plain q8_0 K (any V format: a8_cv_v converts); low-bit or rotated K stays on pk_attn2
-            const bool s8 = attn_pv16 && hb.kvb[0][slot] == 8 && !hb.kvr[slot];
+            // pk_attn8 reads K in any MK_KV format (low-bit tiles are expanded to int8 in its staging) and any V format
+            // (a8_cv_v converts); rotated K stays on pk_attn2 (its Q is rotated in fp16)
+            const bool s8 = attn_pv16 && !hb.kvr[slot];
             if (s8 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else if (s8 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);

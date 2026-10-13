@@ -638,16 +638,18 @@ __device__ __forceinline__ float a8_i2f(int d) { return __int2float_rn(d); }
 
 // chunk k (of 3) of this thread's cp.async share of tile rows kb .. kb + np - 1 (K, V and V scales) into ring stage
 // st, rows >= np zeroed.  Chunk kinds are warp-uniform (i = tid + 384 k: K < 512 <= V < 1024 <= V scales < 1056).
-// vbits: the slot's V format (8, or 4..7: rows of HD vbits / 8 bytes = 2 vbits chunks, staged at the same row offsets)
-__device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int k, int vbits) {
+// kbits / vbits: the tile's K / V format (8, or 4..7: rows of HD bits / 8 bytes = 2 bits chunks, staged at the same row
+// offsets; a low-bit K tile is expanded to int8 in place before its S MMAs, kv_tile_expand)
+__device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int k, int kbits, int vbits) {
     const int i = threadIdx.x + A2_NT * k;
     if (i < 33 * A2_K) {
         int p, off;
         const void * src;
         if (i < 16 * A2_K) {
+            if ((i & 15) >= 2 * kbits) return; // beyond a low-bit row's bytes (overwritten by the expansion)
             p = i >> 4;
             off = p * A8_KLD + 16 * (i & 15);
-            src = Kq + (size_t) (kb + p) * HD + 16 * (i & 15);
+            src = Kq + (size_t) (kb + p) * (HD * kbits / 8) + 16 * (i & 15);
         } else if (i < 32 * A2_K) {
             const int j = i - 16 * A2_K;
             if ((j & 15) >= 2 * vbits) return; // beyond a low-bit row's bytes (never read)
@@ -663,9 +665,9 @@ __device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, cons
         else *reinterpret_cast<int4 *>(st + off) = make_int4(0, 0, 0, 0);
     }
 }
-__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int vbits) {
+__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int kbits, int vbits) {
 #pragma unroll
-    for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k, vbits);
+    for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k, kbits, vbits);
     pf::cpa_commit();
 }
 // K scales of tile rows kb ..: thread t < 256 loads position t >> 3, block t & 7; a8_st_ks stores it transposed as fp32
@@ -718,17 +720,23 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
     // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
     // cache kvp / kvs give exactly the old addresses
-    // Per tile (kv_src): the slot's main buffer (K plain q8; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with
-    // MK_KV_WIN, the q8 ring for tiles at positions >= wsr. vbt(it) = the V format of tile it.
+    // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
+    // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
+    // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.
     const int wsr = kv_ws(n0 + T);
+    auto kbt = [&](int it) { return kv_tbits(0, slot, it * A2_K, wsr); };
     auto vbt = [&](int it) { return kv_tbits(1, slot, it * A2_K, wsr); };
     auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
         const int8_t *tk, *tv;
         const __half *tks, *tvs;
-        kv_src(0, slot, g, it * A2_K, wsr, tk, tks);
+        const int kb_ = kv_src(0, slot, g, it * A2_K, wsr, tk, tks);
         const int vb = kv_src(1, slot, g, it * A2_K, wsr, tv, tvs);
-        a8_issue(st, tk, tv, tvs, 0, np, vb);
+        a8_issue(st, tk, tv, tvs, 0, np, kb_, vb);
         return a8_ld_ks(tks, 0, np);
+    };
+    auto expand_k = [&](int it, int r0, int rs) { // low-bit K rows r0, r0 + rs, .. of tile it (landed) -> int8 in place
+        const int kb_ = kbt(it);
+        if (kb_ != 8) kv_tile_expand(asm_ + (it % A8_NS) * A8_STG, kb_, min(A2_K, pmax + 1 - it * A2_K), r0, rs, A8_KLD);
     };
 
     // ring prologue: tiles it0 .. it0 + A8_NS - 2
@@ -806,9 +814,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             }
     }
 
-    if (it0 < it1) { // V(it0) -> fp16 (later tiles: V(it + 1) during tile it)
+    if (it0 < it1) { // K(it0) -> int8, V(it0) -> fp16 (later tiles: K(it + 1), V(it + 1) during tile it)
         pf::cpa_wait<A8_NS - 2>();
         __syncthreads();
+        expand_k(it0, warp, A2_NT / 32);
 #pragma unroll
         for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbt(it0));
     }
@@ -853,6 +862,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         for (int ni = 0; ni < 2; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
 #pragma unroll
         for (int b = 0; b < 8; b++) {
+            // K(it + 1) -> int8, one row per warp at b = 0, 2, 4 (its stage landed before this tile's barrier and is first
+            // read by tile it + 1's S MMAs)
+            if ((b == 0 || b == 2 || b == 4) && cvn) expand_k(it + 1, warp + (A2_NT / 32) * (b >> 1), 3 * (A2_NT / 32));
             unsigned kf[4];
             pf::ldsm_x4(kf, ka + 32 * b);
             int d0[4], d1[4];
