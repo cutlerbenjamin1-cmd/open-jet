@@ -240,6 +240,7 @@ struct Bufs {
     int ctx;
 #if MK_KV_EMU
     int kvemu[2][N_ATT_SLOTS]; // per slot, K / V: 0 plain q8, else the kv_store_emu mode (MK_KV_EMU_SPEC)
+    int kvemu_sink;            // positions < kvemu_sink stay plain q8 (attention sinks; MK_KV_EMU_SPEC "sink=N")
 #endif
     int dattn; // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
 };
@@ -1634,47 +1635,100 @@ __device__ __forceinline__ void kv_store(int w, int slot, size_t row, const floa
 
 #if MK_KV_EMU
 
-// A K / V row rounded to a lower-bit grid with one fp16 scale per 32 values (the format a real low-bit cache would
-// store), written in the q8 layout. mode: bits (2..8) | 16: Hadamard-rotated first (the dequantized row is rotated
-// back and stored as ordinary q8, which adds q8 rounding) | 32: q4_0-style scale d = (signed max) / -2^(b-1) with
-// 2^b levels (else symmetric: d = max |x| / (2^(b-1) - 1)).
-__device__ __forceinline__ void kv_store_emu(int8_t * q, __half * sc, const float (&vin)[8], int mode) {
+// Lloyd-Max (MSE-optimal) codebooks for N(0,1), positive half (symmetric), 2..6 bits: notes/kvq/lloyd_max.py.
+// MSE / variance: 0.1175 (2 bits), 0.03455 (3), 0.009501 (4), 0.002505 (5), 0.000644 (6).
+__constant__ float LM_LEVELS[62] = {
+    0.4527800f, 1.5104176f,                                                                                     // 2 bits
+    0.2450942f, 0.7560053f, 1.3439093f, 2.1519457f,                                                             // 3
+    0.1283950f, 0.3880483f, 0.6567591f, 0.9423405f, 1.2562312f, 1.6180464f, 2.0690172f, 2.7325896f,             // 4
+    0.0658897f, 0.1980518f, 0.3313783f, 0.4666995f, 0.6049336f, 0.7471357f, 0.8945651f, 1.0487833f,             // 5
+    1.2118044f, 1.3863403f, 1.5762281f, 1.7872332f, 2.0287284f, 2.3177394f, 2.6911196f, 3.2607325f,
+    0.0335182f, 0.1006038f, 0.1678377f, 0.2353205f, 0.3031553f, 0.3714493f, 0.4403149f, 0.5098710f,             // 6
+    0.5802446f, 0.6515730f, 0.7240059f, 0.7977081f, 0.8728625f, 0.9496748f, 1.0283779f, 1.1092386f,
+    1.1925660f, 1.2787219f, 1.3681356f, 1.4613233f, 1.5589154f, 1.6616948f, 1.7706536f, 1.8870784f,
+    2.0126849f, 2.1498391f, 2.3019465f, 2.4741863f, 2.6750484f, 2.9200457f, 3.2428991f, 3.7463072f,
+};
+__constant__ int LM_OFF[5] = {0, 2, 6, 14, 30}; // bits 2..6
+// fixed random signs for mode 's' (randomised Hadamard): bit 8 lane + k flips value k of the lane
+__constant__ unsigned EMU_SIGNS[8] = {0x6818f096u, 0x0205cd15u, 0xca000ab0u, 0x0ce98e8du, 0x005d3defu, 0xf897127cu, 0x0b0b0cf8u, 0x8fd7fa69u};
+
+// A K / V row rounded to what a low-bit cache format would reconstruct, written in the q8 layout (accuracy experiments,
+// MK_KV_EMU_SPEC). mode: bits (2..8) | 16 Hadamard rotation (WHT) first | 32 q4_0-style scale d = (signed max) / -2^(b-1)
+// (else symmetric d = max |x| / (2^(b-1) - 1)) | 64 Lloyd-Max codebook for the (near-Gaussian, rotated) coordinates with
+// scale = rms of the group | 128 scale group = the whole 256-value row (else 32 values) | 256 random signs before the
+// WHT (randomised Hadamard; undone after the inverse). The scale is fp16. A plain integer grid without rotation is
+// stored exactly (integers + scale, as a real kernel would: "4a" is bit-identical to kv_store_q4); everything else is
+// dequantised, transformed back and stored as ordinary q8 (adds q8 rounding). Positions < cB.kvemu_sink stay plain q8.
+__device__ __noinline__ void kv_store_emu(int8_t * q, __half * sc, const float (&vin)[8], int mode, int pos) {
     const int lane = threadIdx.x & 31, bits = mode & 15;
-    const bool rot = mode & 16, q40 = mode & 32;
+    const bool rot = mode & (16 | 256), q40 = mode & 32, lm = mode & 64, rowg = mode & 128, sgn = mode & 256;
+    if (pos < cB.kvemu_sink) {
+        kv_store_q8(q, sc, vin);
+        return;
+    }
     float v[8];
 #pragma unroll
     for (int k = 0; k < 8; k++) v[k] = vin[k];
+    if (sgn) {
+#pragma unroll
+        for (int k = 0; k < 8; k++)
+            if ((EMU_SIGNS[lane >> 2] >> ((lane & 3) * 8 + k)) & 1u) v[k] = -v[k];
+    }
     if (rot) fwht256(v);
-    float am = 0.f, sv = 0.f; // largest |x| of the 32-value block and that x (ties: the larger x, same in all 4 lanes)
+    // group statistics: largest |x| and that x (ties: the larger x, the same in every lane of the group), sum of squares
+    float am = 0.f, sv = 0.f, ss = 0.f;
 #pragma unroll
-    for (int k = 0; k < 8; k++)
+    for (int k = 0; k < 8; k++) {
+        ss += v[k] * v[k];
         if (fabsf(v[k]) > am || (fabsf(v[k]) == am && v[k] > sv)) { am = fabsf(v[k]); sv = v[k]; }
-#pragma unroll
-    for (int m = 1; m <= 2; m <<= 1) {
+    }
+    const int gm = rowg ? 16 : 2;
+    for (int m = 1; m <= gm; m <<= 1) {
         const float oa = __shfl_xor_sync(0xffffffffu, am, m), os = __shfl_xor_sync(0xffffffffu, sv, m);
         if (oa > am || (oa == am && os > sv)) { am = oa; sv = os; }
+        ss += __shfl_xor_sync(0xffffffffu, ss, m);
     }
     const int h = 1 << (bits - 1);
-    const float d = q40 ? sv / (float) -h : am / (float) (h - 1);
-    const float id = d != 0.f ? 1.0f / d : 0.f;
+    const float d = lm ? sqrtf(ss / (rowg ? 256.f : 32.f)) : q40 ? sv / (float) -h : am / (float) (h - 1);
     const __half dh = __float2half_rn(d);
-    int qi[8];
-#pragma unroll
-    for (int k = 0; k < 8; k++)
-        qi[k] = q40 ? min(2 * h - 1, (int) (v[k] * id + ((float) h + 0.5f))) - h : max(1 - h, min(h - 1, __float2int_rn(v[k] * id)));
-    if (!rot) {
-        unsigned w[2] = {0u, 0u};
-#pragma unroll
-        for (int k = 0; k < 8; k++) w[k >> 2] |= ((unsigned) qi[k] & 0xffu) << (8 * (k & 3));
-        *reinterpret_cast<uint2 *>(q + lane * 8) = make_uint2(w[0], w[1]);
-        if ((lane & 3) == 0) sc[lane >> 2] = dh;
-        return;
-    }
     const float df = __half2float(dh);
+    float r[8]; // the reconstruction
+    if (lm) {
+        const float * lv = LM_LEVELS + LM_OFF[bits - 2];
+        const float id = df > 0.f ? 1.0f / df : 0.f;
 #pragma unroll
-    for (int k = 0; k < 8; k++) v[k] = df * (float) qi[k];
-    fwht256(v);
-    kv_store_q8(q, sc, v);
+        for (int k = 0; k < 8; k++) {
+            const float a = fabsf(v[k]) * id;
+            int i = 0; // nearest level: thresholds are the midpoints
+            for (int j = 1; j < h; j++) i = a >= 0.5f * (lv[j - 1] + lv[j]) ? j : i;
+            r[k] = copysignf(df * lv[i], v[k]);
+        }
+    } else {
+        const float id = d != 0.f ? 1.0f / d : 0.f;
+        int qi[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            qi[k] = q40 ? min(2 * h - 1, (int) (v[k] * id + ((float) h + 0.5f))) - h : max(1 - h, min(h - 1, __float2int_rn(v[k] * id)));
+            r[k] = df * (float) qi[k];
+        }
+        if (!rot && !rowg) { // exact store of the integers and the fp16 scale
+            unsigned w[2] = {0u, 0u};
+#pragma unroll
+            for (int k = 0; k < 8; k++) w[k >> 2] |= ((unsigned) qi[k] & 0xffu) << (8 * (k & 3));
+            *reinterpret_cast<uint2 *>(q + lane * 8) = make_uint2(w[0], w[1]);
+            if ((lane & 3) == 0) sc[lane >> 2] = dh;
+            return;
+        }
+    }
+    if (rot) {
+        fwht256(r);
+        if (sgn) {
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+                if ((EMU_SIGNS[lane >> 2] >> ((lane & 3) * 8 + k)) & 1u) r[k] = -r[k];
+        }
+    }
+    kv_store_q8(q, sc, r);
 }
 #endif
 
@@ -1941,14 +1995,14 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             rope8(v, lane, pp);
             const size_t row = slot0 + (size_t) g * ctx + pp, srow = (size_t) g * ctx + pp;
 #if MK_KV_EMU
-            if (Q8 && cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot]);
+            if (Q8 && cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot], pp);
             else
 #endif
             if constexpr (Q8) kv_store(0, slot, srow, v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
 #if MK_KV_EMU
-            if (Q8 && cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot]);
+            if (Q8 && cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot], pp);
             else
 #endif
             if constexpr (Q8) kv_store(1, slot, srow, v);
@@ -2250,13 +2304,13 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             const size_t row = slot0 + (size_t) g * ctx + pp, srow = (size_t) g * ctx + pp;
             (void) row;
 #if MK_KV_EMU
-            if (cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot]);
+            if (cB.kvemu[0][slot]) kv_store_emu(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v, cB.kvemu[0][slot], pp);
             else
 #endif
             kv_store(0, slot, srow, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
 #if MK_KV_EMU
-            if (cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot]);
+            if (cB.kvemu[1][slot]) kv_store_emu(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v, cB.kvemu[1][slot], pp);
             else
 #endif
             kv_store(1, slot, srow, v);
@@ -4736,53 +4790,7 @@ struct MKEngine::Impl {
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
         mem_mark("logits, sampling, ctl");
-        if (const char * spec = getenv("MK_KV_EMU_SPEC")) {
-#if MK_KV_EMU
-            // comma-separated <which><slot>=<bits>[r][a]: which K, V or * (both); slot 0..15 (attention layer 4 slot + 3),
-            // 16 (MTP) or * / empty (all); r: Hadamard rotation, a: q4_0-style scale (kv_store_emu)
-            const std::string s = spec;
-            size_t i = 0;
-            while (i < s.size()) {
-                size_t j = s.find(',', i);
-                if (j == std::string::npos) j = s.size();
-                const std::string tok = s.substr(i, j - i);
-                i = j + 1;
-                if (tok.empty()) continue;
-                const size_t e = tok.find('=');
-                if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV_EMU_SPEC: bad item " + tok);
-                const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
-                int bits = 0, mode = 0;
-                size_t k = 0;
-                while (k < md.size() && isdigit((unsigned char) md[k])) bits = 10 * bits + (md[k++] - '0');
-                for (; k < md.size(); k++) {
-                    if (md[k] == 'r') mode |= 16;
-                    else if (md[k] == 'a') mode |= 32;
-                    else throw std::runtime_error("MK_KV_EMU_SPEC: bad mode " + md);
-                }
-                if (bits < 2 || bits > 8) throw std::runtime_error("MK_KV_EMU_SPEC: bits must be 2..8 in " + tok);
-                mode |= bits;
-                const bool all = sl.empty() || sl == "*";
-                const int slot = all ? -1 : std::stoi(sl);
-                if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV_EMU_SPEC: bad slot in " + tok);
-                for (int w = 0; w < 2; w++)
-                    if (tok[0] == '*' || tok[0] == "KV"[w])
-                        for (int q = 0; q < N_ATT_SLOTS; q++)
-                            if (all || q == slot) hb.kvemu[w][q] = mode == 8 ? 0 : mode;
-            }
-            fprintf(stderr, "[mk] MK_KV_EMU_SPEC %s: K", spec);
-            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[0][q]);
-            fprintf(stderr, " | V");
-            for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[1][q]);
-            fprintf(stderr, "\n");
-            if (!hb.kvq8) throw std::runtime_error("MK_KV_EMU_SPEC needs the q8 KV cache (--kv q8)");
-            for (int w = 0; w < 2; w++)
-                for (int s = 0; s < N_ATT_SLOTS; s++)
-                    if (hb.kvb[w][s] != 8 || hb.kvr[s]) throw std::runtime_error("MK_KV_EMU_SPEC needs an all-q8 cache (no MK_KV)");
-#else
-            (void) spec;
-            throw std::runtime_error("MK_KV_EMU_SPEC needs a build with -DMK_KV_EMU=1");
-#endif
-        }
+        if (const char * spec = getenv("MK_KV_EMU_SPEC")) kv_emu_parse(spec);
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
@@ -5458,6 +5466,72 @@ struct MKEngine::Impl {
     // prefill once a penalised launch has counted into them
     float pen_pres = 0.f, pen_freq = 0.f;
     bool pcnt_dirty = false;
+    // MK_KV_EMU_SPEC / set_kv_emu (MK_KV_EMU builds): comma-separated <K|V|*><slot>=<bits>[flags] and sink=N. slot
+    // 0..15 (attention layer 4 slot + 3), 16 (MTP) or * / empty (all). Flags (kv_store_emu): r Hadamard rotation,
+    // s random signs + rotation, a q4_0-style scale, l Lloyd-Max codebook with rms scale (bits 2..6), n one scale per
+    // 256-value row (else per 32). "8" without flags = plain q8. sink=N: positions < N stay q8.
+    void kv_emu_parse(const std::string & s) {
+#if MK_KV_EMU
+        for (int w = 0; w < 2; w++)
+            for (int q = 0; q < N_ATT_SLOTS; q++) hb.kvemu[w][q] = 0;
+        hb.kvemu_sink = 0;
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos) j = s.size();
+            const std::string tok = s.substr(i, j - i);
+            i = j + 1;
+            if (tok.empty()) continue;
+            if (tok.compare(0, 5, "sink=") == 0) {
+                hb.kvemu_sink = std::stoi(tok.substr(5));
+                continue;
+            }
+            const size_t e = tok.find('=');
+            if (e == std::string::npos || e == 0 || !strchr("KV*", tok[0])) throw std::runtime_error("MK_KV_EMU_SPEC: bad item " + tok);
+            const std::string sl = tok.substr(1, e - 1), md = tok.substr(e + 1);
+            int bits = 0, mode = 0;
+            size_t k = 0;
+            while (k < md.size() && isdigit((unsigned char) md[k])) bits = 10 * bits + (md[k++] - '0');
+            for (; k < md.size(); k++) {
+                if (md[k] == 'r') mode |= 16;
+                else if (md[k] == 'a') mode |= 32;
+                else if (md[k] == 'l') mode |= 64;
+                else if (md[k] == 'n') mode |= 128;
+                else if (md[k] == 's') mode |= 256 | 16;
+                else throw std::runtime_error("MK_KV_EMU_SPEC: bad mode " + md);
+            }
+            if (bits < 2 || bits > 8) throw std::runtime_error("MK_KV_EMU_SPEC: bits must be 2..8 in " + tok);
+            if ((mode & 64) && (bits > 6 || (mode & 32))) throw std::runtime_error("MK_KV_EMU_SPEC: l needs 2..6 bits and no a: " + tok);
+            mode |= bits;
+            const bool all = sl.empty() || sl == "*";
+            const int slot = all ? -1 : std::stoi(sl);
+            if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV_EMU_SPEC: bad slot in " + tok);
+            for (int w = 0; w < 2; w++)
+                if (tok[0] == '*' || tok[0] == "KV"[w])
+                    for (int q = 0; q < N_ATT_SLOTS; q++)
+                        if (all || q == slot) hb.kvemu[w][q] = mode == 8 ? 0 : mode;
+        }
+        fprintf(stderr, "[mk] MK_KV_EMU_SPEC %s: K", s.c_str());
+        for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[0][q]);
+        fprintf(stderr, " | V");
+        for (int q = 0; q < N_ATT_SLOTS; q++) fprintf(stderr, " %d", hb.kvemu[1][q]);
+        fprintf(stderr, " | sink %d\n", hb.kvemu_sink);
+        if (!hb.kvq8) throw std::runtime_error("MK_KV_EMU_SPEC needs the q8 KV cache (--kv q8)");
+        for (int w = 0; w < 2; w++)
+            for (int q = 0; q < N_ATT_SLOTS; q++)
+                if (hb.kvb[w][q] != 8 || hb.kvr[q]) throw std::runtime_error("MK_KV_EMU_SPEC needs an all-q8 cache (no MK_KV)");
+#else
+        (void) s;
+        throw std::runtime_error("MK_KV_EMU_SPEC needs a build with -DMK_KV_EMU=1");
+#endif
+    }
+    void set_kv_emu(const std::string & spec) { // between sequences (no kernel in flight): new spec, cB re-uploaded
+        kv_emu_parse(spec);
+#if MK_KV_EMU
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+#endif
+    }
     void set_penalty(float pres, float freq) {
         if (!std::isfinite(pres) || !std::isfinite(freq)) throw std::runtime_error("penalties must be finite");
         if ((pres != 0.f || freq != 0.f) && !hb.pcnt) {
@@ -5538,6 +5612,8 @@ MKEngine::~MKEngine() { delete p_; }
 void MKEngine::bench_phases() { p_->bench(); }
 
 void MKEngine::set_penalty(float presence, float frequency) { p_->set_penalty(presence, frequency); }
+
+void MKEngine::set_kv_emu(const std::string & spec) { p_->set_kv_emu(spec); }
 
 void MKEngine::reset() {
     p_->pcnt_clear();
