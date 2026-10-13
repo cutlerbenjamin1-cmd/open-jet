@@ -260,8 +260,9 @@ struct Bufs {
     int kvrv[N_ATT_SLOTS]; // V stored Hadamard-rotated (MK_KV "6r" on V): the head's attention output is rotated back
     // MK_KV_WIN=W (recent-window ring): a side (w, slot) whose main buffer is low-bit also keeps its most recent rows as
     // q8 in a ring of kvrc rows per kv head: kvrp [kv head][kvrc][HD] values, kvrs [kv head][kvrc][HD / 32] scales
-    // (nullptr: no ring). A tile at position p is read from the ring when p >= kv_ws(L_ctx); kvrc = (Wb + 1) ATT_BUCKET
-    // with Wb = ceil(W / ATT_BUCKET), so the ring always holds every position the window can name.
+    // (nullptr: no ring). A tile at position p is read from the ring when p >= kv_ws(L_ctx); kvrc = (Wb + 1) ATT_BUCKET + ATP
+    // with Wb = ceil(W / ATT_BUCKET), so the ring always holds every position the window can name (+ ATP: draft rows
+    // written past the partition boundary do not overwrite the window's oldest rows).
     int8_t * kvrp[2][N_ATT_SLOTS];
     __half * kvrs[2][N_ATT_SLOTS];
     int kvwin, kvrc;
@@ -2644,9 +2645,10 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
 // low-bit tiles staged in their packed layout and expanded to int8 once in shared memory (kv_row_expand: q = n - 2^(bits-1)
 // with the scale unchanged, by warps 4 - 15 one interval before the tile is read; the K pipeline is one stage deeper for
 // it), so the MMA path is the q8 one for every tile and the partials equal attn_core_t's for every MK_KV format.
-// T >= 6 (MK_MAXT > 5; all-q8 slots, MIX = false): 6 T > 32 query rows do not fit shared memory, so the items run twice,
-// over query heads 0-2 and 3-5 of each kv head (HG = 3, partial rows ho T ..); the second pass re-reads K / V and skips the
-// K / V store (the first pass of the same item, in the same block, wrote those rows). Per-row arithmetic is unchanged.
+// T >= 6 (MK_MAXT > 5; both forms): 6 T > 32 query rows do not fit shared memory, so the items run twice, over query
+// heads 0-2 and 3-5 of each kv head (HG = 3, partial rows ho T ..); the second pass re-reads K / V (MIX: and re-expands
+// the low-bit tiles) and skips the K / V store (the first pass of the same item, in the same block, wrote those rows, the
+// MK_KV_WIN ring's q8 copies included). Per-row arithmetic is unchanged.
 template <int T, bool MIX = false>
 __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
@@ -3049,7 +3051,11 @@ __device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
 // one-tile chunks (the pipeline fill does not pay there) and with MK_DATTN=0. Every choice gives the same partials.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
-    if constexpr (T > 5) { // MK_MAXT > 5: all-q8 slots only (checked by the host), the pipelined kernel at every context
+    if constexpr (T > 5) { // MK_MAXT > 5 (q8 cache, checked by the host): the pipelined kernel at every context, two head-group
+#if MK_DA_Q4               // passes; slots with a low-bit MK_KV side run its MIX form (attn_core_q8m: the same partials per row)
+        if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
+        else
+#endif
         attn_core_q8<T>(W, slot, n);
         return;
     } else
@@ -5456,7 +5462,12 @@ struct MKEngine::Impl {
             size_t ring_bytes = 0;
             if (want_kv && getenv("MK_KV_WIN") && atoi(getenv("MK_KV_WIN")) > 0) {
                 hb.kvwin = atoi(getenv("MK_KV_WIN"));
-                hb.kvrc = ((hb.kvwin + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET;
+                // + ATP slack rows: rows written past the attention partition of the launch that reads the window (the MTP
+                // block's draft rows and catch-up row, up to n_draft past it, the wide pass at -d 7 included) then land in the
+                // ring slots of positions before the window, not of its oldest rows (multiple of ATP: a tile never wraps)
+                const int kvwr = ((hb.kvwin + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET; // the most rows a window spans
+                static_assert(MAXT + MAXT <= ATP, "ring slack");
+                hb.kvrc = kvwr + ATP;
                 // MK_KV_WIN_ALL=1 (test knob): rings for the q8 sides too. Their ring rows are the same q8 rows as the main
                 // buffer (and k_ring_refill re-stores a q8 row exactly), so output must stay byte-identical to no window:
                 // exercises the ring write / read / refill paths with an exact expectation.
@@ -5471,7 +5482,7 @@ struct MKEngine::Impl {
                             nr++;
                         }
                 fprintf(stderr, "[mk] KV recent window: the last %d..%d positions of %d low-bit sides stay q8 (MK_KV_WIN=%d; rings of %d rows per head, %.1f MiB)\n",
-                        hb.kvrc - ATT_BUCKET + 1, hb.kvrc, nr, hb.kvwin, hb.kvrc, ring_bytes / 1048576.0);
+                        kvwr - ATT_BUCKET + 1, kvwr, nr, hb.kvwin, hb.kvrc, ring_bytes / 1048576.0);
             }
             const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2 + ring_bytes) / 1e9 : rows * HD * 4.0 / 1e9;
             fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
@@ -6385,13 +6396,17 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
 #if MK_MAXT > 5
-    if (n_draft > 4) { // the wide pass (T >= 6) runs the all-q8 decode attention only (attn_core<T > 5>)
+    if (n_draft > 4) { // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_q8,
+                       // or attn_core_q8m for the low-bit MK_KV sides)
         bool q8 = p_->hb.kvq8;
+#if !MK_DA_Q4
         for (int s = 0; s < N_ATT_SLOTS; s++) q8 = q8 && p_->hb.kvb[0][s] == 8 && p_->hb.kvb[1][s] == 8;
+#endif
         if (!q8) {
             delete p_;
             p_ = nullptr;
-            throw std::runtime_error("n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV)");
+            throw std::runtime_error(MK_DA_Q4 ? "n_draft > 4 needs the q8 KV cache (--kv q8)"
+                                              : "n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV; MK_DA_Q4=0 build)");
         }
     }
 #endif
