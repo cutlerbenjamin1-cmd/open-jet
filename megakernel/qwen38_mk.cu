@@ -63,10 +63,10 @@
 #ifndef MK_WV
 #define MK_WV 0
 #endif
-// MK_WV_FMK=1: Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS (the first M1 layout); default 0: tile-major whole
-// blocks (prefill GEMMs read whole 16-B chunks: the FM order cost the prefill ~4%; notes/agent_wvplumb.md "wvplumb2")
+// MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
+// prefill reads whole 16-B chunks, but decode loses: -d 0 -5.8%, -d 4 +-0 vs dp4a instead of +3% / +7%; notes/agent_wvplumb.md)
 #ifndef MK_WV_FMK
-#define MK_WV_FMK 0
+#define MK_WV_FMK 1
 #endif
 // MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
 // ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),

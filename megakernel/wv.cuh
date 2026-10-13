@@ -37,8 +37,8 @@ __device__ __forceinline__ float mag23(unsigned w, int k) { return __int_as_floa
 // the weight types the wv path serves (the others stay on dp4a at every T: per tensor T-invariant)
 __host__ __device__ constexpr bool wv_type(int t) { return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0; }
 // fragment-ordered (FM) types; the other wv types are tile-major whole blocks
-// (MK_WV_FMK=0: Q4_K / Q5_K tile-major whole blocks instead: about the same decode speed, and their prefill GEMMs read
-// whole 16-B chunks; the FM order cost the prefill ~4%, notes/agent_wvplumb.md "wvplumb2")
+// (MK_WV_FMK=0: Q4_K / Q5_K tile-major whole blocks instead: their prefill GEMMs read whole 16-B chunks, but the
+// decode GEMMs lose most of the wv gain (8-B loads at stride 32); notes/agent_wvplumb.md "wvplumb3")
 __host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || (MK_WV_FMK && (t == T_Q4K || t == T_Q5K)); }
 // per-16 weight scales (MK_MAXT > 5 ffn_down types): split MMAs only
 __host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
