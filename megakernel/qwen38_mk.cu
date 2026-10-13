@@ -5562,8 +5562,10 @@ struct MKEngine::Impl {
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
             // pk_attn8 reads K in any MK_KV format (low-bit tiles are expanded to int8 in its staging) and any V format
-            // (a8_cv_v converts); rotated K stays on pk_attn2 (its Q is rotated in fp16)
-            const bool s8 = attn_pv16 && !hb.kvr[slot];
+            // (a8_cv_v converts). Rotated K too: pk_attn_prep rotates Q (fp32 fwht256) before its fp16 store to qh, so the
+            // int8 Q fragments are rotated as well; pk_attn_out un-rotates a rotated V's output for every kernel. MK_ATTN_S8=0
+            // keeps pk_attn2 (fp16 Q) for comparison.
+            const bool s8 = attn_pv16;
             const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
             if (s8 && attn_s8 == 1) {
                 if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
