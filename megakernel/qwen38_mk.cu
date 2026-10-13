@@ -223,6 +223,7 @@ struct Bufs {
     float2 * dq;       // sampled drafts: per draft [MAXT][TOPK_MAX] its proposal q' as (prob, token id), then (0, -1)
     float2 * cand;     // [MAXT][TOPK_MAX] best (logit, id) of the main lm_head rows, descending (sampling)
     float * logits;    // [MAXT][VOCAB] main lm_head logits of a scoring launch (Launch::score == 2)
+    unsigned short * pcnt; // [VOCAB] presence / frequency penalty: occurrences of each token in the response (saturating)
     unsigned * bar;
     unsigned * cnt;
     Ctl * ctl;
@@ -252,6 +253,11 @@ struct Launch {
     // sampling: draft from the MTP's own sampling distribution q' and verify with min(1, p / q') plus the
     // residual max(0, p - q') (distribution-exact; higher acceptance than argmax drafts at temp 1)
     int spec_smp;
+    // presence / frequency penalty (vLLM's semantics, OpenAI's parameters): the logit of token v is lowered by
+    // freq * c(v) + pres * (c(v) > 0), c(v) = how often v occurs in this response's generated tokens before the row's
+    // position (Bufs::pcnt: the committed ones; a verify row adds the drafts in its own context). Applied to the main
+    // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (the kernels without the penalty).
+    float pres, freq;
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
 
@@ -2590,10 +2596,18 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + 128 * 8 <= SM_MISC, "to
 // every logit of each row in cB.logits (scoring).  LSE (TL == 1): also the log-sum-exp of the row's
 // true logits; the last block leaves misc[LM_LSE] = lse and misc[LM_BEST] = the best true logit.
 // Draft rows: s_tok and the TOPK ids are token ids (mapped through cW.draft_ids).
+// PEN: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
+// cB.pcnt plus its occurrences in ctl->tok[1 .. nx0 + t] (the drafts in row t's context; nx0: the drafts before row 0).
+// Every value is then the true logit minus the penalty (correctly rounded, no contraction: the same in any T).
 constexpr int LM_LSE = 240, LM_BEST = 241, LM_WLSE = 208; // misc() slots ([LM_WLSE, +2 * NW): per-warp lse)
-template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr) {
+__device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
+    return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
+}
+template <int TL, bool TOPK = false, bool FULL = false, bool LSE = false, bool PEN = false>
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * cand = nullptr,
+                                     float pres = 0.f, float freq = 0.f, int nx0 = 0) {
     static_assert(!LSE || TL == 1, "LSE: one row");
+    static_assert(!(PEN && FULL), "no penalty when scoring");
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
@@ -2610,13 +2624,20 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
+    int xt[4]; // PEN: the drafts tok[1..4] (only the first nx0 + t count for row t)
+    if constexpr (PEN) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) xt[i] = ((volatile Ctl *) cB.ctl)->tok[1 + i];
+    }
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
+        int p0, p1; // token ids of the rows
         {
             const uint8_t * rp[2];
             const __half * dp[2]; // Q6_K: the rows' scale (meta) streams
-            const int p0 = ids ? __ldg(ids + r) : r, p1 = ids ? __ldg(ids + r + 1) : r + 1;
+            p0 = ids ? __ldg(ids + r) : r;
+            p1 = ids ? __ldg(ids + r + 1) : r + 1;
             rp[0] = head.w + (size_t) p0 * head.rb;
             rp[1] = head.w + (size_t) p1 * head.rb;
             dp[0] = head.d + (size_t) p0 * head.nd;
@@ -2624,8 +2645,24 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             rows_t<TL, 5, 2, T_Q6K>(rp, dp, sx, a);
         }
         wsum_acc<TL, 2>(a);
+        if constexpr (PEN) { // a[k][t] <- the penalised true logit
+            const int c0 = __ldcg(cB.pcnt + p0), c1 = __ldcg(cB.pcnt + p1);
+#pragma unroll
+            for (int t = 0; t < TL; t++) {
+                int e0 = c0, e1 = c1;
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                    if (i < nx0 + t) {
+                        e0 += xt[i] == p0;
+                        e1 += xt[i] == p1;
+                    }
+                a[0][t] = pen_logit(a[0][t], m[t], e0, pres, freq);
+                a[1][t] = pen_logit(a[1][t], m[t], e1, pres, freq);
+            }
+        }
+        // (below, PEN ? a : a * m = the true logits: PEN's a already are)
         if constexpr (LSE) {
-            const float v0 = a[0][0] * m[0], v1 = a[1][0] * m[0];
+            const float v0 = PEN ? a[0][0] : a[0][0] * m[0], v1 = PEN ? a[1][0] : a[1][0] * m[0];
             const float mx = fmaxf(lm_m, fmaxf(v0, v1));
             lm_s = lm_s * __expf(lm_m - mx) + __expf(v0 - mx) + __expf(v1 - mx);
             lm_m = mx;
@@ -2642,8 +2679,8 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
 #pragma unroll
         for (int t = 0; t < TL; t++) {
             if constexpr (TOPK) { // true logits: apply the final RMS norm scale (irrelevant to the argmax)
-                topk_insert(bv[t], bi[t], a[0][t] * m[t], r);
-                topk_insert(bv[t], bi[t], a[1][t] * m[t], r + 1);
+                topk_insert(bv[t], bi[t], PEN ? a[0][t] : a[0][t] * m[t], r);
+                topk_insert(bv[t], bi[t], PEN ? a[1][t] : a[1][t] * m[t], r + 1);
             } else {
                 if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r; }
                 if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1; }
@@ -2767,7 +2804,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         }
         if (lane == 0) {
             s_tok[warp] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
-            if (LSE) m[LM_BEST] = b * m[0];
+            if (LSE) m[LM_BEST] = PEN ? b : b * m[0];
         }
     }
     if (tid == 0) *cB.cnt = 0;
@@ -2923,10 +2960,11 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const 
 }
 
 // ---- main-model control (single thread) ----
-__device__ void main_control(int mode, int last, int T, const int * tgt) {
+__device__ void main_control(int mode, int last, int T, const int * tgt, bool pen) {
     Ctl * c = cB.ctl;
     const int n = c->n;
     int a, bonus = -1;
+    // pen: count the emitted tokens (the response so far) for the presence / frequency penalty
     if (mode == MODE_DECODE) {
         a = 0;
         while (a < T - 1 && tgt[a] == c->tok[a + 1]) a++;
@@ -2963,6 +3001,11 @@ __device__ void main_control(int mode, int last, int T, const int * tgt) {
         c->n = P;
         c->tok[0] = bonus;
     }
+    if (pen)
+        for (int i = 0; i < c->n_out; i++) {
+            const int v = c->out[i];
+            if (cB.pcnt[v] < 0xffff) cB.pcnt[v]++;
+        }
 }
 
 template <int T>
@@ -3008,10 +3051,13 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     bool am_last;
     int tl = 0;
     const bool sampling = P.temp > 0.0f && !P.score;
+    const bool pen = (P.pres != 0.f || P.freq != 0.f) && !P.score; // (the first token of a response has nothing to penalise)
     if (P.mode == MODE_DECODE || P.score) {
-        if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok);
+        if (sampling) am_last = pen ? lm_head<T, true, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
+                                    : lm_head<T, true>(0, false, sm, s_tok);
         else if (P.score == 2) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
-        else am_last = lm_head<T>(0, false, sm, s_tok);
+        else am_last = pen ? lm_head<T, false, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
+                           : lm_head<T>(0, false, sm, s_tok);
         tl = T;
     } else if (P.last) {
         am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
@@ -3025,7 +3071,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
             sample_targets(P, T, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
-        main_control(P.mode, P.last, T, P.score ? s_tok + T - 1 : tg);
+        main_control(P.mode, P.last, T, P.score ? s_tok + T - 1 : tg, pen);
         __threadfence();
     }
     gsync(epoch, PH_LMHEAD);
@@ -3099,8 +3145,12 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         const bool lastb = lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl);
 #else
         float2 * const tl = cB.dq + k * TOPK_MAX;
-        const bool lastb = P.spec_smp ? lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl)
-                                      : lm_head<1, false, false, true>(R - 1, true, sm, s_tok);
+        // presence / frequency penalty: draft k + 1 has the committed tokens and drafts 1..k in its context
+        const bool pen = P.pres != 0.f || P.freq != 0.f;
+        const bool lastb = P.spec_smp ? (pen ? lm_head<1, true, false, true, true>(R - 1, true, sm, s_tok, tl, P.pres, P.freq, k)
+                                             : lm_head<1, true, false, true>(R - 1, true, sm, s_tok, tl))
+                                      : (pen ? lm_head<1, false, false, true, true>(R - 1, true, sm, s_tok, nullptr, P.pres, P.freq, k)
+                                             : lm_head<1, false, false, true>(R - 1, true, sm, s_tok));
 #endif
         if (lastb && threadIdx.x == 0) {
             Ctl * c = cB.ctl;
@@ -4449,6 +4499,7 @@ struct MKEngine::Impl {
         hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
+        hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
@@ -4608,6 +4659,11 @@ struct MKEngine::Impl {
         }
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
+        if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
+            L.pres = pen_pres;
+            L.freq = pen_freq;
+            pcnt_dirty = true;
+        }
         void * args[] = {&L};
         ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
         ck_guard_state();
@@ -5090,6 +5146,26 @@ struct MKEngine::Impl {
         mem_mark("scoring logits");
     }
 
+    // presence / frequency penalty (Launch::pres / freq): the response's token counts (cB.pcnt), zeroed by the next
+    // prefill once a penalised launch has counted into them
+    float pen_pres = 0.f, pen_freq = 0.f;
+    bool pcnt_dirty = false;
+    void set_penalty(float pres, float freq) {
+        if (!std::isfinite(pres) || !std::isfinite(freq)) throw std::runtime_error("penalties must be finite");
+        if ((pres != 0.f || freq != 0.f) && !hb.pcnt) {
+            hb.pcnt = dalloc<unsigned short>(VOCAB);
+            CK(cudaMemcpyToSymbol(cB, &hb.pcnt, sizeof(hb.pcnt), offsetof(Bufs, pcnt)));
+            mem_mark("penalty counts");
+        }
+        pen_pres = pres;
+        pen_freq = freq;
+    }
+    void pcnt_clear() {
+        if (!pcnt_dirty) return;
+        CK(cudaMemsetAsync(hb.pcnt, 0, (size_t) VOCAB * sizeof(unsigned short)));
+        pcnt_dirty = false;
+    }
+
     void reset() {
         ck_wait_restore();
         ck_guard_state();
@@ -5152,7 +5228,10 @@ MKEngine::~MKEngine() { delete p_; }
 
 void MKEngine::bench_phases() { p_->bench(); }
 
+void MKEngine::set_penalty(float presence, float frequency) { p_->set_penalty(presence, frequency); }
+
 void MKEngine::reset() {
+    p_->pcnt_clear();
     p_->reset();
     p_->seq.clear();
     p_->ck_pos = -1;
@@ -5164,6 +5243,7 @@ int MKEngine::position() const { return p_->hctl.n; }
 
 int MKEngine::prefill(const std::vector<int> & tokens, int ck_at) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
+    p_->pcnt_clear(); // a new response: the penalties count its generated tokens only
     if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
