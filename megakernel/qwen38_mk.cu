@@ -136,9 +136,12 @@ constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 
 constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (ATP + 8) * 2 + 96 * 4; // Q, K/V, S, P, stats
 // attn_core_q8 (decode attention, all-q8 slots): q8 K / V ring stages, double-buffered S and P
 constexpr int AQ_NSK = 3, AQ_NSV = 4; // K(t) is issued in interval t - 2 and read in t; V(t) issued in t - 1, read in t + 2
-constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks
+constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued in t - 3, expanded to int8 in t - 1, read in t
+constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
+                                      // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
-constexpr int SM_ATTN_Q8 = 32 * (256 + 8) * 2 + (AQ_NSK + AQ_NSV) * AQ_STG + 2 * 32 * AQ_LDS * 4 + 2 * 32 * (ATP + 8) * 2 + 4 * 32 * 4;
+constexpr int SM_ATTN_Q8 = 32 * (256 + 8) * 2 + (AQ_NSKM + AQ_NSV) * AQ_STG + 2 * 32 * AQ_LDS * 4 + 2 * 32 * (ATP + 8) * 2;
+static_assert(SM_ATTN_Q8 + 16 <= 99 * 1024, "attention ring budget (mk_cycle has a few bytes of static shared memory)");
 constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
@@ -1909,6 +1912,71 @@ __device__ __forceinline__ unsigned kv_hi4(unsigned x, int k0, int hb) {
     x >>= hb * k0;
     return ((x & m) | (((x >> hb) & m) << 8) | (((x >> (2 * hb)) & m) << 16) | (((x >> (3 * hb)) & m) << 24)) << 4;
 }
+// the four HB-bit fields k = 0 .. 3 of x (field k at bit HB k) -> bits 4 .. 4 + HB - 1 of byte k (the high nibbles of a
+// word of four low nibbles, as kv_hi4 with a compile-time width)
+template <int HB>
+__device__ __forceinline__ unsigned kv_spread4(unsigned x) {
+    if constexpr (HB == 1) return ((x & 0xfu) * 0x02040810u) & 0x10101010u; // bit k -> bit 8 k + 4 (no two products collide)
+    if constexpr (HB == 2) {
+        x &= 0xffu;
+        x = (x | (x << 12)) & 0x000f000fu; // fields 0, 1 at 0 .. 3; 2, 3 at 16 .. 19
+        x = (x | (x << 6)) & 0x03030303u;  // one field per byte
+        return x << 4;
+    }
+    if constexpr (HB == 3) {
+        x &= 0xfffu;
+        x = (x | (x << 10)) & 0x003f003fu;
+        x = (x | (x << 5)) & 0x07070707u;
+        return x << 4;
+    }
+    return 0u;
+}
+// One staged q4 .. q7 K / V row (kv_store_q4 / kv_store_qn's layout: lane word w = the low nibbles of values 8 w .. 8 w + 7,
+// then at 128 + w (BITS - 4) their high bits) expanded IN PLACE to the q8 layout: 256 int8 values q = n - 2^(BITS - 1), the
+// scales untouched. The fp16 product d q is the same number the low-bit decode computes (qn_to_f16 / a2_qnh), so every
+// consumer of the q8 layout (aq_q8x2, a8_imma with the scale applied after the int8 dot) sees exactly the low-bit values.
+// One warp per row: every lane reads its word and high bits before any lane writes (the output overlaps the input).
+template <int BITS>
+__device__ __forceinline__ void kv_row_expand(uint8_t * row) {
+    constexpr int HB = BITS - 4;
+    const int lane = threadIdx.x & 31;
+    const unsigned wd = *reinterpret_cast<const unsigned *>(row + 4 * lane);
+    unsigned hi = 0u;
+    if constexpr (HB == 1) hi = row[128 + lane];
+    if constexpr (HB == 2) hi = *reinterpret_cast<const unsigned short *>(row + 128 + 2 * lane);
+    if constexpr (HB == 3) hi = (unsigned) row[128 + 3 * lane] | ((unsigned) row[129 + 3 * lane] << 8) | ((unsigned) row[130 + 3 * lane] << 16);
+    __syncwarp();
+    unsigned lo = wd & 0x0f0f0f0fu, hv = (wd >> 4) & 0x0f0f0f0fu; // values 0 .. 3 / 4 .. 7 (biased, n = q + 2^(BITS-1))
+    if constexpr (HB > 0) {
+        lo |= kv_spread4<HB>(hi);
+        hv |= kv_spread4<HB>(hi >> (4 * HB));
+    }
+    // per byte n - 2^(BITS-1) mod 256, without borrows between bytes (n < 128: bit 7 is free to absorb them)
+    constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
+    lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
+    hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
+    *reinterpret_cast<uint2 *>(row + 8 * lane) = make_uint2(lo, hv);
+}
+// rows r0, r0 + rs, .. < np of a staged low-bit tile (row stride ld bytes) -> q8 layout; bits is block-uniform
+__device__ __forceinline__ void kv_tile_expand(uint8_t * st, int bits, int np, int r0, int rs, int ld) {
+    switch (bits) {
+    case 4:
+        for (int r = r0; r < np; r += rs) kv_row_expand<4>(st + r * ld);
+        break;
+    case 5:
+        for (int r = r0; r < np; r += rs) kv_row_expand<5>(st + r * ld);
+        break;
+    case 6:
+        for (int r = r0; r < np; r += rs) kv_row_expand<6>(st + r * ld);
+        break;
+    case 7:
+        for (int r = r0; r < np; r += rs) kv_row_expand<7>(st + r * ld);
+        break;
+    default:
+        break;
+    }
+}
+
 // 8 q4 .. q7 values (lane word w in kv_store_q4's nibble order, high bits hi) + scale -> 4 fp16 pairs (q4: q4_to_f16)
 __device__ __forceinline__ void qn_to_f16(unsigned w, unsigned hi, float d, int bits, __half2 (&h)[4]) {
     const int hb = bits - 4, mid = 1 << (bits - 1);
@@ -2395,16 +2463,6 @@ __device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d
     const __half2 r = __hmul2(q, d);
     return *reinterpret_cast<const unsigned *>(&r);
 }
-// attn_core_q8m (q8 and q4 slots): bytes sel of y hold biased values b (q8: q + 128 = q ^ 0x80, q4: the nibble = q + 8);
-// 0x6400 | b is the fp16 1024 + b, minus bias (0x6480 = 1152 for q8, 0x6408 = 1032 for q4) is q exactly, and one fp16
-// multiply rounds the exact product d * q (= q8_to_f16's / q4_to_f16's value)
-__device__ __forceinline__ unsigned aq_x2p(unsigned y, unsigned sel, __half2 d, __half2 bias) {
-    const unsigned h = __byte_perm(y, 0x64646464u, sel);
-    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), bias);
-    const __half2 r = __hmul2(q, d);
-    return *reinterpret_cast<const unsigned *>(&r);
-}
-
 // one commit group's copies, issued by NTH threads (this one is thread t of them): K rows of a tile (kn valid rows,
 // kn < 0: none) -> K stage dk, V rows of a tile -> dv; rows >= the valid count get zero scales (their values are
 // never used: masked S, P = 0). MIX: q4..q7 rows (kbits / vbits) copy 2 bits value chunks (kv_stage's staging layout).
@@ -2432,8 +2490,10 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
     }
 }
 
-// MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 (MK_KV), the q4
-// fragments converted with q4_to_f16's values (aq_x2p), so the partials equal attn_core_t's for every MK_KV format.
+// MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 .. q7 (MK_KV), the
+// low-bit tiles staged in their packed layout and expanded to int8 once in shared memory (kv_row_expand: q = n - 2^(bits-1)
+// with the scale unchanged, by warps 4 - 15 one interval before the tile is read; the K pipeline is one stage deeper for
+// it), so the MMA path is the q8 one for every tile and the partials equal attn_core_t's for every MK_KV format.
 template <int T, bool MIX = false>
 __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
@@ -2443,7 +2503,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     constexpr int LDH = HD + 8;
     constexpr int LDP = TP + 8;
     constexpr int LDS = AQ_LDS;
-    constexpr int NSK = AQ_NSK, NSV = AQ_NSV;
+    constexpr int NSK = MIX ? AQ_NSKM : AQ_NSK, NSV = AQ_NSV;
     static_assert(R <= 32 && TP == 32 && MT <= 2, "8 rows per softmax warp, 32-position tiles");
     const int L_ctx = n + T;
     const int ws = mtp_ws(slot, n); // MK_MTP_WIN
@@ -2453,17 +2513,16 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     __half * sQ = reinterpret_cast<__half *>(sm);                 // [32][LDH]
     uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + 32 * LDH); // NSK stages
     uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
-    float * sS = reinterpret_cast<float *>(vring + NSV * AQ_STG); // [2][32][LDS]
+    float * sS = reinterpret_cast<float *>(vring + NSV * AQ_STG); // [2][32][LDS]; pad columns: m (32), l (33), alpha (34)
     __half * sP = reinterpret_cast<__half *>(sS + 2 * 32 * LDS);  // [2][32][LDP]
-    float * sM = reinterpret_cast<float *>(sP + 2 * 32 * LDP);
-    float * sL = sM + 32;
-    float * sAl = sL + 32; // [2][32]
+    auto sM = [&](int r) -> float & { return sS[r * LDS + 32]; };
+    auto sL = [&](int r) -> float & { return sS[r * LDS + 33]; };
+    auto sAl = [&](int b, int r) -> float & { return sS[(b * 32 + r) * LDS + 34]; };
     const size_t ctx = cB.ctx;
     const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
     (void) slot0;
-    // MK_KV per-slot formats: kq4 / vq4 = bits (8, or 4..7 = low-bit, MIX only); the low-bit decode below reads q4's
-    // nibbles plus khb / vhb high bits per value (kv_store_qn's layout: word w's high bits at 128 + w hb)
-    // (per tile: kv_tbits, since with MK_KV_WIN the tiles at positions >= wsr are the ring's q8 copies)
+    // MK_KV per-slot formats (MIX only): tiles are copied in the slot's format (per tile: kv_tbits, since with MK_KV_WIN the
+    // tiles at positions >= wsr are the ring's q8 copies) and the low-bit ones expanded to int8 in their stage before use
     const int wsr = MIX ? kv_ws(L_ctx) : 0;
 
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
@@ -2545,13 +2604,15 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             (void) srow;
         }
         if (tid < 32) {
-            sM[tid] = -INFINITY;
-            sL[tid] = 0.f;
+            sM(tid) = -INFINITY;
+            sL(tid) = 0.f;
         }
         __threadfence_block();
         __syncthreads();
 
         // ---- ring prologue: commit groups {K(0)}, {K(1), V(0)}; then per interval jt {K(jt + 2), V(jt + 1)}
+        // (MIX: {K(0), K(1)}, {K(2), V(0)}; per interval {K(jt + 3), V(jt + 1)}, and the low-bit tiles that landed at the
+        // end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         const int ntl = (c1 - c0 + TP - 1) / TP;
         auto tnp = [&](int t) { return t < ntl ? min(TP, c1 - c0 - t * TP) : -1; }; // valid rows of tile t, -1: none
         // tile sources (MK_KV_WIN: the q8 ring for tiles at positions >= wsr, else the slot's main buffer) and formats
@@ -2572,12 +2633,27 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             if (nth_tid == NT) aq_issue<NT, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
             else aq_issue<NT - 128, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
         };
-        issue(tid, kring, 0, vring, -1, NT);
-        asm volatile("cp.async.commit_group;" ::: "memory");
-        issue(tid, kring + AQ_STG, 1, vring, 0, NT);
-        asm volatile("cp.async.commit_group;" ::: "memory");
-        asm volatile("cp.async.wait_group 1;" ::: "memory");
-        __syncthreads();
+        if constexpr (MIX) {
+            issue(tid, kring, 0, vring, -1, NT);
+            issue(tid, kring + AQ_STG, 1, vring, -1, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            issue(tid, kring + 2 * AQ_STG, 2, vring, 0, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+            __syncthreads();
+            const int kb0 = kv_tbits(0, slot, c0, wsr); // K(0) -> int8 now (all warps); K(1) in interval 0
+            if (kb0 != 8) {
+                kv_tile_expand(kring, kb0, tnp(0), warp, NW, KVQ_ROW);
+                __syncthreads();
+            }
+        } else {
+            issue(tid, kring, 0, vring, -1, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            issue(tid, kring + AQ_STG, 1, vring, 0, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+            __syncthreads();
+        }
 
         float acc[MT][4][4]; // P V warps: O rows 16 i + {g8, g8 + 8}, dims 32 wn + 8 tig + jj and + 4
 #pragma unroll
@@ -2595,37 +2671,13 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const uint8_t * krow = kring + (jt % NSK) * AQ_STG + (8 * wn + g8) * KVQ_ROW;
                     const uint4 scv = *reinterpret_cast<const uint4 *>(krow + 256);
                     const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
-                    unsigned kb[HD / 16][2];
-                    const int kq4 = MIX ? kv_tbits(0, slot, c0 + jt * TP, wsr) : 8, khb = kq4 - 4; // this tile's K format
-                    if (!MIX || kq4 == 8) {
+                    unsigned kb[HD / 16][2]; // (MIX: a low-bit tile was expanded to this layout in interval jt - 1)
 #pragma unroll
-                        for (int ks = 0; ks < HD / 16; ks++) {
-                            const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
-                            const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
-                            kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd);
-                            kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd);
-                        }
-                    } else {
-                        // q4 K: dims 16 ks + 2 tig (+1) are nibbles (tig >> 1: high) of bytes 2 (tig & 1) (+1) of word 2 ks,
-                        // dims + 8 the same of word 2 ks + 1
-                        const uint8_t * kq = krow + 2 * (tig & 1);
-                        const int ksh = 4 * (tig >> 1);
-                        const __half2 kbias = __half2half2(__ushort_as_half((unsigned short) (0x6400 + (1 << (kq4 - 1)))));
-                        const unsigned khm = (1u << khb) - 1u;
-#pragma unroll
-                        for (int ks = 0; ks < HD / 16; ks++) {
-                            const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
-                            const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
-                            unsigned w0 = ((unsigned) *reinterpret_cast<const unsigned short *>(kq + 8 * ks) >> ksh) & 0x0f0fu;
-                            unsigned w1 = ((unsigned) *reinterpret_cast<const unsigned short *>(kq + 8 * ks + 4) >> ksh) & 0x0f0fu;
-                            if (khb > 0) { // q5..q7: the high bits of values 2 tig, 2 tig + 1 of words 2 ks, 2 ks + 1
-                                const unsigned h0 = kv_hi(krow + 128 + (2 * ks) * khb, khb), h1 = kv_hi(krow + 128 + (2 * ks + 1) * khb, khb);
-                                w0 |= (((h0 >> (khb * 2 * tig)) & khm) << 4) | (((h0 >> (khb * (2 * tig + 1))) & khm) << 12);
-                                w1 |= (((h1 >> (khb * 2 * tig)) & khm) << 4) | (((h1 >> (khb * (2 * tig + 1))) & khm) << 12);
-                            }
-                            kb[ks][0] = aq_x2p(w0, 0x4140, dd, kbias);
-                            kb[ks][1] = aq_x2p(w1, 0x4140, dd, kbias);
-                        }
+                    for (int ks = 0; ks < HD / 16; ks++) {
+                        const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
+                        const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
+                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd);
+                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd);
                     }
                     float s[MT][4];
 #pragma unroll
@@ -2659,7 +2711,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const int wn = warp - 4, jp = jt - 2, b = jp & 1;
 #pragma unroll
                     for (int i = 0; i < MT; i++) {
-                        const float al0 = sAl[b * 32 + 16 * i + g8], al1 = sAl[b * 32 + 16 * i + g8 + 8];
+                        const float al0 = sAl(b, 16 * i + g8), al1 = sAl(b, 16 * i + g8 + 8);
 #pragma unroll
                         for (int j = 0; j < 4; j++) {
                             acc[i][j][0] *= al0;
@@ -2669,48 +2721,25 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                         }
                     }
                     const unsigned paddr = (unsigned) __cvta_generic_to_shared(sP + b * 32 * LDP + (lane & 15) * LDP + (lane >> 4) * 8);
-                    // q4 V (MIX): dims 32 wn + 4 g8 + jj are nibbles (g8 & 1: high) of bytes jj of word 4 wn + (g8 >> 1)
-                    const int vq4 = MIX ? kv_tbits(1, slot, c0 + jp * TP, wsr) : 8, vhb = vq4 - 4; // this tile's V format
-                    const bool vlow = MIX && vq4 != 8;
-                    const uint8_t * vst = vring + (jp % NSV) * AQ_STG + (vlow ? 16 * wn + 4 * (g8 >> 1) : 32 * wn + 4 * g8);
+                    // (MIX: a low-bit V tile was expanded to the q8 layout in interval jt - 1)
+                    const uint8_t * vst = vring + (jp % NSV) * AQ_STG + 32 * wn + 4 * g8;
                     const uint8_t * vsc = vring + (jp % NSV) * AQ_STG + 256 + 2 * wn;
-                    const uint8_t * vhi = vring + (jp % NSV) * AQ_STG + 128 + (4 * wn + (g8 >> 1)) * vhb; // q5..q7 high bits
-                    const int vsh = vlow ? 4 * (g8 & 1) : 0;
-                    const unsigned vmsk = vlow ? 0x0f0f0f0fu : 0xffffffffu, vxor = vlow ? 0u : 0x80808080u;
-                    const __half2 vbias = __half2half2(__ushort_as_half((unsigned short) (0x6400 + (1 << (vq4 - 1)))));
 #pragma unroll
                     for (int ks = 0; ks < TP / 16; ks++) {
                         unsigned bf[2][4]; // [b0 / b1][tile jj]
 #pragma unroll
                         for (int h = 0; h < 2; h++) {
                             const int p = 16 * ks + 2 * tig + 8 * h; // k rows p, p + 1 of the fragment
-                            unsigned xa, xb;
-                            if constexpr (MIX) {
-                                xa = ((*reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) >> vsh) & vmsk) ^ vxor;
-                                xb = ((*reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) >> vsh) & vmsk) ^ vxor;
-                                if (vlow && vhb > 0) { // q5..q7: the high bits of values 4 (g8 & 1) + jj of the word
-                                    xa |= kv_hi4(kv_hi(vhi + p * KVQ_ROW, vhb), 4 * (g8 & 1), vhb);
-                                    xb |= kv_hi4(kv_hi(vhi + (p + 1) * KVQ_ROW, vhb), 4 * (g8 & 1), vhb);
-                                }
-                            } else {
-                                xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ 0x80808080u;
-                                xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ 0x80808080u;
-                            }
+                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ 0x80808080u;
+                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ 0x80808080u;
                             const unsigned sw = (unsigned) *reinterpret_cast<const unsigned short *>(vsc + p * KVQ_ROW) |
                                                 ((unsigned) *reinterpret_cast<const unsigned short *>(vsc + (p + 1) * KVQ_ROW) << 16);
                             const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
                             const unsigned y0 = __byte_perm(xa, xb, 0x5140), y1 = __byte_perm(xa, xb, 0x7362);
-                            if constexpr (MIX) {
-                                bf[h][0] = aq_x2p(y0, 0x4140, dd, vbias);
-                                bf[h][1] = aq_x2p(y0, 0x4342, dd, vbias);
-                                bf[h][2] = aq_x2p(y1, 0x4140, dd, vbias);
-                                bf[h][3] = aq_x2p(y1, 0x4342, dd, vbias);
-                            } else {
-                                bf[h][0] = aq_q8x2p(y0, 0x4140, dd);
-                                bf[h][1] = aq_q8x2p(y0, 0x4342, dd);
-                                bf[h][2] = aq_q8x2p(y1, 0x4140, dd);
-                                bf[h][3] = aq_q8x2p(y1, 0x4342, dd);
-                            }
+                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd);
+                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd);
+                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd);
+                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd);
                         }
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
@@ -2744,7 +2773,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     for (int k = 1; k < 8; k++) m = fmaxf(m, sv[k]);
                     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
                     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-                    const float mold = sM[r];
+                    const float mold = sM(r);
                     const float mnew = fmaxf(mold, m);
                     float p[8], al = 1.f;
 #pragma unroll
@@ -2765,9 +2794,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #pragma unroll
                         for (int k = 0; k < 8; k++) prow[l4 + 4 * k] = __float2half_rn(p[k]);
                         if (l4 == 0) {
-                            sL[r] = sL[r] * al + ps;
-                            sM[r] = mnew;
-                            sAl[b * 32 + r] = al;
+                            sL(r) = sL(r) * al + ps;
+                            sM(r) = mnew;
+                            sAl(b, r) = al;
                         }
                     }
                 }
@@ -2775,8 +2804,24 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
             // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains: -5% per tile at T >= 3);
             // then wait for K(jt + 1) and V(jt)
-            if (jt + 1 < ntl && warp >= 4)
-                issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+            if (warp >= 4) {
+                if constexpr (MIX) {
+                    // K(jt + 3) into the stage of K(jt - 1); then the low-bit tiles that landed at the end of interval jt - 1
+                    // are expanded to int8 for interval jt + 1: K(jt + 1) (S warps) and V(jt - 1) (P V warps), one row per
+                    // warp per step (their stages are not touched by any copy in flight)
+                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    if (jt + 1 < ntl) {
+                        const int kb_ = kv_tbits(0, slot, c0 + (jt + 1) * TP, wsr);
+                        if (kb_ != 8) kv_tile_expand(kring + ((jt + 1) % NSK) * AQ_STG, kb_, tnp(jt + 1), warp - 4, NW - 4, KVQ_ROW);
+                    }
+                    if (jt >= 1 && jt - 1 < ntl) {
+                        const int vb_ = kv_tbits(1, slot, c0 + (jt - 1) * TP, wsr);
+                        if (vb_ != 8) kv_tile_expand(vring + ((jt - 1) % NSV) * AQ_STG, vb_, tnp(jt - 1), warp - 4, NW - 4, KVQ_ROW);
+                    }
+                } else {
+                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                }
+            }
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
@@ -2800,7 +2845,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     }
                 }
         }
-        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM[tid], sL[tid]);
+        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM(tid), sL(tid));
         __syncthreads();
     }
 }
