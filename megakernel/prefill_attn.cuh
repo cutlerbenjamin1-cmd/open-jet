@@ -341,15 +341,14 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     const int ntile = pmax / A2_K + 1;
     const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
     const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
-    // q8 cache: the slot's K / V in their MK_KV formats (q8_0 or q4: rows of HD or HD / 2 bytes)
-    const int kq4 = Q8 ? cB.kvb[0][slot] : 8, vq4 = Q8 ? cB.kvb[1][slot] : 8; // bits per value (8, or 4..7)
-    const int kst = HD * kq4 / 8, vst = HD * vq4 / 8;
-    const int8_t * Kq = cB.kvp[0][slot] + (size_t) g * cB.ctx * kst;
-    const int8_t * Vq = cB.kvp[1][slot] + (size_t) g * cB.ctx * vst;
+    // q8 cache: the slot's K / V tiles in their MK_KV formats (rows of HD bits / 8 bytes), or the MK_KV_WIN q8 ring for
+    // tiles at positions >= wsr (kv_src per tile); kbi / vbi = the bits of the K / V tile in flight (rq)
+    const int wsr = Q8 ? kv_ws(n0 + T) : 0;
+    int kbi = 8, vbi = 8;
+    const int8_t * tq = nullptr;
+    const __half * ts = nullptr;
     const __half * Kh = static_cast<const __half *>(cB.kc) + row0 * HD;
     const __half * Vh = static_cast<const __half *>(cB.vc) + row0 * HD;
-    const __half * Ks = cB.kvs[0][slot] + (size_t) g * cB.ctx * (HD / 32);
-    const __half * Vs = cB.kvs[1][slot] + (size_t) g * cB.ctx * (HD / 32);
 
     for (int i = tid; i < 6 * A2_Q * 32; i += A2_NT) { // 96 rows x 32 chunks of 16 B
         const int r = i >> 5, c = i & 31, h = r / A2_Q, tt = r % A2_Q;
@@ -362,9 +361,11 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     if (it0 < it1) {
         const int kb = it0 * A2_K, np = min(A2_K, pmax + 1 - kb);
         if constexpr (Q8) {
-            a2_ld_q8(rq, Kq + (size_t) kb * kst, Ks + (size_t) kb * (HD / 32), np, kq4);
-            a2_st_q8(rq, sK, kq4);
-            a2_ld_q8(rq, Vq + (size_t) kb * vst, Vs + (size_t) kb * (HD / 32), np, vq4);
+            kbi = kv_src(0, slot, g, kb, wsr, tq, ts);
+            a2_ld_q8(rq, tq, ts, np, kbi);
+            a2_st_q8(rq, sK, kbi);
+            vbi = kv_src(1, slot, g, kb, wsr, tq, ts);
+            a2_ld_q8(rq, tq, ts, np, vbi);
         } else {
             a2_cp_f16(sK, Kh + (size_t) kb * HD, np);
         }
@@ -403,7 +404,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
             mma16816(s[1], a[0], a[1], a[2], a[3], b[2], b[3]);
             // V(it) -> sV (free since the barrier above) between the MMAs, late enough for the loads to have landed
             if constexpr (Q8)
-                if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2, vq4);
+                if (ks >= 6 && (ks & 3) == 2) a2_st_q8(rq, sV, (ks - 6) >> 2, vbi);
         }
         // causal mask, row maxima over the pair
         float mx0 = -INFINITY, mx1 = -INFINITY;
@@ -474,7 +475,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
         m1 = mn1;
         const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth; // A fragments of positions 0-15 / 16-31
         if constexpr (Q8) {
-            if (it + 1 < it1) a2_ld_q8(rq, Kq + (size_t) kn * kst, Ks + (size_t) kn * (HD / 32), npn, kq4);
+            if (it + 1 < it1) {
+                kbi = kv_src(0, slot, g, kn, wsr, tq, ts);
+                a2_ld_q8(rq, tq, ts, npn, kbi);
+            }
         } else {
             pf::cpa_wait<0>(); // V(it)
         }
@@ -504,7 +508,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                     mma16816(o[2 * j + 1], A.x, A.y, A.z, A.w, b[2], b[3]);
                     // K(it + 1) -> sK (free since the barrier above) late in the loop
                     if constexpr (Q8)
-                        if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1, kq4);
+                        if (ks == 1 && (j & 1) && j < 7 && nxt) a2_st_q8(rq, sK, j >> 1, kbi);
                 }
             }
         } else {
@@ -529,12 +533,13 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
                 o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
                 o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
                 if constexpr (Q8)
-                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4, kq4); // K(it + 1) -> sK late in the loop
+                    if (j >= 4 && j < 7 && nxt) a2_st_q8(rq, sK, j - 4, kbi); // K(it + 1) -> sK late in the loop
             }
         }
         if constexpr (Q8) {
             if (nxt) {
-                a2_ld_q8(rq, Vq + (size_t) kn * vst, Vs + (size_t) kn * (HD / 32), npn, vq4);
+                vbi = kv_src(1, slot, g, kn, wsr, tq, ts);
+                a2_ld_q8(rq, tq, ts, npn, vbi);
             }
         }
     }
@@ -713,12 +718,18 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
     // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
     // cache kvp / kvs give exactly the old addresses
-    const size_t hrow0 = (size_t) g * cB.ctx;
-    const int vbits = cB.kvb[1][slot]; // V: q8, or q4..q7 (converted to fp16 by a8_cv_v); K must be plain q8
-    const int8_t * Kq = cB.kvp[0][slot] + hrow0 * HD;
-    const int8_t * Vq = cB.kvp[1][slot] + hrow0 * (HD * vbits / 8);
-    const __half * Ks = cB.kvs[0][slot] + hrow0 * (HD / 32);
-    const __half * Vs = cB.kvs[1][slot] + hrow0 * (HD / 32);
+    // Per tile (kv_src): the slot's main buffer (K plain q8; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with
+    // MK_KV_WIN, the q8 ring for tiles at positions >= wsr. vbt(it) = the V format of tile it.
+    const int wsr = kv_ws(n0 + T);
+    auto vbt = [&](int it) { return kv_tbits(1, slot, it * A2_K, wsr); };
+    auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
+        const int8_t *tk, *tv;
+        const __half *tks, *tvs;
+        kv_src(0, slot, g, it * A2_K, wsr, tk, tks);
+        const int vb = kv_src(1, slot, g, it * A2_K, wsr, tv, tvs);
+        a8_issue(st, tk, tv, tvs, 0, np, vb);
+        return a8_ld_ks(tks, 0, np);
+    };
 
     // ring prologue: tiles it0 .. it0 + A8_NS - 2
 #pragma unroll
@@ -727,8 +738,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         uint8_t * st = asm_ + (it % A8_NS) * A8_STG;
         if (it < it1) {
             const int kb = it * A2_K, np = min(A2_K, pmax + 1 - kb);
-            a8_issue(st, Kq, Vq, Vs, kb, np, vbits);
-            a8_st_ks(st, a8_ld_ks(Ks, kb, np));
+            a8_st_ks(st, issue_tile(st, it, np));
         } else {
             pf::cpa_commit();
         }
@@ -800,7 +810,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         pf::cpa_wait<A8_NS - 2>();
         __syncthreads();
 #pragma unroll
-        for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbits);
+        for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbt(it0));
     }
     float o[16][4];
 #pragma unroll
@@ -824,13 +834,13 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
         const uint8_t * stv = asm_ + ((it + 1) % A8_NS) * A8_STG;
         const bool cvn = it + 1 < it1;
+        const int vbn = vbt(it + 1); // V(it + 1)'s format
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + (ia % A8_NS) * A8_STG;
         float ksn = 0.f;
         if (ia < it1) {
             const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
-            a8_issue(sta, Kq, Vq, Vs, kba, npa, vbits);
-            ksn = a8_ld_ks(Ks, kba, npa);
+            ksn = issue_tile(sta, ia, npa);
         } else {
             pf::cpa_commit();
         }
@@ -871,7 +881,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
             // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
-            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1, vbits);
+            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1, vbn);
         }
         if constexpr (QROW) {
 #pragma unroll

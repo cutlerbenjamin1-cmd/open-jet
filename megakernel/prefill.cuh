@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
                 kv_store_emu(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v, cB.kvemu[isv][slot], pos);
             else
 #endif
-            if (cB.kvq8) kv_store(isv, slot, (size_t) ((it - NH) % NKV) * ctx + pos, v);
+            if (cB.kvq8) kv_store(isv, slot, (it - NH) % NKV, pos, v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
     }
