@@ -233,15 +233,25 @@ struct A2Q8 {
     __half d[3];
 };
 // q4 (MK_KV): rows of HD / 2 bytes, chunk c = one word (kv_store_q4's nibble order) in q[k].x
-__device__ __forceinline__ void a2_ld_q8(A2Q8 & r, const int8_t * rows, const __half * sc, int np, bool q4 = false) {
+// bits: 8 (q8: 8 bytes per chunk) or 4..7 (kv_store_q4 / kv_store_qn: the lane word in .x, its bits - 4 high bytes in .y)
+__device__ __forceinline__ void a2_ld_q8(A2Q8 & r, const int8_t * rows, const __half * sc, int np, int bits = 8) {
 #pragma unroll
     for (int k = 0; k < 3; k++) {
         const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
         r.q[k] = make_uint2(0, 0);
         r.d[k] = __ushort_as_half(0);
         if (i < A2_K * 32 && p < np) {
-            if (q4) r.q[k].x = __ldg(reinterpret_cast<const unsigned *>(rows + (size_t) p * (HD / 2)) + c);
-            else r.q[k] = __ldg(reinterpret_cast<const uint2 *>(rows + (size_t) p * HD) + c);
+            if (bits == 8) {
+                r.q[k] = __ldg(reinterpret_cast<const uint2 *>(rows + (size_t) p * HD) + c);
+            } else {
+                const int8_t * rp = rows + (size_t) p * (HD * bits / 8);
+                r.q[k].x = __ldg(reinterpret_cast<const unsigned *>(rp) + c);
+                const int hb = bits - 4;
+                const uint8_t * hp = reinterpret_cast<const uint8_t *>(rp) + 128 + c * hb;
+                unsigned hi = 0;
+                for (int b = 0; b < hb; b++) hi |= (unsigned) __ldg(hp + b) << (8 * b);
+                r.q[k].y = hi;
+            }
             r.d[k] = sc[(size_t) p * (HD / 32) + (c >> 2)];
         }
     }
@@ -266,19 +276,34 @@ __device__ __forceinline__ void a2_q8h(uint2 q, __half d, __half2 (&h)[4]) {
     h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(y, 0x64646464u, 0x4140)), off), dd);
     h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(y, 0x64646464u, 0x4342)), off), dd);
 }
+// 8 q4..q7 values (lane word w, high bits hi: kv_store_qn's layout) + fp16 scale -> 4 fp16 pairs; bits = 4 is a2_q4h, and
+// the value d * (n - 2^(bits-1)) is rounded once to fp16 like qn_to_f16 (decode)
+__device__ __forceinline__ void a2_qnh(unsigned w, unsigned hi, __half d, int bits, __half2 (&h)[4]) {
+    unsigned lo = w & 0x0F0F0F0Fu, hv = (w >> 4) & 0x0F0F0F0Fu;
+    if (bits > 4) {
+        lo |= kv_hi4(hi, 0, bits - 4);
+        hv |= kv_hi4(hi, 4, bits - 4);
+    }
+    const __half2 off = __half2half2(__ushort_as_half((unsigned short) (0x6400 + (1 << (bits - 1))))), dd = __half2half2(d);
+    h[0] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4140)), off), dd);
+    h[1] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4342)), off), dd);
+    h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4140)), off), dd);
+    h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4342)), off), dd);
+}
 // chunk k of the tile -> fp16 rows in shared memory
-__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k, bool q4 = false) {
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k, int bits = 8) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
         __half2 h[4];
-        if (q4) a2_q4h(r.q[k].x, r.d[k], h);
+        if (bits == 4) a2_q4h(r.q[k].x, r.d[k], h);
+        else if (bits != 8) a2_qnh(r.q[k].x, r.q[k].y, r.d[k], bits, h);
         else a2_q8h(r.q[k], r.d[k], h);
         *reinterpret_cast<int4 *>(dst + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
-__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, bool q4) {
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int bits) {
 #pragma unroll
-    for (int k = 0; k < 3; k++) a2_st_q8(r, dst, k, q4);
+    for (int k = 0; k < 3; k++) a2_st_q8(r, dst, k, bits);
 }
 // fp16 K or V tile -> shared memory (cp.async, one commit group); rows >= np zeroed
 __device__ __forceinline__ void a2_cp_f16(__half * dst, const __half * src, int np) {
@@ -317,8 +342,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
     const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
     // q8 cache: the slot's K / V in their MK_KV formats (q8_0 or q4: rows of HD or HD / 2 bytes)
-    const bool kq4 = Q8 && cB.kvb[0][slot] == 4, vq4 = Q8 && cB.kvb[1][slot] == 4;
-    const int kst = kq4 ? HD / 2 : HD, vst = vq4 ? HD / 2 : HD;
+    const int kq4 = Q8 ? cB.kvb[0][slot] : 8, vq4 = Q8 ? cB.kvb[1][slot] : 8; // bits per value (8, or 4..7)
+    const int kst = HD * kq4 / 8, vst = HD * vq4 / 8;
     const int8_t * Kq = cB.kvp[0][slot] + (size_t) g * cB.ctx * kst;
     const int8_t * Vq = cB.kvp[1][slot] + (size_t) g * cB.ctx * vst;
     const __half * Kh = static_cast<const __half *>(cB.kc) + row0 * HD;
@@ -608,7 +633,8 @@ __device__ __forceinline__ float a8_i2f(int d) { return __int2float_rn(d); }
 
 // chunk k (of 3) of this thread's cp.async share of tile rows kb .. kb + np - 1 (K, V and V scales) into ring stage
 // st, rows >= np zeroed.  Chunk kinds are warp-uniform (i = tid + 384 k: K < 512 <= V < 1024 <= V scales < 1056).
-__device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int k) {
+// vbits: the slot's V format (8, or 4..7: rows of HD vbits / 8 bytes = 2 vbits chunks, staged at the same row offsets)
+__device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int k, int vbits) {
     const int i = threadIdx.x + A2_NT * k;
     if (i < 33 * A2_K) {
         int p, off;
@@ -619,9 +645,10 @@ __device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, cons
             src = Kq + (size_t) (kb + p) * HD + 16 * (i & 15);
         } else if (i < 32 * A2_K) {
             const int j = i - 16 * A2_K;
+            if ((j & 15) >= 2 * vbits) return; // beyond a low-bit row's bytes (never read)
             p = j >> 4;
             off = A8_KB + A8_KSB + p * HD + 16 * (j & 15);
-            src = Vq + (size_t) (kb + p) * HD + 16 * (j & 15);
+            src = Vq + (size_t) (kb + p) * (HD * vbits / 8) + 16 * (j & 15);
         } else {
             p = i - 32 * A2_K;
             off = A8_KB + A8_KSB + A8_VB + 16 * p;
@@ -631,9 +658,9 @@ __device__ __forceinline__ void a8_issue_k(uint8_t * st, const int8_t * Kq, cons
         else *reinterpret_cast<int4 *>(st + off) = make_int4(0, 0, 0, 0);
     }
 }
-__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np) {
+__device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const int8_t * Vq, const __half * Vs, int kb, int np, int vbits) {
 #pragma unroll
-    for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k);
+    for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k, vbits);
     pf::cpa_commit();
 }
 // K scales of tile rows kb ..: thread t < 256 loads position t >> 3, block t & 7; a8_st_ks stores it transposed as fp32
@@ -645,14 +672,16 @@ __device__ __forceinline__ float a8_ld_ks(const __half * Ks, int kb, int np) {
 __device__ __forceinline__ void a8_st_ks(uint8_t * st, float v) {
     if (threadIdx.x < 8 * A2_K) reinterpret_cast<float *>(st + A8_KB)[(threadIdx.x & 7) * A2_K + (threadIdx.x >> 3)] = v;
 }
-// chunk k (of 3) of this thread: 8 V values of ring stage st -> fp16 in sV (a2_q8h, as pk_attn2)
-__device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k) {
+// chunk k (of 3) of this thread: 8 V values of ring stage st -> fp16 in sV (a2_q8h / a2_q4h / a2_qnh, as pk_attn2)
+__device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, int vbits) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
-        const uint2 q = *reinterpret_cast<const uint2 *>(st + A8_KB + A8_KSB + p * HD + 8 * c);
+        const uint8_t * row = st + A8_KB + A8_KSB + p * HD;
         const __half d = reinterpret_cast<const __half *>(st + A8_KB + A8_KSB + A8_VB)[p * (HD / 32) + (c >> 2)];
         __half2 h[4];
-        a2_q8h(q, d, h);
+        if (vbits == 8) a2_q8h(*reinterpret_cast<const uint2 *>(row + 8 * c), d, h);
+        else if (vbits == 4) a2_q4h(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
+        else a2_qnh(*reinterpret_cast<const unsigned *>(row + 4 * c), kv_hi(row + 128 + c * (vbits - 4), vbits - 4), d, vbits, h);
         *reinterpret_cast<int4 *>(sV + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
@@ -685,8 +714,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
     // cache kvp / kvs give exactly the old addresses
     const size_t hrow0 = (size_t) g * cB.ctx;
+    const int vbits = cB.kvb[1][slot]; // V: q8, or q4..q7 (converted to fp16 by a8_cv_v); K must be plain q8
     const int8_t * Kq = cB.kvp[0][slot] + hrow0 * HD;
-    const int8_t * Vq = cB.kvp[1][slot] + hrow0 * HD;
+    const int8_t * Vq = cB.kvp[1][slot] + hrow0 * (HD * vbits / 8);
     const __half * Ks = cB.kvs[0][slot] + hrow0 * (HD / 32);
     const __half * Vs = cB.kvs[1][slot] + hrow0 * (HD / 32);
 
@@ -697,7 +727,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         uint8_t * st = asm_ + (it % A8_NS) * A8_STG;
         if (it < it1) {
             const int kb = it * A2_K, np = min(A2_K, pmax + 1 - kb);
-            a8_issue(st, Kq, Vq, Vs, kb, np);
+            a8_issue(st, Kq, Vq, Vs, kb, np, vbits);
             a8_st_ks(st, a8_ld_ks(Ks, kb, np));
         } else {
             pf::cpa_commit();
@@ -770,7 +800,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         pf::cpa_wait<A8_NS - 2>();
         __syncthreads();
 #pragma unroll
-        for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k);
+        for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbits);
     }
     float o[16][4];
 #pragma unroll
@@ -799,7 +829,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         float ksn = 0.f;
         if (ia < it1) {
             const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
-            a8_issue(sta, Kq, Vq, Vs, kba, npa);
+            a8_issue(sta, Kq, Vq, Vs, kba, npa, vbits);
             ksn = a8_ld_ks(Ks, kba, npa);
         } else {
             pf::cpa_commit();
@@ -841,7 +871,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
             // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
-            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1);
+            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1, vbits);
         }
         if constexpr (QROW) {
 #pragma unroll

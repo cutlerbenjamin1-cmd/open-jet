@@ -533,13 +533,22 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 
 #include "prefill_attn.cuh"
 
-// attention output * sigmoid(gate) -> fp16 xh (K = VD)
-__global__ void __launch_bounds__(256) pk_attn_out() {
+// attention output * sigmoid(gate) -> fp16 xh (K = VD, hperm order within each 16-group). One warp per head, 8 dims per
+// lane: a slot whose V is stored rotated (MK_KV "r" on V) gets its output rotated back here (WHT, its own inverse).
+__global__ void __launch_bounds__(256) pk_attn_out(int slot) {
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int j = warp; j < VD / 32; j += 8) {
-        const int e = 32 * j + lane, h = e / HD, d = e % HD;
-        const float gate = __ldg(cP.y0 + (size_t) t * QG + h * 512 + 256 + d);
-        hstore32(__ldg(cP.y2 + (size_t) t * VD + e) / (1.0f + expf(-gate)), cP.xh + (size_t) t * VD + 32 * j);
+    const bool rotv = cB.kvq8 && cB.kvrv[slot];
+    for (int h = warp; h < NH; h += 8) {
+        float v[8];
+        load8(cP.y2 + (size_t) t * VD + h * HD + lane * 8, v);
+        if (rotv) fwht256(v);
+        __half * dst = cP.xh + (size_t) t * VD + h * HD;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int d = lane * 8 + k;
+            const float gate = __ldg(cP.y0 + (size_t) t * QG + h * 512 + 256 + d);
+            dst[pf::hperm(d)] = __float2half_rn(fminf(fmaxf(v[k] / (1.0f + expf(-gate)), -65504.f), 65504.f));
+        }
     }
 }
 
