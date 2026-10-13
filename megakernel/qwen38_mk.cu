@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -4142,12 +4143,21 @@ struct MKEngine::Impl {
         // T = n_draft + 1 verify row) below drop_last; at n_draft 4 the same gates as the MAXT 5 default
         float gate_drop[MAXT - 1] = {}, gate_stop[MAXT - 1] = {0.f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f};
         float drop_last = 0.4f;
+        // context cap: from position dctx on, at most 4 drafts (T <= 5: at long context the wide pass's second
+        // head-group pass over K / V costs more than drafts 5..7 gain)
+        int dctx = INT_MAX;
 #else
         float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
 #endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
     } pol;
+    // the policy's draft depth at position pos: n_draft, or (MK_MAXT > 5) at most 4 from Policy::dctx on
+#if MK_MAXT > 5
+    int depth_top(int pos) const { return pos >= pol.dctx ? std::min(n_draft_max, 4) : n_draft_max; }
+#else
+    int depth_top(int) const { return n_draft_max; }
+#endif
 #if MK_SPEC_LOG
     FILE * slog = nullptr;               // MK_SPEC_LOG_FILE: one JSON line per decode cycle
     std::vector<float2> slog_q;          // dlog of the drafts the next cycle verifies
@@ -5461,7 +5471,8 @@ struct MKEngine::Impl {
             L.gate_stop[k] = pol.gate_stop[k];
         }
 #if MK_MAXT > 5
-        if (n_draft_max >= 1) L.gate_drop[n_draft_max - 1] = std::max(L.gate_drop[n_draft_max - 1], pol.drop_last);
+        const int top = depth_top(hctl.n); // drop_last: the deepest draft of this position's policy depth
+        if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
 #endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
@@ -6231,6 +6242,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
 // sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
+// MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts);
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -6255,6 +6267,7 @@ void MKEngine::set_policy(const std::string & spec) {
             (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
 #if MK_MAXT > 5
         else if (k == "droplast") pol.drop_last = std::stof(v); // the deepest draft (k = n_draft - 1)
+        else if (k == "dctx") pol.dctx = std::stoi(v); // from position dctx on: at most 4 drafts
 #endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
@@ -6360,7 +6373,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
-        p_->ndraft = p_->n_draft_max;
+        p_->ndraft = p_->depth_top(c.n);
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
         i += T;
@@ -6493,9 +6506,10 @@ int MKEngine::step(std::vector<int> & out) {
     // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
     // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
     const Impl::Policy & pol = p_->pol;
-    int nd = n_draft_;
-    if (pol.depth == 0) nd = (!p_->all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
-    else if (pol.depth == 2) nd = std::min(n_draft_, std::max(std::min(pol.dmin, n_draft_), 1 + p_->last_acc));
+    const int top = p_->depth_top(c.n); // n_draft (MK_MAXT > 5: at most 4 from Policy::dctx on)
+    int nd = top;
+    if (pol.depth == 0) nd = (!p_->all_acc && top > 3) ? top - 1 : top;
+    else if (pol.depth == 2) nd = std::min(top, std::max(std::min(pol.dmin, top), 1 + p_->last_acc));
     p_->ndraft = nd;
 #if MK_SPEC_LOG
     const int n0 = c.n;
