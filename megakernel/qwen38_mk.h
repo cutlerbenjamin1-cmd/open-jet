@@ -36,6 +36,12 @@ class MKEngine {
     // prompt, e.g. at the start of the generation prompt, which a follow-up turn's template may render differently
     // (thinking mode re-renders the previous turn as <think>\n\n</think>, one token before the end of the prompt).
     int prefill(const std::vector<int> & tokens, int ck_at = -1);
+    // prefill() saving checkpoints at the absolute positions cks (inside this prompt) into the checkpoint pool:
+    // MK_CK_SLOTS (default 8) checkpoints of 0.17 GB of pinned host memory each, evicted by coverage when full
+    // (older ones thin out, recent ones stay dense). ck_exact (or -1) is kept at its exact position; the others move
+    // down by up to 31 tokens onto the batched prefill's scan grid. Saving changes nothing the prefill computes.
+    // Unless ck_exact is inside the batched part, a checkpoint at the end of the prompt is saved too (as prefill()).
+    int prefill(const std::vector<int> & tokens, const std::vector<int> & cks, int ck_exact);
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
     void set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed);
@@ -49,9 +55,13 @@ class MKEngine {
     // positions folded into the recurrent state (truncate() can only go back to there).
     const std::vector<int> & sequence() const;
     int committed() const;
-    // Each prefill saves a checkpoint at the end of its prompt; rewinding to it drops everything
-    // after (also tokens before the committed position), so a prompt that diverges anywhere after
-    // the checkpoint can be re-fed from there.  Returns false when there is no checkpoint.
+    // Each prefill saves a checkpoint at the end of its prompt (or at ck_at, and at cks); rewinding to one
+    // drops everything after it (also tokens before the committed position) and the checkpoints after it, so a
+    // prompt that diverges anywhere after the checkpoint can be re-fed from there.
+    // checkpoints(): positions of the checkpoints (ascending); rewind_to(pos): restores the one at pos (false: none);
+    // checkpoint_pos() / rewind_to_checkpoint(): the last one (-1 / false: none).
+    std::vector<int> checkpoints() const;
+    bool rewind_to(int pos);
     int checkpoint_pos() const;
     bool rewind_to_checkpoint();
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.

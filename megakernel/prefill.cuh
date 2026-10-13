@@ -203,6 +203,23 @@ __global__ void pk_conv_ring(int T, int n0, int dl) {
         ring[(size_t) ((n0 + t) % CONV_RING) * QKV + c] = __ldg(cP.y0 + (size_t) t * QKV + c);
 }
 
+// Checkpoint at position P inside the chunk at n0 (pf_run): the conv ring as it is after position P - 1, i.e. slot
+// p % CONV_RING = raw qkv of p for p in [P - CONV_RING, P): the chunk's rows (y0) for p >= n0, else the ring before
+// the chunk (launched before pk_conv_ring overwrites it; slots of p < 0 are copied as they are, never read).
+__global__ void pk_ck_conv(int n0, int P, int dl, float * dst) {
+    const int p = P - CONV_RING + (int) blockIdx.x, s = (p % CONV_RING + CONV_RING) % CONV_RING;
+    const float * src = p >= n0 ? cP.y0 + (size_t) (p - n0) * QKV : cB.conv + ((size_t) dl * CONV_RING + s) * QKV;
+    for (int c = threadIdx.x; c < QKV; c += blockDim.x) dst[(size_t) s * QKV + c] = __ldg(src + c);
+}
+// ... and the h ring: slot p % H_RING = final h of p for p in lo .. lo + gridDim.x - 1, from the ring before the chunk
+// (from_ring: launched before pk_final_h overwrites it) or from the chunk's h rows (after pk_final_h).  dst: the
+// checkpoint's ring (mapped host memory, or device memory with MK_CK_DEVICE=1)
+__global__ void pk_ck_hist(int lo, int n0, int from_ring, float * dst) {
+    const int p = lo + (int) blockIdx.x, s = (p % H_RING + H_RING) % H_RING;
+    const float * src = from_ring ? cB.h_hist + (size_t) s * D : cP.h + (size_t) (p - n0 + 1) * D;
+    for (int e = threadIdx.x; e < D; e += blockDim.x) dst[(size_t) s * D + e] = __ldg(src + e);
+}
+
 // Gated delta rule over the chunk in the chunked (WY) form on tensor cores.  Per 32-token chunk,
 // with a_i = sum_{j <= i} log g_j, gamma_i = exp(a_i), state S (128 x 128, rows = key dim) at the
 // chunk start and u_i = beta_i (v_i - g_i S_{i-1}^T k_i) the delta-rule updates:
@@ -244,18 +261,21 @@ __device__ __forceinline__ void mma4(float (&c)[4], const unsigned (&a)[4], unsi
     mma16816(c, a[0], a[1], a[2], a[3], b0, b1);
 }
 
-__global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
+// Rows t0 .. t0 + T - 1 of the chunk (32-token chunks from row t0): the state is read from st_in and written to st_out
+// (one layer's [NVH][128 cols][128 rows]). Normally both are the layer's live state and t0 = 0; a checkpoint at row
+// t0 + T splits the scan there (the first part writes a staging copy that the second part reads; pf_run).
+__global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float * st_in, float * st_out) {
     __shared__ __align__(16) __half sK[DC][DC_LD], sQ[DC][DC_LD], sV[DC][DC_LV];
     __shared__ __align__(16) __half sT0[DC][DC_LP], sT1[DC][DC_LP], sP[DC][DC_LP];
     __shared__ __align__(16) float sAT[DC][DC_LA]; // A transposed: sAT[j][i] = A_ij
     __shared__ float sa[DC], sb[DC], sg[DC], sd[DC];
     const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int col0 = blockIdx.y * 64 + 8 * w; // this warp's 8 value columns
-    float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128; // [col][row]
-    float S[8][4];                                                // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
+    const float * Si = st_in + (size_t) h * 128 * 128; // [col][row]
+    float S[8][4];                                    // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
-        const float * p = Sg + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
+        const float * p = Si + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
         S[mt][0] = __ldcg(p);
         S[mt][1] = __ldcg(p + 128);
         S[mt][2] = __ldcg(p + 8);
@@ -268,16 +288,16 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
             const int i = tid + 256 * k, tt = i >> 5, c = i & 31, t = tb + tt;
-            pqk[k] = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV + (c < 16 ? 0 : NKH * 128) + kh * 128) + (c & 15))
+            pqk[k] = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) (t0 + t) * QKV + (c < 16 ? 0 : NKH * 128) + kh * 128) + (c & 15))
                            : make_uint4(0, 0, 0, 0);
         }
         const int t = tb + (tid >> 3);
-        pv = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV + 2 * NKH * 128 + h * 128 + blockIdx.y * 64) + (tid & 7))
+        pv = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) (t0 + t) * QKV + 2 * NKH * 128 + h * 128 + blockIdx.y * 64) + (tid & 7))
                    : make_uint4(0, 0, 0, 0);
         if (w == 0) {
             const int tl = tb + lane;
-            pbeta = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + NVH + h) : 0.f;
-            plg = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + h) : 0.f;
+            pbeta = tl < T ? __ldg(cP.gb + (size_t) (t0 + tl) * 96 + NVH + h) : 0.f;
+            plg = tl < T ? __ldg(cP.gb + (size_t) (t0 + tl) * 96 + h) : 0.f;
         }
     };
     auto put = [&] {
@@ -418,7 +438,7 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
             for (int hf = 0; hf < 2; hf++) {
                 const int t = tb + 16 * mt + g + 8 * hf;
                 if (t < T)
-                    *reinterpret_cast<float2 *>(cP.y2 + (size_t) t * VD + h * 128 + col0 + 2 * t4) =
+                    *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + t) * VD + h * 128 + col0 + 2 * t4) =
                         make_float2(o[mt][2 * hf], o[mt][2 * hf + 1]);
             }
 
@@ -442,7 +462,7 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
     }
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
-        float * p = Sg + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
+        float * p = st_out + (size_t) h * 128 * 128 + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
         p[0] = S[mt][0];
         p[128] = S[mt][1];
         p[8] = S[mt][2];
