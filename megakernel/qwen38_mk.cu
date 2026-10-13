@@ -164,8 +164,8 @@ constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued 
 #define MK_XP_SM 0 // MIX tile expansion: rows per tile done by the softmax warps (0: all 12 non-S warps round-robin)
 #endif
 #ifndef MK_AQ_EARLY
-#define MK_AQ_EARLY 1 // MIX: issue the interval's K / V copies at the top of the interval (0: after the MMA work, as q8)
-#endif
+#define MK_AQ_EARLY 0 // MIX: 1 = issue the interval's K / V copies at the top of the interval (measured -2% per cycle at 101.6k
+#endif                // vs after the MMA work: the copies' lead time does not limit the MIX kernel; kept as a knob)
 constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
                                       // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
