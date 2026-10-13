@@ -681,11 +681,14 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
     const int ntile = pmax / A2_K + 1;
     const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
-    const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
-    const int8_t * Kq = static_cast<const int8_t *>(cB.kc) + row0 * HD;
-    const int8_t * Vq = static_cast<const int8_t *>(cB.vc) + row0 * HD;
-    const __half * Ks = cB.ksc + row0 * (HD / 32);
-    const __half * Vs = cB.vsc + row0 * (HD / 32);
+    // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
+    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
+    // cache kvp / kvs give exactly the old addresses
+    const size_t hrow0 = (size_t) g * cB.ctx;
+    const int8_t * Kq = cB.kvp[0][slot] + hrow0 * HD;
+    const int8_t * Vq = cB.kvp[1][slot] + hrow0 * HD;
+    const __half * Ks = cB.kvs[0][slot] + hrow0 * (HD / 32);
+    const __half * Vs = cB.kvs[1][slot] + hrow0 * (HD / 32);
 
     // ring prologue: tiles it0 .. it0 + A8_NS - 2
 #pragma unroll
