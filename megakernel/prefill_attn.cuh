@@ -290,8 +290,8 @@ __device__ __forceinline__ void a2_qnh(unsigned w, unsigned hi, __half d, int bi
     h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4140)), off), dd);
     h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4342)), off), dd);
 }
-// chunk k of the tile -> fp16 rows in shared memory
-__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k, int bits = 8) {
+// chunk k of the tile -> fp16 rows in shared memory (bits has no default: a2_st_q8(r, dst, bits) is the whole-tile overload)
+__device__ __forceinline__ void a2_st_q8(const A2Q8 & r, __half * dst, int k, int bits) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
         __half2 h[4];
