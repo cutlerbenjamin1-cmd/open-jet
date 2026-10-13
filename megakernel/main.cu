@@ -21,6 +21,7 @@ static void usage() {
             "                 [--prompt-ids f]   (prompt given as whitespace-separated token ids)\n"
             "                 [--think [xhigh|medium|low]]   (reasoning mode, the chat template's default effort is xhigh)\n"
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
+            "                 [--presence-penalty p] [--frequency-penalty f]   (on the generated tokens; default 0)\n"
             "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
             "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n");
@@ -53,7 +54,7 @@ static int run(int argc, char ** argv) {
     // kernels, the decode megakernel, or (mixed) the unscored prefix through the former, like a prompt,
     // and the scored positions through the latter (the first half and the rest when all are scored)
     std::string kld_file, ref_out, score_path = "prefill";
-    float temp = 0.f, top_p = 1.f, min_p = 0.f;
+    float temp = 0.f, top_p = 1.f, min_p = 0.f, pres = 0.f, freq = 0.f;
     int top_k = 32;
     unsigned long long seed = 1;
     int kv_mode = -1;
@@ -83,6 +84,8 @@ static int run(int argc, char ** argv) {
         else if (a == "--top-k") top_k = atoi(next().c_str());
         else if (a == "--min-p") min_p = atof(next().c_str());
         else if (a == "--seed") seed = strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--presence-penalty") pres = atof(next().c_str());
+        else if (a == "--frequency-penalty") freq = atof(next().c_str());
         else if (a == "--kv") { const std::string k = next(); kv_mode = k == "f16" ? 0 : k == "q8" ? 1 : -1; }
         else if (a == "--turn2-file") { std::ifstream f(next()); std::stringstream ss; ss << f.rdbuf(); turn2 = ss.str(); }
         else usage();
@@ -142,6 +145,7 @@ static int run(int argc, char ** argv) {
 
     MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode);
     eng.set_sampling(temp, top_p, top_k, min_p, seed);
+    eng.set_penalty(pres, freq);
     if (bench_phases) {
         eng.bench_phases();
         return 0;

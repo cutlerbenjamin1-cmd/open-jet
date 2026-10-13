@@ -45,6 +45,11 @@ class MKEngine {
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
     void set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed);
+    // Presence / frequency penalty (OpenAI parameters, vLLM's semantics): each generated token's logit is lowered by
+    // frequency * c + presence * (c > 0), c = its occurrences among the tokens generated so far in this response
+    // (since the last prefill; prompt tokens do not count). Greedy and sampled; speculative verification stays exact
+    // (a verify row counts the drafts before it). 0, 0 (default): off.
+    void set_penalty(float presence, float frequency);
     // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
     // MK_POLICY sets it at construction.
     void set_policy(const std::string & spec);

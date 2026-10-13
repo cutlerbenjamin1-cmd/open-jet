@@ -194,13 +194,16 @@ the MTP block can be any of:
 | Q4_K, Q5_K | as stored |
 | Q6_K, Q8_0 | re-laid-out at load (values unchanged) |
 | IQ4_XS | re-laid-out at load into Q4_K-shaped 144-byte blocks, 4-bit indices mapped to int8 weights with `__byte_perm` |
-| Q3_K, IQ3_S | re-encoded at load as Q6_K, exactly |
+| Q3_K, IQ3_S | re-laid-out at load (values + scales streams, 114 / 112 B per 256 weights); the GEMV and the prefill GEMM
+feed exactly the integers and scales of the Q6_K re-encode they replace (`MK_REENC3=1`): bit-identical results at
+~0.54x the bytes |
 | IQ4_NL | re-encoded at load as Q8_0, exactly |
 
 `token_embd` must be Q4_K and `output` Q6_K; `ssm_alpha` / `ssm_beta` are dequantized to F32 at load
 (they are folded into fp32 rows with the norm weight). The exact re-encodes keep every weight's
 value (both formats store a small integer times the same fp16 `d` and an integer sub-block scale),
-and the loader checks each re-encoded row bit for bit against ggml's dequantization of the original.
+and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's dequantization of the
+original.
 A file with any other type is refused, naming the first tensor that does not match, and open-jet
 starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
 
@@ -249,8 +252,9 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   engine's sequence (prompts + emitted tokens), and when the re-rendered history diverges after the
   end of the previous prompt (e.g. a reformatted tool call) the engine rewinds to a checkpoint
   saved there. Anything else starts over (batched prefill, ~1500 tok/s).
-- Sampling: temperature, top_p, top_k (<= 32), min_p, seed; presence / repetition penalties are
-  ignored (with a warning). One request at a time.
+- Sampling: temperature, top_p, top_k (<= 32), min_p, seed, presence_penalty / frequency_penalty (-2..2, vLLM's
+  semantics: the tokens generated in this response); repetition_penalty is ignored (with a warning). One request at
+  a time.
 - KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).
 
 ## How it gets its speed
@@ -332,8 +336,9 @@ processing the whole conversation as one fresh prompt.
 - Specialised to this model's shapes (27B) and the weight types under [The GGUF](#the-gguf)
   (benchmarked: unsloth's Q4_K_M and UD-Q4_K_XL); the loader rejects any other model or type. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
   GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
-- Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
-  repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).
+- Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order), and presence / frequency
+  penalties on the generated tokens (applied first; greedy too; exact under speculative verification: a verify
+  row also counts the drafts before it); no repetition penalty.
 - Text only; one sequence and one checkpoint: a conversation is reused while it grows (or diverges
   only after the end of the previous prompt); editing an earlier part, e.g. context compaction,
   re-prefills it. No slot save / restore (open-jet's low-memory shell swap falls back to

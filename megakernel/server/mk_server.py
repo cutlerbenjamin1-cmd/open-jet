@@ -53,6 +53,7 @@ class Engine:
             "mk_is_eog": (ctypes.c_int, [vp, ctypes.c_int]),
             "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float,
                                                ctypes.c_ulonglong]),
+            "mk_set_penalty": (ctypes.c_int, [vp, ctypes.c_float, ctypes.c_float]),
             "mk_prefill": (ctypes.c_int, [vp, ip, ctypes.c_int]),
             "mk_prefill_ck": (ctypes.c_int, [vp, ip, ctypes.c_int, ctypes.c_int]),
             "mk_step": (ctypes.c_int, [vp, ip, ctypes.c_int]),
@@ -116,6 +117,10 @@ class Engine:
     def set_sampling(self, temp, top_p, top_k, min_p, seed):
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
+
+    def set_penalty(self, presence, frequency):
+        if self.L.mk_set_penalty(self.h, presence, frequency) < 0:
+            raise self._err("penalty")
 
     def prefill(self, toks, ck_at=-1, cks=()):
         """cks: more checkpoint positions (absolute; the engine moves them onto its scan grid), ck_at stays exact"""
@@ -415,9 +420,17 @@ class Server:
         if top_k <= 0 or top_k > TOPK_MAX:
             self.warn_once("top_k", f"top_k {top_k} -> {TOPK_MAX} (the megakernel samples from at most {TOPK_MAX} candidates)")
             top_k = TOPK_MAX
+        # presence / frequency penalty, vLLM's semantics: tokens generated in this response so far (not the prompt)
+        pen = []
         for k in ("presence_penalty", "frequency_penalty"):
-            if float(body.get(k) or 0) != 0:
-                self.warn_once(k, f"{k} is not supported by the megakernel and is ignored")
+            try:
+                v = float(body.get(k) or 0)
+            except (TypeError, ValueError):
+                raise BadRequest(f"{k} must be a number")
+            if not -2.0 <= v <= 2.0:
+                raise BadRequest(f"{k} must be in [-2, 2]")
+            pen.append(v)
+        self.eng.set_penalty(*pen)
         if float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0) != 1.0:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:

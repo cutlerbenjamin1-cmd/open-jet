@@ -102,6 +102,17 @@ int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, 
     }
 }
 
+// presence / frequency penalty (MKEngine::set_penalty); returns 0, or -1
+int mk_set_penalty(void * hp, float presence, float frequency) {
+    try {
+        static_cast<Handle *>(hp)->eng->set_penalty(presence, frequency);
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
 // draft-depth policy "key=value,..." (MKEngine::set_policy); returns 0, or -1 on a bad spec
 int mk_set_policy(void * hp, const char * spec) {
     try {
