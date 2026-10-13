@@ -726,14 +726,16 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
     // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.
     const int wsr = kv_ws(n0 + T), wsm = kv_wsm(wsr);
-    auto kbt = [&](int it) { return kv_tbits(0, slot, it * A2_K, wsr); };
-    auto vbt = [&](int it) { return kv_tbits(1, slot, it * A2_K, wsr); };
+    const KvFmt kf = kv_fmt(slot); // per-slot formats once; per tile one compare of the tile index (kv_ring_tile)
+    const int itr_k = kv_ring_tile(kf.kr, wsr, 0, A2_K), itr_v = kv_ring_tile(kf.vr, wsr, 0, A2_K);
+    auto kbt = [&](int it) { return it >= itr_k ? 8 : kf.kb; };
+    auto vbt = [&](int it) { return it >= itr_v ? 8 : kf.vb; };
     auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
         const int8_t *tk, *tv;
         const __half *tks, *tvs;
-        const int kb_ = kv_src(0, slot, g, it * A2_K, wsr, wsm, tk, tks);
-        const int vb = kv_src(1, slot, g, it * A2_K, wsr, wsm, tv, tvs);
-        a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kb_ : 8, vb);
+        kv_tile_src(0, slot, g, it * A2_K, wsr, wsm, kf.kb, it >= itr_k, tk, tks);
+        kv_tile_src(1, slot, g, it * A2_K, wsr, wsm, kf.vb, it >= itr_v, tv, tvs);
+        a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kbt(it) : 8, vbt(it));
         return a8_ld_ks(tks, 0, np);
     };
     auto expand_k = [&](int it, int r0, int rs) { // low-bit K rows r0, r0 + rs, .. of tile it (landed) -> int8 in place

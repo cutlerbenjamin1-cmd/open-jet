@@ -1788,22 +1788,39 @@ __device__ __forceinline__ int kv_tbits(int w, int slot, int p0, int ws) {
 }
 // ws % kvrc for kv_src (computed once per launch / item: a runtime integer modulo is ~25 dependent instructions)
 __device__ __forceinline__ int kv_wsm(int ws) { return cB.kvrc > 0 ? ws % cB.kvrc : 0; }
-// the tile's rows: q / s = values / scales of its first row (ring or main buffer), returns its bits. wsm = kv_wsm(ws):
-// a ring tile's row is p0 % kvrc = wsm + (p0 - ws) folded once (positions ws .. L_ctx - 1 span at most kvrc rows)
-__device__ __forceinline__ int kv_src(int w, int slot, int g, int p0, int ws, int wsm, const int8_t *& q, const __half *& s) {
-    if (cB.kvrp[w][slot] != nullptr && p0 >= ws) {
+// Per-slot KV format facts, loaded once per launch: the hot kernels then decide a tile's format and source with one integer
+// compare of the tile index against kv_ring_tile (kv_tbits / kv_src per tile cost a uniform-datapath chain with R2UR
+// conversions of the ring pointer right after the tile barrier: 10% of pk_attn8<_, true>'s stall samples, notes/kvq/ncu).
+struct KvFmt { int kb, vb, kr, vr; }; // main-buffer bits of K / V; 1 if the side has a q8 ring (MK_KV_WIN)
+__device__ __forceinline__ KvFmt kv_fmt(int slot) {
+    return {cB.kvb[0][slot], cB.kvb[1][slot], cB.kvrp[0][slot] != nullptr, cB.kvrp[1][slot] != nullptr};
+}
+// first index of the tiles of tp positions starting at position base that comes from the ring (p0 >= ws); none: INT_MAX
+__device__ __forceinline__ int kv_ring_tile(int ring, int ws, int base, int tp) {
+    return ring ? max(0, (ws - base + tp - 1) / tp) : 0x7fffffff;
+}
+// the tile's rows: q / s = values / scales of its first row (ring: the slot's q8 ring, else the main buffer of `bits`).
+// wsm = kv_wsm(ws): a ring tile's row is p0 % kvrc = wsm + (p0 - ws) folded once (positions ws .. L_ctx - 1 span at most
+// kvrc rows)
+__device__ __forceinline__ void kv_tile_src(int w, int slot, int g, int p0, int ws, int wsm, int bits, bool ring, const int8_t *& q, const __half *& s) {
+    if (ring) {
         int r0 = wsm + (p0 - ws);
         if (r0 >= cB.kvrc) r0 -= cB.kvrc;
         const size_t rr = (size_t) g * cB.kvrc + r0;
         q = cB.kvrp[w][slot] + rr * HD;
         s = cB.kvrs[w][slot] + rr * (HD / 32);
-        return 8;
+    } else {
+        const size_t row = (size_t) g * cB.ctx + p0;
+        q = cB.kvp[w][slot] + row * (HD * bits / 8);
+        s = cB.kvs[w][slot] + row * (HD / 32);
     }
+}
+// kv_tile_src with the decision made here (attn_core_t, pk_attn2: per-tile cost acceptable), returns the tile's bits
+__device__ __forceinline__ int kv_src(int w, int slot, int g, int p0, int ws, int wsm, const int8_t *& q, const __half *& s) {
+    const bool ring = cB.kvrp[w][slot] != nullptr && p0 >= ws;
     const int bits = cB.kvb[w][slot];
-    const size_t row = (size_t) g * cB.ctx + p0;
-    q = cB.kvp[w][slot] + row * (HD * bits / 8);
-    s = cB.kvs[w][slot] + row * (HD / 32);
-    return bits;
+    kv_tile_src(w, slot, g, p0, ws, wsm, bits, ring, q, s);
+    return ring ? 8 : bits;
 }
 
 #if MK_KV_EMU
@@ -2661,6 +2678,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     // MK_KV per-slot formats (MIX only): tiles are copied in the slot's format (per tile: kv_tbits, since with MK_KV_WIN the
     // tiles at positions >= wsr are the ring's q8 copies) and the low-bit ones expanded to int8 in their stage before use
     const int wsr = MIX ? kv_ws(L_ctx) : 0, wsm = MIX ? kv_wsm(wsr) : 0;
+    const KvFmt kf = MIX ? kv_fmt(slot) : KvFmt{8, 8, 0, 0}; // per-slot formats, once per launch (kv_ring_tile per item)
 
     for (int ho = 0; ho < 6; ho += HG) // (T <= 5: one pass, ho = 0)
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
@@ -2753,14 +2771,20 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         const int ntl = (c1 - c0 + TP - 1) / TP;
         auto tnp = [&](int t) { return t < ntl ? min(TP, c1 - c0 - t * TP) : -1; }; // valid rows of tile t, -1: none
-        // tile sources (MK_KV_WIN: the q8 ring for tiles at positions >= wsr, else the slot's main buffer) and formats
+        // MIX: tiles jtr_k / jtr_v .. of this chunk come from the q8 rings (MK_KV_WIN, positions >= wsr), the others from
+        // the slot's main buffer in its format: one compare per tile (kv_ring_tile)
+        const int jtr_k = MIX ? kv_ring_tile(kf.kr, wsr, c0, TP) : 0x7fffffff, jtr_v = MIX ? kv_ring_tile(kf.vr, wsr, c0, TP) : 0x7fffffff;
+        auto kbt = [&](int t) { return t >= jtr_k ? 8 : kf.kb; }; // format of K tile t (MIX; 8 otherwise)
+        auto vbt = [&](int t) { return t >= jtr_v ? 8 : kf.vb; };
         auto issue = [&](int t_, uint8_t * dk, int tk, uint8_t * dv, int tv, int nth_tid) {
             const int8_t *kq, *vq;
             const __half *ks, *vs;
             int kb_ = 8, vb_ = 8;
             if constexpr (MIX) {
-                kb_ = kv_src(0, slot, g, c0 + tk * TP, wsr, wsm, kq, ks);
-                vb_ = kv_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, vq, vs);
+                kb_ = kbt(tk);
+                vb_ = vbt(max(tv, 0));
+                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                kv_tile_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, kf.vb, max(tv, 0) >= jtr_v, vq, vs);
             } else { // all-q8 slot: the plain layout
                 const size_t kr = (size_t) g * ctx + c0 + tk * TP, vr = (size_t) g * ctx + c0 + max(tv, 0) * TP;
                 kq = cB.kvp[0][slot] + kr * HD;
@@ -2779,7 +2803,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
-            const int kb0 = kv_tbits(0, slot, c0, wsr); // K(0) -> bytes now (all warps); K(1) in interval 0
+            const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
             if (kb0 != 8) {
                 kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
                 __syncthreads();
@@ -2817,7 +2841,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
                     // MIX: a low-bit tile was expanded to biased bytes n = q + 2^(b-1) in interval jt - 1; its xm / sub make
                     // the conversion below yield the same fp16 q (aq_q8x2). All-q8: the constants fold.
-                    const int kbj = MIX ? kv_tbits(0, slot, c0 + jt * TP, wsr) : 8;
+                    const int kbj = kbt(jt);
                     const unsigned kxm = kbj == 8 ? 0x8080u : 0u, ksub = aq_sub(kbj);
                     unsigned kb[HD / 16][2];
 #pragma unroll
@@ -2872,7 +2896,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     // (MIX: a low-bit V tile was expanded to biased bytes in interval jt - 1: xm / sub as for K)
                     const uint8_t * vst = vring + (jp % NSV) * AQ_STG + 32 * wn + 4 * g8;
                     const uint8_t * vsc = vring + (jp % NSV) * AQ_STG + 256 + 2 * wn;
-                    const int vbj = MIX ? kv_tbits(1, slot, c0 + jp * TP, wsr) : 8;
+                    const int vbj = vbt(jp);
                     const unsigned vxm = vbj == 8 ? 0x80808080u : 0u, vsub = aq_sub(vbj);
 #pragma unroll
                     for (int ks = 0; ks < TP / 16; ks++) {
@@ -2970,11 +2994,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     else if (warp >= 12) { r0 = warp - 12; rs = 4; r1 = MK_XP_SM; }
                     else { r0 = MK_XP_SM + warp - 4; rs = 8; r1 = TP; }
                     if (jt + 1 < ntl) {
-                        const int kb_ = kv_tbits(0, slot, c0 + (jt + 1) * TP, wsr);
+                        const int kb_ = kbt(jt + 1);
                         if (kb_ != 8) kv_tile_expand<false>(kring + ((jt + 1) % NSK) * AQ_STG, kb_, r1, r0, rs, KVQ_ROW);
                     }
                     if (jt >= 1 && jt - 1 < ntl) {
-                        const int vb_ = kv_tbits(1, slot, c0 + (jt - 1) * TP, wsr);
+                        const int vb_ = vbt(jt - 1);
                         if (vb_ != 8) kv_tile_expand<false>(vring + ((jt - 1) % NSV) * AQ_STG, vb_, r1, r0, rs, KVQ_ROW);
                     }
                 } else {
