@@ -58,6 +58,11 @@
 #ifndef MK_DA_Q4
 #define MK_DA_Q4 1
 #endif
+// MK_WV=1: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
+// tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMV). Default 0: today's dp4a path.
+#ifndef MK_WV
+#define MK_WV 0
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -165,6 +170,9 @@ struct LayerW {
     const float *qn, *kn;
     // ffn
     Mat fg, fu, fd;
+#if MK_WV
+    Mat qkv_fm, gate_fm; // M0 (wvplumb): wv-layout copies of qkv / gate (w == nullptr: this layer's dn_proj stays dp4a)
+#endif
 };
 
 struct ModelW {
@@ -3043,6 +3051,10 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const 
 }
 
 // ---- main-model control (single thread) ----
+#if MK_WV
+#include "wv.cuh"
+#endif
+
 __device__ void main_control(int mode, int last, int T, const int * tgt, bool pen) {
     Ctl * c = cB.ctl;
     const int n = c->n;
@@ -3115,6 +3127,10 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             resid_any<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
         } else {
+#if MK_WV
+            if (W.qkv_fm.w) dn_proj_wv<T>(W, W.qkv_fm, W.gate_fm, dl, n, dn_c);
+            else
+#endif
             dn_proj<T>(W, dl, n, dn_c, sm);
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
@@ -3595,6 +3611,10 @@ bool repack_iq3s(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const
     }
     return true;
 }
+
+#if MK_WV
+#include "wv_host.cuh"
+#endif
 
 } // namespace
 
@@ -4356,6 +4376,28 @@ struct MKEngine::Impl {
         return m;
     }
 
+#if MK_WV
+    // M0 (wvplumb): a wv-layout copy of a loaded matrix (device -> host -> re-layout -> device; extra VRAM, measurement only)
+    size_t wv_dup_bytes = 0;
+    Mat wv_dup(const Mat & m) {
+        std::vector<uint8_t> w((size_t) m.N * m.rb), meta(m.type == T_Q8_0 ? (size_t) m.N * m.nd * 2 : 0);
+        CK(cudaMemcpy(w.data(), m.w, w.size(), cudaMemcpyDeviceToHost));
+        if (!meta.empty()) CK(cudaMemcpy(meta.data(), m.d, meta.size(), cudaMemcpyDeviceToHost));
+        wv_relayout(m.type, m.N, m.K, m.rb, w, meta);
+        Mat o = m;
+        uint8_t * dw = dalloc<uint8_t>(w.size(), false);
+        CK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+        o.w = dw;
+        if (!meta.empty()) {
+            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
+            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
+            o.d = reinterpret_cast<const __half *>(dm);
+        }
+        wv_dup_bytes += w.size() + meta.size();
+        return o;
+    }
+#endif
+
     QBuf qbuf(int U) {
         QBuf q;
         q.U = U;
@@ -4463,6 +4505,12 @@ struct MKEngine::Impl {
                 needq(blk(i, "attn_qkv.weight"), L.qkv.type);
                 needq(blk(i, "attn_gate.weight"), L.gate.type);
                 needq(blk(i, "ssm_out.weight"), L.sout.type);
+#if MK_WV
+                if (!mtp && wv_type(L.qkv.type) && wv_type(L.gate.type)) {
+                    L.qkv_fm = wv_dup(L.qkv);
+                    L.gate_fm = wv_dup(L.gate);
+                }
+#endif
                 L.conv = up_f32(blk(i, "ssm_conv1d.weight"), 4 * QKV);
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
@@ -4525,6 +4573,9 @@ struct MKEngine::Impl {
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
         mem_mark("weights: 64 layers + MTP");
+#if MK_WV
+        fprintf(stderr, "[mk] MK_WV: %.2f GB of wv-layout weight copies (M0 measurement build)\n", wv_dup_bytes / 1e9);
+#endif
         req_q4 = mtp_q4 != 0;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
         req_q4 = false;
