@@ -53,6 +53,9 @@ class MKEngine {
     // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
     // MK_POLICY sets it at construction.
     void set_policy(const std::string & spec);
+    // KV-cache quantisation emulation (builds with -DMK_KV_EMU=1; accuracy experiments): the MK_KV_EMU_SPEC syntax
+    // (see qwen38_mk.cu), applied to the rows stored from now on. Throws on other builds.
+    void set_kv_emu(const std::string & spec);
     // Drops emitted tokens beyond `len` sequence positions (e.g. those generated after an
     // end-of-turn token within the last cycle) before the next prefill.
     void truncate(int len);

@@ -54,6 +54,7 @@ static int run(int argc, char ** argv) {
     // kernels, the decode megakernel, or (mixed) the unscored prefix through the former, like a prompt,
     // and the scored positions through the latter (the first half and the rest when all are scored)
     std::string kld_file, ref_out, score_path = "prefill";
+    std::string kld_specs; // --kld-specs: ';'-separated MK_KV_EMU_SPEC values, scored in turn (MK_KV_EMU builds)
     float temp = 0.f, top_p = 1.f, min_p = 0.f, pres = 0.f, freq = 0.f;
     int top_k = 32;
     unsigned long long seed = 1;
@@ -76,6 +77,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--kld") kld_file = next();
         else if (a == "--ref-out") ref_out = next();
         else if (a == "--score-path") score_path = next();
+        else if (a == "--kld-specs") kld_specs = next();
         else if (a == "--turn2") turn2 = next();
         else if (a == "--prompt-ids") prompt_ids_file = next();
         else if (a == "--think") think = (i + 1 < argc && argv[i + 1][0] != '-') ? next() : "xhigh";
@@ -127,19 +129,39 @@ static int run(int argc, char ** argv) {
     };
 
     if (!kld_file.empty()) {
-        ls::Session ses(kld_file, ref_out, {}, MKEngine::n_vocab());
-        size_t longest = 0;
-        for (const ls::Seq & q : ses.seqs()) longest = std::max(longest, q.tok.size());
-        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
-        for (size_t s = 0; s < ses.seqs().size(); s++) {
-            const ls::Seq & q = ses.seqs()[s];
-            const int N = (int) q.tok.size();
-            const int mk_from = score_path == "decode" ? 0 : score_path == "prefill" ? N : q.first > 0 ? q.first : N / 2;
-            eng.score_logits(q.tok, mk_from, q.first, [&](int i0, int n, const float * l) { ses.rows((int) s, i0, n, l); });
-            fprintf(stderr, "\r%zu / %zu sequences", s + 1, ses.seqs().size());
+        // --kld-specs (MK_KV_EMU builds): the whole reference is scored once per ';'-separated MK_KV_EMU_SPEC value with
+        // one model load, each report preceded by "### KV_EMU <spec>"
+        std::vector<std::string> specs;
+        for (size_t i = 0; i <= kld_specs.size();) {
+            size_t j = kld_specs.find(';', i);
+            if (j == std::string::npos) j = kld_specs.size();
+            specs.push_back(kld_specs.substr(i, j - i));
+            i = j + 1;
         }
-        fprintf(stderr, "\n");
-        ses.report(piece);
+        size_t longest = 0;
+        {
+            ls::Session probe(kld_file, "", {}, MKEngine::n_vocab());
+            for (const ls::Seq & q : probe.seqs()) longest = std::max(longest, q.tok.size());
+        }
+        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
+        for (const std::string & sp : specs) {
+            if (!kld_specs.empty()) {
+                eng.set_kv_emu(sp);
+                printf("### KV_EMU %s\n", sp.c_str());
+                fflush(stdout);
+            }
+            ls::Session ses(kld_file, ref_out, {}, MKEngine::n_vocab());
+            for (size_t s = 0; s < ses.seqs().size(); s++) {
+                const ls::Seq & q = ses.seqs()[s];
+                const int N = (int) q.tok.size();
+                const int mk_from = score_path == "decode" ? 0 : score_path == "prefill" ? N : q.first > 0 ? q.first : N / 2;
+                eng.score_logits(q.tok, mk_from, q.first, [&](int i0, int n, const float * l) { ses.rows((int) s, i0, n, l); });
+                fprintf(stderr, "\r%zu / %zu sequences", s + 1, ses.seqs().size());
+            }
+            fprintf(stderr, "\n");
+            ses.report(piece);
+            fflush(stdout);
+        }
         return 0;
     }
 
