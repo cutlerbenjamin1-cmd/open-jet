@@ -36,7 +36,7 @@ void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::
                 }
             }
         });
-    } else { // tile-major whole blocks of BS bytes (per super-block), the meta stream likewise
+    } else { // tile-major whole blocks of BS bytes (per super-block), the meta stream likewise (MB-byte entries)
         auto tm = [&](const uint8_t * src, uint8_t * dst, int rowb, int BS) {
             const int nbk = rowb / BS;
             parallel_rows(N / 16, [&](int64_t tile) {
@@ -45,10 +45,14 @@ void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::
                         memcpy(dst + (((size_t) tile * nbk + i) * 16 + rr) * BS, src + ((size_t) tile * 16 + rr) * rowb + (size_t) i * BS, BS);
             });
         };
-        tm(w.data(), o.data(), rb, type == T_Q8_0 ? 256 : 144);
+        // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
+        // pairs), IQ3_S 96 (+ 16-B meta per block)
+        const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
+        const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
+        tm(w.data(), o.data(), rb, BS);
         if (!meta.empty()) {
             std::vector<uint8_t> om(meta.size());
-            tm(meta.data(), om.data(), (int) (meta.size() / N), 16);
+            tm(meta.data(), om.data(), (int) (meta.size() / N), MB);
             meta.swap(om);
         }
     }

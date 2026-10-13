@@ -140,8 +140,9 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 template <int TYPE, bool GLU = false, int NB = BN, int LAY = 0>
 __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
     static_assert(!GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "fused gate / up needs in-row scales");
-    static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80, "wv layout types");
-    constexpr bool FMT = LAY && (TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4); // fragment-ordered
+    static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80 || TYPE == TQ6K ||
+                      TYPE == TQ3K || TYPE == TIQ3S, "wv layout types");
+    constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
     static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
     static_assert(NB * (BM + 4) * 4 <= hm_smem<TYPE, NB>(), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256;
@@ -206,6 +207,15 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     // Q3_K / IQ3_S: the row's value stream (high bits / signs at 64 + 8 p of each block) and its smem row
     const uint8_t * vsrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb;
+    // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
+    // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
+    constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
+    if constexpr (LAY && (TYPE == TQ6K || TYPE == TQ3K || TYPE == TIQ3S)) {
+        const int rowm = row0 + (tid & (BM - 1)), nb = W.K >> 8;
+        esrc = reinterpret_cast<const uint8_t *>(W.d) + ((size_t) (rowm >> 4) * (TYPE == TIQ3S ? nb : nb / 2) * 16 + (rowm & 15)) *
+                                                            (TYPE == TIQ3S ? 16 : 36);
+        vsrc = W.w + ((size_t) (rowm >> 4) * nb * 16 + (rowm & 15)) * BLK;
+    }
     const unsigned rdst = (tid & (BM - 1)) * SR;
     const __half * xsrc[XIT];
     unsigned xdst[XIT];
@@ -240,8 +250,8 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             }
         if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
             if (tid < BM) {
-                cpa4(s + edst, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
-                cpa4(s + edst + 4, esrc + (sb >> 1) * 36 + 32);
+                cpa4(s + edst, esrc + (sb >> 1) * EST + 16 * (sb & 1) + 4 * p);
+                cpa4(s + edst + 4, esrc + (sb >> 1) * EST + 32);
             }
         } else if constexpr (TYPE == TQ80) {
             if (tid < BM) {
@@ -250,14 +260,14 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             }
         } else if constexpr (TYPE == TQ3K) { // high bits of the stage's two units | sc[4p..4p+3] | the pair's two d
             if (tid < BM) {
-                cpa8(s + rdst + 16, vsrc + sb * BLK + 64 + 8 * p);
-                cpa4(s + rdst + 24, esrc + (sb >> 1) * 36 + 16 * (sb & 1) + 4 * p);
-                cpa4(s + rdst + 28, esrc + (sb >> 1) * 36 + 32);
+                cpa8(s + rdst + 16, vsrc + sb * VST + 64 + 8 * p);
+                cpa4(s + rdst + 24, esrc + (sb >> 1) * EST + 16 * (sb & 1) + 4 * p);
+                cpa4(s + rdst + 28, esrc + (sb >> 1) * EST + 32);
             }
         } else if constexpr (TYPE == TIQ3S) { // the block's meta (qh[8] | scales[4] | d) | signs of the stage's two units
             if (tid < BM) {
-                cpa16(s + rdst + 16, esrc + sb * 16);
-                cpa8(s + rdst + 32, vsrc + sb * BLK + 64 + 8 * p);
+                cpa16(s + rdst + 16, esrc + sb * EST);
+                cpa8(s + rdst + 32, vsrc + sb * VST + 64 + 8 * p);
             }
         }
 #pragma unroll

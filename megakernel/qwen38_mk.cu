@@ -63,6 +63,20 @@
 #ifndef MK_WV
 #define MK_WV 0
 #endif
+// MK_WV_FMK=1: Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS (the first M1 layout); default 0: tile-major whole
+// blocks (prefill GEMMs read whole 16-B chunks: the FM order cost the prefill ~4%; notes/agent_wvplumb.md "wvplumb2")
+#ifndef MK_WV_FMK
+#define MK_WV_FMK 0
+#endif
+// MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
+// ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),
+// the conv ring has 16 slots, and the attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
+#ifndef MK_MAXT
+#define MK_MAXT 5
+#endif
+#if MK_MAXT < 5 || MK_MAXT > 8 || (MK_MAXT > 5 && !MK_WV)
+#error "MK_MAXT must be 5, or 6..8 with MK_WV=1"
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -105,11 +119,14 @@ constexpr int D = 5120, FF = 17408, VOCAB = 248320, NL = 64, NLA = 65;
 constexpr int NH = 24, NKV = 4, HD = 256;
 constexpr int NKH = 16, NVH = 48, HK = 128;
 constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
-constexpr int MAXT = 5;
+constexpr int MAXT = MK_MAXT;
+constexpr int MAXT_PF = 5; // rows of prefill-mode and scoring launches (T >= 6 runs only as a decode verify pass)
 constexpr int NT = 512, NW = NT / 32;
 constexpr float EPS = 1e-6f;
 constexpr float ROPE_BASE = 10000000.0f;
-constexpr int CONV_RING = 8, KV_RING = 16, H_RING = 16;
+// conv ring: dn_proj writes positions n .. n + T - 1 while dn_core reads n - 3 .. n + T - 1 (T + 3 slots)
+constexpr int CONV_RING = MAXT > 5 ? 16 : 8, KV_RING = 16, H_RING = 16;
+static_assert(MAXT + 3 <= CONV_RING && 2 * MAXT - 1 <= KV_RING, "rings");
 constexpr int KVGB = NKH * HK + NVH * HK + 2 * NVH; // k | v | g | beta
 constexpr int KVGB_V = NKH * HK, KVGB_G = KVGB_V + NVH * HK, KVGB_B = KVGB_G + NVH;
 constexpr int N_ATT_SLOTS = 17; // 16 trunk attention layers + MTP block
@@ -203,7 +220,7 @@ struct Ctl {
     int n_out, out[8];
     int n_acc;
     int mtp_R, mtp_logits, mtp_P;
-    int mtp_pos[8], mtp_tok[8];
+    int mtp_pos[MAXT + 3], mtp_tok[MAXT + 3]; // MTP catch-up rows (<= T + 1)
     int tgt[8];
     // draft confidence: dconf[k] = the MTP's own softmax probability of draft k + 1 (tok[k + 1]) over the
     // draft vocabulary, dchain = their running product; nd_prod = drafts this launch produced (the
@@ -280,7 +297,7 @@ struct Launch {
     // draft early stop on the MTP's confidence f (its softmax top-1 probability, or with gate_chain the
     // running product over this launch's drafts), per draft index k: f < gate_drop[k] drops the draft and
     // stops drafting, f < gate_stop[k] keeps it and stops. All 0: off (always Launch::ndraft drafts).
-    float gate_drop[4], gate_stop[4];
+    float gate_drop[MAXT - 1], gate_stop[MAXT - 1];
     int gate_chain;
     // sampling: draft from the MTP's own sampling distribution q' and verify with min(1, p / q') plus the
     // residual max(0, p - q') (distribution-exact; higher acceptance than argmax drafts at temp 1)
@@ -1372,6 +1389,27 @@ __device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, 
         if ((lane >> 1) == t) base[t * stride + idx + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
 }
 
+#if MK_WV
+// MK_WV builds: one store functor type for every gemv_pairs call site. A lambda per site made one gemv_pairs instance per
+// (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB for the merged MK_WV build;
+// notes/agent_wvplumb.md "wvplumb2"). Rows t of base (or, ring >= 0, the conv ring rows (ring + t) % CONV_RING), scaled by
+// the RMS-norm scale s_rs[t]: the stores of dn_proj's / attn_proj's lambdas, the same values.
+struct PairOut {
+    float * base;
+    int stride, ring;
+    template <int T> __device__ __forceinline__ void operator()(int r, const float (&a)[2][T]) const {
+        const int lane = threadIdx.x & 31;
+        const float * s_rs = misc(nullptr);
+#pragma unroll
+        for (int t = 0; t < T; t++)
+            if ((lane >> 1) == t) {
+                const int row = ring >= 0 ? (ring + t) % CONV_RING : t;
+                base[row * stride + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
+            }
+    }
+};
+#endif
+
 // delta-net input projections: alpha/beta (fp32), qkv -> conv ring, z
 template <int T>
 __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, uint8_t * /*sm*/) {
@@ -1422,6 +1460,10 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
         store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
     }
+#if MK_WV
+    gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, PairOut{conv, QKV, n});
+    gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z, PairOut{cB.z, VD, -1});
+#else
     gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
         const int lane = threadIdx.x & 31;
 #pragma unroll
@@ -1431,6 +1473,7 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     });
     gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
                          [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
+#endif
     // Warm L2 with what dn_core will read, while the other blocks are still projecting:
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
@@ -2073,9 +2116,15 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     const SX sx = make_sx(sm, U_D);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const int nq = QG / 2, nk = KVD / 2;
+#if MK_WV
+    gemv_pairs_any<T, 5>(W.q, 0, nq, PairOut{cB.qbuf, QG, -1});
+    gemv_pairs_any<T, 5>(W.k, nq, nq + nk, PairOut{cB.kbuf, KVD, -1});
+    gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, PairOut{cB.vbuf, KVD, -1});
+#else
     gemv_pairs_any<T, 5>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
     gemv_pairs_any<T, 5>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
     gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
+#endif
     // Warm L2 with what attn_core reads first: q/k norm weights, RoPE rows of the new positions,
     // and the first K / V tile of this block's attention item (positions < n).
     pf_block(W.qn, HD * 4);
@@ -2474,10 +2523,14 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
 
 // MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 (MK_KV), the q4
 // fragments converted with q4_to_f16's values (aq_x2p), so the partials equal attn_core_t's for every MK_KV format.
+// T >= 6 (MK_MAXT > 5; all-q8 slots, MIX = false): 6 T > 32 query rows do not fit shared memory, so the items run twice,
+// over query heads 0-2 and 3-5 of each kv head (HG = 3, partial rows ho T ..); the second pass re-reads K / V and skips the
+// K / V store (the first pass of the same item, in the same block, wrote those rows). Per-row arithmetic is unchanged.
 template <int T, bool MIX = false>
 __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
-    constexpr int R = 6 * T;
+    constexpr int HG = T > 5 ? 3 : 6; // query heads per pass
+    constexpr int R = HG * T;
     constexpr int MT = (R + 15) / 16; // 16-row MMA tiles of query rows
     constexpr int TP = ATP;
     constexpr int LDH = HD + 8;
@@ -2506,6 +2559,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     // (per tile: kv_tbits, since with MK_KV_WIN the tiles at positions >= wsr are the ring's q8 copies)
     const int wsr = MIX ? kv_ws(L_ctx) : 0;
 
+    for (int ho = 0; ho < 6; ho += HG) // (T <= 5: one pass, ho = 0)
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c = item % nch;
         int c0, c1;
@@ -2517,7 +2571,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = min(warp + 16 * k2, R - 1);
-            const int hq = r / T, t = r % T, head = g * 6 + hq;
+            const int hq = r / T, t = r % T, head = g * 6 + ho + hq;
             load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
             const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
 #pragma unroll
@@ -2557,7 +2611,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 }
             }
         }
-        const int pn0 = max(c0, n), pn1 = min(c1, n + T);
+        const int pn0 = max(c0, n), pn1 = ho ? pn0 : min(c1, n + T); // (the first head-group pass stores)
         for (int pp = pn0 + warp; pp < pn1; pp += NW) {
             const int t = pp - n;
             float v[8];
@@ -2829,18 +2883,18 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 for (int j = 0; j < 4; j++) {
                     const int r0 = 16 * i + g8, d0 = 32 * wn + 8 * tig + j; // columns 2 tig, 2 tig + 1: dims d0, d0 + 4
                     if (r0 < R) {
-                        float * o = cB.apart + ((size_t) item * AR + r0) * 256 + d0;
+                        float * o = cB.apart + ((size_t) item * AR + ho * T + r0) * 256 + d0;
                         o[0] = acc[i][j][0];
                         o[4] = acc[i][j][1];
                     }
                     if (r0 + 8 < R) {
-                        float * o = cB.apart + ((size_t) item * AR + r0 + 8) * 256 + d0;
+                        float * o = cB.apart + ((size_t) item * AR + ho * T + r0 + 8) * 256 + d0;
                         o[0] = acc[i][j][2];
                         o[4] = acc[i][j][3];
                     }
                 }
         }
-        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM[tid], sL[tid]);
+        if (tid < R) cB.aml[item * AR + ho * T + tid] = make_float2(sM[tid], sL[tid]);
         __syncthreads();
     }
 }
@@ -2861,6 +2915,10 @@ __device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
 // one-tile chunks (the pipeline fill does not pay there) and with MK_DATTN=0. Every choice gives the same partials.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
+    if constexpr (T > 5) { // MK_MAXT > 5: all-q8 slots only (checked by the host), the pipelined kernel at every context
+        attn_core_q8<T>(W, slot, n);
+        return;
+    } else
     if (cB.kvq8) {
 #if MK_DA_ROUTE || MK_DA_Q4
         // one call site per kernel: attn_core_t is force-inlined, a second site would duplicate it
@@ -3040,7 +3098,8 @@ __device__ __noinline__ void tk_grid_chain(int t, float * tv, int * ti, int * ts
     ti[a] = id;
     ts[a] = s;
 }
-constexpr int SM_CAND = 32768; // sampled lm_head: the final candidate rows [MAXT][32] (value, id) in shared memory,
+// sampled lm_head: the final candidate rows [MAXT][32] (value, id) in shared memory, above the top-k merge lists,
+constexpr int SM_CAND = MAXT * 16 * 32 * 12 > 32768 ? MAXT * 16 * 32 * 12 : 32768;
 constexpr int SM_DQ = SM_CAND + MAXT * 32 * 8; // and the drafts' proposals q' staged for sample_targets
 constexpr int SM_LSE = SM_DQ + MAXT * 32 * 8;   // the draft lm_head's per-block (max, sum of exp), [gridDim.x]
 static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + 128 * 8 <= SM_MISC, "top-k merge shared memory");
@@ -3054,7 +3113,10 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + 128 * 8 <= SM_MISC, "to
 // PEN: presence / frequency penalty (Launch::pres / freq) on the true logits, the occurrences of a token = its count in
 // cB.pcnt plus its occurrences in ctl->tok[1 .. nx0 + t] (the drafts in row t's context; nx0: the drafts before row 0).
 // Every value is then the true logit minus the penalty (correctly rounded, no contraction: the same in any T).
-constexpr int LM_LSE = 240, LM_BEST = 241, LM_WLSE = 208; // misc() slots ([LM_WLSE, +2 * NW): per-warp lse)
+// misc() slots ([LM_WLSE, +2 * NW): per-warp lse), above the argmax lists [16, 16 + 2 NW MAXT) and s_last (LM_LAST)
+constexpr int LM_WLSE = MAXT > 5 ? 16 + 2 * NW * MAXT : 208, LM_LSE = LM_WLSE + 32, LM_BEST = LM_LSE + 1;
+constexpr int LM_LAST = MAXT > 5 ? LM_BEST + 1 : 200;
+static_assert(LM_LAST < 400 && (MAXT == 5 || LM_WLSE >= 16 + 2 * NW * MAXT), "lm_head misc slots (s_tok at 400)");
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
     return __fsub_rn(__fsub_rn(__fmul_rn(a, sc), __fmul_rn(freq, (float) c)), c > 0 ? pres : 0.f);
 }
@@ -3079,10 +3141,10 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     float lm_m = -INFINITY, lm_s = 0.f; // LSE: running max / sum of exp (warp-uniform)
     const Mat head = draft ? cW.head_d : cW.head;
-    int xt[4]; // PEN: the drafts tok[1..4] (only the first nx0 + t count for row t)
+    int xt[MAXT - 1]; // PEN: the drafts tok[1..MAXT - 1] (only the first nx0 + t count for row t)
     if constexpr (PEN) {
 #pragma unroll
-        for (int i = 0; i < 4; i++) xt[i] = ((volatile Ctl *) cB.ctl)->tok[1 + i];
+        for (int i = 0; i < MAXT - 1; i++) xt[i] = ((volatile Ctl *) cB.ctl)->tok[1 + i];
     }
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
@@ -3106,7 +3168,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             for (int t = 0; t < TL; t++) {
                 int e0 = c0, e1 = c1;
 #pragma unroll
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < MAXT - 1; i++)
                     if (i < nx0 + t) {
                         e0 += xt[i] == p0;
                         e1 += xt[i] == p1;
@@ -3200,7 +3262,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     __threadfence();
     __syncthreads();
-    int * s_last = reinterpret_cast<int *>(m + 200);
+    int * s_last = reinterpret_cast<int *>(m + LM_LAST);
     if (tid == 0) s_last[0] = (atomicAdd(cB.cnt, 1u) == gridDim.x - 1);
     __syncthreads();
     if (!s_last[0]) return false;
@@ -3448,7 +3510,7 @@ __device__ void main_control(int mode, int last, int T, const int * tgt, bool pe
     const int m = c->mtp_valid;
     const int P = bonus >= 0 ? n + a + 1 : n + T - 1;
     int R = 0;
-    for (int p = m; p <= P && R < 8; p++, R++) {
+    for (int p = m; p <= P && R < MAXT + 3; p++, R++) {
         c->mtp_pos[R] = p;
         c->mtp_tok[R] = (p >= n && p <= n + a) ? c->tok[p - n] : bonus;
     }
@@ -3482,9 +3544,13 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         const LayerW & W = cW.L[L];
         const float * wnext = (L + 1 < NL) ? cW.L[L + 1].attn_norm : cW.onorm;
 #if MK_WV
-        // wv phases where at least one matrix of the phase is in the wv layout (the others: dp4a, per tensor at every T)
+        // wv phases where at least one matrix of the phase is in the wv layout (the others: dp4a, per tensor at every T).
+        // T >= 6 (MK_MAXT > 5): always the wv phase functions (their dp4a part runs the hybrid types, the only ones not in
+        // the wv layout there), and every main-layer ffn_down is in the wv layout (the loader checks it).
+        constexpr bool WIDE = T > 5;
         if (W.attn) {
-            if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(W, L / 4, n);
+            if constexpr (WIDE) attn_proj_wv<T>(W, L / 4, n);
+            else if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(W, L / 4, n);
             else attn_proj<T>(W, L / 4, n, sm);
             gsync(epoch, PH_ATTN_PROJ);
             attn_core<T>(W, L / 4, n, sm);
@@ -3492,23 +3558,26 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             attn_combine<T>(n, 0, L / 4);
             gsync(epoch, PH_ATTN_COMB);
             if (W.o.fm) resid_wv<T, false, VD>(W.o, cB.qo, W.post_norm, 0);
-            else resid_any<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
+            else resid_dp<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
         } else {
-            if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, dl, n, dn_c);
+            if constexpr (WIDE) dn_proj_wv<T>(W, dl, n, dn_c);
+            else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, dl, n, dn_c);
             else dn_proj<T>(W, dl, n, dn_c, sm);
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
             if (W.sout.fm) resid_wv<T, false, VD>(W.sout, cB.qo, W.post_norm, 0);
-            else resid_any<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
+            else resid_dp<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_SOUT);
             dl++;
         }
-        if (W.fg.fm || W.fu.fm) ffn_gu_wv<T>(W);
+        if constexpr (WIDE) ffn_gu_wv<T>(W);
+        else if (W.fg.fm || W.fu.fm) ffn_gu_wv<T>(W);
         else ffn_gu<T>(W, sm);
         gsync(epoch, PH_FFN_GU);
-        if (W.fd.fm) resid_wv<T, true, FF>(W.fd, cB.qa, wnext, 1);
+        if constexpr (WIDE) resid_wv<T, true, FF>(W.fd, cB.qa, wnext, 1);
+        else if (W.fd.fm) resid_wv<T, true, FF>(W.fd, cB.qa, wnext, 1);
         else resid_any<T, 17>(W.fd, cB.qa, cB.x, true, wnext, sm);
         gsync(epoch, PH_FFN_DOWN);
 #else
@@ -3543,13 +3612,25 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     int tl = 0;
     const bool sampling = P.temp > 0.0f && !P.score;
     const bool pen = (P.pres != 0.f || P.freq != 0.f) && !P.score; // (the first token of a response has nothing to penalise)
+    // The wide pass (MK_MAXT > 5, T = MAXT): decode launches of P.T = 6 .. MAXT rows run as one MAXT-row pass; the rows
+    // P.T .. MAXT - 1 are padding (stale ctl tokens: their K / V, conv, delta-net ring and h rows land at future
+    // positions, rewritten before any real row reads them; real rows never attend to them, and the host keeps
+    // positions n + 1 .. n + MAXT in one attention partition). Only rows < P.T reach the verify / control.
+    // (Prefill and scoring launches stay at T <= 5: no FULL lm_head here.)
+#if MK_MAXT > 5
+    const int Tr = T == MAXT ? P.T : T;
+#else
+    constexpr int Tr = T;
+#endif
     if (P.mode == MODE_DECODE || P.score) {
         if (sampling) am_last = pen ? lm_head<T, true, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
                                     : lm_head<T, true>(0, false, sm, s_tok);
-        else if (P.score == 2) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
-        else am_last = pen ? lm_head<T, false, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
-                           : lm_head<T>(0, false, sm, s_tok);
-        tl = T;
+        else if (P.score == 2) {
+            if constexpr (T <= 5) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
+            else am_last = false;
+        } else am_last = pen ? lm_head<T, false, false, false, true>(0, false, sm, s_tok, nullptr, P.pres, P.freq, 0)
+                             : lm_head<T>(0, false, sm, s_tok);
+        tl = Tr;
     } else if (P.last) {
         am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
         tl = 1;
@@ -3560,9 +3641,9 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         int tg[MAXT];
         for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
-            sample_targets(P, T, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+            sample_targets(P, Tr, tl, tg, reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
-        main_control(P.mode, P.last, T, P.score ? s_tok + T - 1 : tg, pen);
+        main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen);
         __threadfence();
     }
     gsync(epoch, PH_LMHEAD);
@@ -3672,6 +3753,11 @@ __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     main_forward<T>(P, sm, epoch);
 }
+#if MK_MAXT > 5
+// T = 6 .. MAXT: one MAXT-row pass (padding rows, see main_forward), out of line: a separate function keeps mk_cycle (and
+// ptxas's memory for it) at the size of the MAXT 5 kernel
+__device__ __noinline__ void run_wide(const Launch & P, unsigned & epoch) { main_forward<MAXT>(P, smem, epoch); }
+#endif
 
 template <int T>
 __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & epoch) {
@@ -3724,6 +3810,9 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         case 3: run_main<3>(P, sm, epoch); break;
         case 4: run_main<4>(P, sm, epoch); break;
         case 5: run_main<5>(P, sm, epoch); break;
+#if MK_MAXT > 5
+        default: run_wide(P, epoch); break; // T = 6 .. MAXT
+#endif
     }
     if (P.ndraft == 0 || P.score) return;
     volatile Ctl * vc = cB.ctl;
@@ -3731,7 +3820,7 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     const bool lg = vc->mtp_logits;
     int done = 0;
     while (done < Rtot) {
-        const int R = min(MAXT, Rtot - done);
+        const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
         const bool last_pass = done + R == Rtot;
         const bool want = lg && last_pass && P.ndraft > 0;
         switch (R) {
@@ -4048,7 +4137,14 @@ struct MKEngine::Impl {
         int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
         int dmin = 1;
+#if MK_MAXT > 5
+        // generalised gate (any depth): stop after draft k >= 1 below 0.4, drop the deepest draft (k = n_draft - 1, the
+        // T = n_draft + 1 verify row) below drop_last; at n_draft 4 the same gates as the MAXT 5 default
+        float gate_drop[MAXT - 1] = {}, gate_stop[MAXT - 1] = {0.f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f};
+        float drop_last = 0.4f;
+#else
         float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
+#endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
     } pol;
@@ -4695,6 +4791,9 @@ struct MKEngine::Impl {
                     memcpy(mp + 32 + 2 * (b & 1), &dbits, 2);
                 }
             });
+#if MK_MAXT > 5
+            if (wv_lay && wv_fd) wv_relay(m, q, meta); // main-layer ffn_down: tile-major values and meta pairs
+#endif
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
             uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
@@ -4749,6 +4848,9 @@ struct MKEngine::Impl {
                 if (!(q3 ? repack_q3k(src, qo, mo, nb, f.data()) : repack_iq3s(src, qo, mo, nb, f.data(), grid))) exact = false;
             });
             if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S repack is not exact");
+#if MK_MAXT > 5
+            if (wv_lay && wv_fd) wv_relay(m, q, meta); // main-layer ffn_down: tile-major values and meta
+#endif
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
             uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
@@ -4817,7 +4919,8 @@ struct MKEngine::Impl {
 
 #if MK_WV
     // the matrices of the main layers (set while they load) of the wv types are re-laid-out on the host before the upload
-    bool wv_lay = false;
+    // (MK_MAXT > 5: wv_fd while a main layer's ffn_down loads: its Q6_K / Q3_K / IQ3_S too)
+    bool wv_lay = false, wv_fd = false;
     int wv_n = 0;
     double wv_s = 0;
     void wv_relay(Mat & m, std::vector<uint8_t> & w, std::vector<uint8_t> & meta) {
@@ -4995,7 +5098,14 @@ struct MKEngine::Impl {
             }
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
+#if MK_MAXT > 5
+            wv_fd = true;
+#endif
             L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D);
+#if MK_MAXT > 5
+            wv_fd = false;
+            if (!mtp && !L.fd.fm) throw std::runtime_error(blk(i, "ffn_down.weight") + ": MK_MAXT > 5 needs every ffn_down in the wv layout");
+#endif
             needq(blk(i, "ffn_gate.weight"), L.fg.type);
             needq(blk(i, "ffn_up.weight"), L.fu.type);
             needq(blk(i, "ffn_down.weight"), L.fd.type);
@@ -5003,7 +5113,8 @@ struct MKEngine::Impl {
         mem_mark("weights: 64 layers + MTP");
 #if MK_WV
         wv_lay = false;
-        fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; Q6_K / Q3_K / IQ3_S stay on dp4a)\n", wv_n, wv_s);
+        fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; %s), MAXT %d\n", wv_n, wv_s,
+                MAXT > 5 ? "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a" : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
 #endif
         req_q4 = mtp_q4 != 0;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -5345,10 +5456,13 @@ struct MKEngine::Impl {
 
     void launch(int mode, int T, int last, int score = 0) {
         Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < MAXT - 1; k++) {
             L.gate_drop[k] = pol.gate_drop[k];
             L.gate_stop[k] = pol.gate_stop[k];
         }
+#if MK_MAXT > 5
+        if (n_draft_max >= 1) L.gate_drop[n_draft_max - 1] = std::max(L.gate_drop[n_draft_max - 1], pol.drop_last);
+#endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
         if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
@@ -5536,6 +5650,11 @@ struct MKEngine::Impl {
         mmh_attr<pf::TQ4K, true, 1>();
         mmh_attr<pf::TQ5K, true, 1>();
         mmh_attr<pf::TIQ4, true, 1>();
+#if MK_MAXT > 5
+        mmh_attr<pf::TQ6K, false, 1>();
+        mmh_attr<pf::TQ3K, false, 1>();
+        mmh_attr<pf::TIQ3S, false, 1>();
+#endif
 #endif
         if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
             pf_bn_force = atoi(e);
@@ -5650,6 +5769,11 @@ struct MKEngine::Impl {
                 case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;
+#if MK_MAXT > 5
+                case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O); return;
+                case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O); return;
+                case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O); return;
+#endif
                 default: throw std::runtime_error("gemm: unsupported weight type in the wv layout");
             }
         }
@@ -6086,6 +6210,17 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
+#if MK_MAXT > 5
+    if (n_draft > 4) { // the wide pass (T >= 6) runs the all-q8 decode attention only (attn_core<T > 5>)
+        bool q8 = p_->hb.kvq8;
+        for (int s = 0; s < N_ATT_SLOTS; s++) q8 = q8 && p_->hb.kvb[0][s] == 8 && p_->hb.kvb[1][s] == 8;
+        if (!q8) {
+            delete p_;
+            p_ = nullptr;
+            throw std::runtime_error("n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV)");
+        }
+    }
+#endif
     reset();
     if (const char * pol = getenv("MK_POLICY")) set_policy(pol);
 #if MK_SPEC_LOG
@@ -6099,7 +6234,8 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
-    float dk[4] = {-1.f, -1.f, -1.f, -1.f}, sk[4] = {-1.f, -1.f, -1.f, -1.f}; // per-draft overrides
+    float dk[MAXT - 1], sk[MAXT - 1]; // per-draft overrides
+    for (int j = 0; j < MAXT - 1; j++) dk[j] = sk[j] = -1.f;
     size_t i = 0;
     while (i < spec.size()) {
         size_t j = spec.find(',', i);
@@ -6115,14 +6251,17 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "drop") for (float & x : pol.gate_drop) x = std::stof(v);
         else if (k == "stop") for (float & x : pol.gate_stop) x = std::stof(v);
         else if (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0) && k[4] >= '1' &&
-                 k[4] <= '4') // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
+                 k[4] < '1' + MAXT - 1) // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
             (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
+#if MK_MAXT > 5
+        else if (k == "droplast") pol.drop_last = std::stof(v); // the deepest draft (k = n_draft - 1)
+#endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
         else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
         else throw std::runtime_error("policy: unknown key " + k);
     }
-    for (int j = 0; j < 4; j++) {
+    for (int j = 0; j < MAXT - 1; j++) {
         if (dk[j] >= 0.f) pol.gate_drop[j] = dk[j];
         if (sk[j] >= 0.f) pol.gate_stop[j] = sk[j];
     }
@@ -6216,7 +6355,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         c.mtp_valid = c.dn_c;
     }
     while (i < feed.size()) {
-        const int T = att_cap_T(c.dn_c, (int) std::min<size_t>(MAXT, feed.size() - i));
+        const int T = att_cap_T(c.dn_c, (int) std::min<size_t>(MAXT_PF, feed.size() - i));
         const bool last = i + T == feed.size();
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
@@ -6292,7 +6431,7 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     size_t i = 0;
     while (i < tokens.size()) {
-        const int T = att_cap_T((int) i, (int) std::min<size_t>(MAXT, tokens.size() - i));
+        const int T = att_cap_T((int) i, (int) std::min<size_t>(MAXT_PF, tokens.size() - i));
         c.n = (int) i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -6319,7 +6458,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     c.dn_c = mk_from;
     std::vector<float> rows((size_t) MAXT * VOCAB);
     for (int i = mk_from; i < N;) {
-        const int T = att_cap_T(i, std::min(MAXT, N - i));
+        const int T = att_cap_T(i, std::min(MAXT_PF, N - i));
 #if MK_KV_EMU
         p_->kv_demote_to(i - p_->hb.kvemu_win); // recent-window emulation
 #endif
@@ -6343,7 +6482,13 @@ int MKEngine::step(std::vector<int> & out) {
     if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full");
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
+#if MK_MAXT > 5
+    // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
+    int T = att_cap_T(c.n, 1 + p_->nd_avail);
+    if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5;
+#else
     const int T = att_cap_T(c.n, 1 + p_->nd_avail);
+#endif
     // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
     // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
     // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
