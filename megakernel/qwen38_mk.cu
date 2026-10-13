@@ -4243,13 +4243,25 @@ struct MKEngine::Impl {
         seq.resize(s.pos);
         for (auto & o : ck) // later checkpoints belong to the abandoned continuation
             if (o.pos > s.pos) o.pos = -1;
-        if (hb.kvwin > 0 && s.pos > 0) { // MK_KV_WIN: the window's ring rows may hold the abandoned continuation's positions
-            const int p0 = std::max(0, s.pos - hb.kvrc);
-            k_ring_refill<<<std::min(1024, (s.pos - p0) * NKV * N_ATT_SLOTS * 2 / 8 + 1), 256>>>(p0, s.pos);
-            CK(cudaGetLastError());
-        }
+        ring_rewind(s.pos);
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore to %d enqueued in %.2f ms\n", s.pos, ck_ms);
+    }
+    // MK_KV_WIN: the sequence goes back to position P (checkpoint restore, truncate). The abandoned positions P .. kv_top - 1
+    // (kv_top: every launch's rows, draft rows included) occupied the ring slots of the window rows P - kvrc .. kv_top - kvrc - 1,
+    // so exactly those rows are refilled from the main buffer (they stay at its precision until they age out of the window;
+    // a fresh prefill of the same text has them at q8). Positions >= P are rewritten before they are read.
+    int kv_top = 0;
+    void ring_rewind(int P) {
+        if (hb.kvwin > 0) {
+            const int p0 = std::max(0, P - hb.kvrc), p1 = std::min(P, kv_top - hb.kvrc);
+            if (p1 > p0) {
+                k_ring_refill<<<std::min(1024, (p1 - p0) * NKV * N_ATT_SLOTS * 2 / 8 + 1), 256>>>(p0, p1);
+                CK(cudaGetLastError());
+            }
+            if (memlog) fprintf(stderr, "[mk-mem] KV window ring: rewind to %d (rows written to %d), refilled %d rows\n", P, kv_top, std::max(0, p1 - p0));
+        }
+        kv_top = std::min(kv_top, P);
     }
     int ck_find(int pos) const {
         for (int i = 0; i < (int) ck.size(); i++)
@@ -5093,10 +5105,14 @@ struct MKEngine::Impl {
             if (want_kv && getenv("MK_KV_WIN") && atoi(getenv("MK_KV_WIN")) > 0) {
                 hb.kvwin = atoi(getenv("MK_KV_WIN"));
                 hb.kvrc = ((hb.kvwin + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET;
+                // MK_KV_WIN_ALL=1 (test knob): rings for the q8 sides too. Their ring rows are the same q8 rows as the main
+                // buffer (and k_ring_refill re-stores a q8 row exactly), so output must stay byte-identical to no window:
+                // exercises the ring write / read / refill paths with an exact expectation.
+                const bool win_all = getenv("MK_KV_WIN_ALL") && atoi(getenv("MK_KV_WIN_ALL")) != 0;
                 int nr = 0;
                 for (int w = 0; w < 2; w++)
                     for (int s = 0; s < N_ATT_SLOTS; s++)
-                        if (hb.kvb[w][s] != 8) {
+                        if (hb.kvb[w][s] != 8 || win_all) {
                             hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
                             hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
                             ring_bytes += (size_t) NKV * hb.kvrc * (HD + HD / 16);
@@ -5242,6 +5258,7 @@ struct MKEngine::Impl {
     }
 
     void launch(int mode, int T, int last, int score = 0) {
+        kv_top = std::max(kv_top, hctl.n + T + ndraft); // rows hctl.n .. + T - 1, the MTP's draft rows after them (ring_rewind)
         Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
         for (int k = 0; k < 4; k++) {
             L.gate_drop[k] = pol.gate_drop[k];
@@ -5648,6 +5665,7 @@ struct MKEngine::Impl {
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
                 int first = 0, const std::vector<Snap> * snaps = nullptr) {
         pf_init();
+        kv_top = std::max(kv_top, n0 + (int) toks.size()); // (ring_rewind)
         ck_scr_guard(); // the scratch may still be the source of an end save's copy
         ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
@@ -5938,6 +5956,7 @@ struct MKEngine::Impl {
         ck_rs_slot = -1;   // (a restore not issued yet is moot)
         ck_wait_restore(); // (an issued one still writes the state)
         ck_guard_state();
+        kv_top = 0; // (MK_KV_WIN: every position is rewritten before it is read; the ring needs nothing)
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
@@ -6140,6 +6159,7 @@ void MKEngine::truncate(int len) {
     std::vector<int> & seq = p_->seq;
     if (len < p_->hctl.dn_c || len > (int) seq.size())
         throw std::runtime_error("truncate: can only drop tokens emitted after the committed position");
+    p_->ring_rewind(len); // MK_KV_WIN: the dropped positions' ring slots held window rows
     seq.resize(len);
 }
 
