@@ -716,7 +716,7 @@ __device__ __forceinline__ float ex_f(float a, float R, float b, float s) { retu
 
 template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
-                                                     int segt = 0, int exh = 0) {
+                                                     int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) {
     static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn8 KB");
     static_assert(VB == 0 || (VB >= 4 && VB <= 7), "pk_attn8 VB");
     extern __shared__ __align__(16) uint8_t asm_[];
@@ -747,7 +747,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
     // EXA: 0 whole item (final output); split item (S units, S partial slots): unit 0 = the head, segments 0 .. exh - 1
     // (folds, R -> slot 0), role 1; unit u >= 1 = segment exh + u - 1 alone (-> slot u), role 2. (Role 2 code also
-    // handles a unit of several segments, each to slot 1 + k - ex_h.)
+    // handles a unit of several segments, each to slot 1 + k - ex_h.) Split item j's S slots: in part for j < exa, else
+    // in part2 (two idle scratch buffers, see MKEngine's ex_part).
     int ex_role = 0, ex_h = 0;
     float * ex_base = nullptr;
     if (EXA) {
@@ -761,7 +762,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             it1 = min(ntile, k1 * segt);
             ex_h = exh;
             ex_role = seg == 0 ? 1 : 2;
-            ex_base = part + (size_t) (item - nfull) * S * A2_PART;
+            const int j = item - nfull;
+            ex_base = j < exa ? part + (size_t) j * S * A2_PART : part2 + (size_t) (j - exa) * S * A2_PART;
         }
     }
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
@@ -1167,12 +1169,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
 
 // EXA: the split items' results: the head unit's R (slot 0, segments 0 .. sh - 1) folded with the single segments
 // (slot q = segment sh + q - 1) in segment order, with pk_attn8's own ex_ab / ex_f arithmetic, then normalised -> y2 (rows
-// r0 + ..). Block = split item; S slots per item; exh >= 1 = the head unit's segments (an item may have fewer).
-__global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int exh, int r0, const float * __restrict__ part) {
+// r0 + ..). Block = split item; S slots per item (in part for the first exa items, then in part2); exh >= 1 = the head
+// unit's segments (an item may have fewer).
+__global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int exh, int r0, const float * __restrict__ part,
+                                                      const float * __restrict__ part2, int exa) {
     const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
     const int ntile = (n0 + t0 + nq - 1) / A2_K + 1, nsg = (ntile + segt - 1) / segt, sh = min(exh, nsg);
-    const float * P = part + (size_t) blockIdx.x * S * A2_PART;
+    const int j = blockIdx.x;
+    const float * P = j < exa ? part + (size_t) j * S * A2_PART : part2 + (size_t) (j - exa) * S * A2_PART;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int r = warp; r < 6 * A2_Q; r += 8) {
         const int h = r / A2_Q, tt = r % A2_Q;
