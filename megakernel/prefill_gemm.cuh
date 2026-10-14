@@ -46,7 +46,7 @@ template <int TYPE> struct WT;
 template <> struct WT<TQ4K> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TIQ4> { static constexpr int BLK = 136, NCH = 3; }; // in 272 B pairs, see mmh's load
 template <> struct WT<TIQ4NL> { static constexpr int BLK = 144, NCH = 3; };
-template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 5; };
+template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 2; }; // qs; header + qh: SBT
 template <> struct WT<TQ6K> { static constexpr int BLK = 192, NCH = 3; }; // + the meta stream (W.d), see load
 template <> struct WT<TQ80> { static constexpr int BLK = 256, NCH = 4; };
 // native Q3_K / IQ3_S (rows_q3k / rows_iq3s): the 16 B of index / low bits of the stage's two units; the rest (Q3_K: high
@@ -57,7 +57,7 @@ template <> struct WT<TIQ3S> { static constexpr int BLK = 96, NCH = 1; };
 template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, int & inc) {
     if constexpr (TYPE == TQ3K || TYPE == TIQ3S) { off = 0; inc = 16; }
     else if constexpr (TYPE == TQ4K || TYPE == TIQ4 || TYPE == TIQ4NL) { off = c == 0 ? 0 : 16 * c; inc = c == 0 ? 0 : 32; }
-    else if constexpr (TYPE == TQ5K) { off = c < 3 ? 16 * c : 48 + 16 * (c - 3); inc = c < 3 ? 0 : 32; }
+    else if constexpr (TYPE == TQ5K) { off = 48 + 16 * c; inc = 32; } // (the stage holds qs only; header + qh: SBT)
     else if constexpr (TYPE == TQ6K) { off = c < 2 ? 16 * c : 128; inc = c < 2 ? 32 : 16; }
     else { off = 16 * c; inc = 64; }
 }
@@ -102,15 +102,23 @@ template <int TYPE> struct HT;
 // SR: smem bytes per weight row; SEP: fp16 scales in a separate double buffer (else in the row:
 // Q6_K rows are 64 B, chunks XOR-swizzled by (row / 2) % 4, scales in the meta chunk's spare 8 B)
 template <> struct HT<TQ4K> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
-template <> struct HT<TIQ4> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
+#ifndef MK_PF_NS_IQ4
+#define MK_PF_NS_IQ4 4 // (experiment) cp.async stages of the IQ4_XS kernels
+#endif
+template <> struct HT<TIQ4> { static constexpr int SR = 48, NS = MK_PF_NS_IQ4; static constexpr bool SEP = true; };
 template <> struct HT<TIQ4NL> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
-template <> struct HT<TQ5K> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
+template <> struct HT<TQ5K> { static constexpr int SR = 32, NS = 4; static constexpr bool SEP = true; }; // + SBT
 template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = 4; static constexpr bool SEP = false; };
 template <> struct HT<TQ80> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
 // Q3_K row: [lows 16 | highs 8 | sc 4 | d pair 4 | pad 16]; IQ3_S row: [index lows 16 | meta 16 | signs 8 | pad 8]
 // (48 B rows: the 8 row groups g of a fragment load hit distinct banks, as Q4_K's)
 template <> struct HT<TQ3K> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
 template <> struct HT<TIQ3S> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
+// Per-super-block bytes that the 4 stages of a super-block share (Q5_K: header 16 + qh 32 B per row) go to a double buffer
+// (SBB, by super-block parity) once per super-block instead of into every stage: Q5_K's stage is then 32 B per row, so it
+// gets 4 stages like the 48-B types (3 before: 2-5% slower, notes/agent_pf.md). R: bytes per row, NC: 16-B chunks per row.
+template <int TYPE> struct SBT { static constexpr int R = 0, NC = 0; };
+template <> struct SBT<TQ5K> { static constexpr int R = 48, NC = 3; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
 constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps of 16 rows, each over all NB tokens
 // NB: tokens per CTA (BN = 128 or, for short prompts, 64 / 32; picked per GEMM by the host, see Impl::pf_nb).
@@ -121,7 +129,7 @@ template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { 
 // (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, measured no faster: notes/agent_ttft.md.)
 // At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_smem() {
-    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0);
+    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + 2 * SBT<TYPE>::R * BM + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0);
 }
 
 __device__ __forceinline__ void hmma16(unsigned (&d)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
@@ -166,11 +174,14 @@ __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
     return (tg == TIQ4 && (tu == TQ5K || tu == TQ4K)) || tg == TIQ4NL || tu == TIQ4NL || (tg == TQ6K && tu == TQ6K) ? 2 : 1;
 }
 
-// Mixed-type GLU tiles: both halves' weight bytes + the activations per stage; 4 stages if they fit in 99 KB, else 3
+// Mixed-type GLU tiles: both halves' weight bytes + the activations per stage; 4 stages if they fit (NB 32: in 48 KB, two
+// CTAs per SM like the same-type kernels; else in 99 KB), else 3
 template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_stage2() { return BM / 2 * (HT<TG>::SR + HT<TU>::SR) + hm_x<NB>(); }
-template <int TG, int TU> __host__ __device__ constexpr int hm_sep2() { return HT<TG>::SEP || HT<TU>::SEP ? 2 * 2 * BM * 8 : 0; }
+template <int TG, int TU> __host__ __device__ constexpr int hm_sep2() { // + the halves' super-block buffers
+    return (HT<TG>::SEP || HT<TU>::SEP ? 2 * 2 * BM * 8 : 0) + 2 * BM / 2 * (SBT<TG>::R + SBT<TU>::R);
+}
 template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_ns2() {
-    return 4 * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() <= 99 * 1024 ? 4 : 3;
+    return 4 * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() <= (NB <= 32 ? 48 : 99) * 1024 ? 4 : 3;
 }
 template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
     return hm_ns2<TG, TU, NB>() * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>();
@@ -186,14 +197,17 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
     static constexpr bool SEP = HT<TYPE>::SEP;
     static constexpr int F6L = 0, F6H = 32 * ROWS, F6M = 48 * ROWS, F6U = 3360;
     // FMT stage layout (see above): Q5_K qh regions at FQH, qs regions at FQS, headers at FHO; FCPT chunks per tile and stage
-    static constexpr int FQH = 0, FQS = TYPE == TQ5K ? ROWS * 32 : 0, FHO = FQS + ROWS * 32;
-    static constexpr int FNQ = TYPE == TQ5K ? 64 : 32, FCPT = FNQ + (TYPE == TIQ4 ? 8 : 16);
+    // (Q5_K: the stage holds qs only; its qh region (FQH) and headers (FHO) are in the super-block buffer, SBT)
+    static constexpr int FQH = 0, FQS = 0, FHO = ROWS * 32;
+    static constexpr int FNQ = 32, FCPT = FNQ + (TYPE == TQ5K ? 0 : TYPE == TIQ4 ? 8 : 16);
+    static constexpr int SBR = SBT<TYPE>::R, SNC = SBT<TYPE>::NC; // super-block buffer bytes per row, its chunks per row
+    static constexpr int WCHS = SNC ? (FMT ? ROWS / 16 * 48 : ROWS * SNC) : 0, WITS = WCHS ? (WCHS + 255) / 256 : 1;
     static constexpr int WCH = FMT ? ROWS / 16 * FCPT : FM6 ? ROWS / 16 * 48 : ROWS * NCH, WIT = (WCH + 255) / 256;
     static constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
     static constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
-    static_assert(!FMT || FHO + ROWS * 16 <= SR * ROWS, "FMT stage layout fits the stage's weight part");
+    static_assert(!FMT || SBR || FHO + ROWS * 16 <= SR * ROWS, "FMT stage layout fits the stage's weight part");
     static_assert(!FM6 || F6M + 16 * ROWS == SR * ROWS, "FM6: 48 chunks per tile and stage");
     static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80 || TYPE == TQ6K ||
                       TYPE == TQ3K || TYPE == TIQ3S, "wv layout types");
@@ -202,12 +216,16 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
     int winc[WIT];
     unsigned wdst[WIT];
     bool wq[WIT]; // IQ4_XS: an index chunk (not the pair's header), at + 128 in the odd block of a pair (LAY: not a header)
+    const uint8_t * ssrc[WITS]; // super-block buffer chunks (SBT): source of super-block 0, offset in a buffer
+    unsigned sdst[WITS];
+    const uint8_t * sbbp; // this half's two super-block buffers (generic / shared address)
+    unsigned sbba;
     const uint8_t * f6src, * f6d, * dsrc8, * esrc, * vsrc;
     const __half * dsrc;
     unsigned edst, rdst;
     int rt; // this thread's row for the per-row copies (valid if 0 <= rt < ROWS)
 
-    __device__ __forceinline__ void init(int tid, const WMat & W, const uint8_t * W2, int row0) {
+    __device__ __forceinline__ void init(int tid, const WMat & W, const uint8_t * W2, int row0, uint8_t * sbb = nullptr) {
 #pragma unroll
         for (int k = 0; k < WIT; k++) {
             const int i = tid + k * 256, r = i / NCH, c = i % NCH;
@@ -226,10 +244,9 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
                     int o2, i2 = 0, d2;
                     if (cc < FNQ) { // qs chunk (Q5_K: cc < 32 qh, then qs) of lane (gq, tq), stored at fmt_off(gq, tq)
                         const int qq = cc & 31, q = qq & 7, rs = qq >> 3, gq = 2 * (q >> 1) + (rs & 1), tq = 2 * (rs >> 1) + (q & 1);
-                        const bool qh = TYPE == TQ5K && cc < 32;
-                        o2 = (qh ? 256 : TYPE == TQ4K ? 256 : TYPE == TQ5K ? 768 : 128) + 16 * (4 * gq + tq);
-                        i2 = qh ? 0 : 512; // qs of 64-group p: + 512 p
-                        d2 = (qh ? FQH : FQS) + 512 * t + 128 * (2 * (rs & 1) + (rs >> 1)) + 16 * q;
+                        o2 = (TYPE == TQ4K ? 256 : TYPE == TQ5K ? 768 : 128) + 16 * (4 * gq + tq);
+                        i2 = 512; // qs of 64-group p: + 512 p
+                        d2 = FQS + 512 * t + 128 * (2 * (rs & 1) + (rs >> 1)) + 16 * q;
                     } else { // header: Q4_K / Q5_K row h of the tile (FM chunk 2 (h & 7) + (h >> 3)); IQ4_XS rows h, h + 8 (chunk h)
                         const int h = cc - FNQ;
                         o2 = TYPE == TIQ4 ? 16 * h : 16 * (2 * (h & 7) + (h >> 3));
@@ -284,11 +301,50 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
             vsrc = W.w + ((size_t) (rowm >> 4) * nb * 16 + (rowm & 15)) * BLK;
         }
         rdst = HB + r * SR;
+        // super-block buffer chunks (Q5_K: header + qh of each row; FMT: per tile 32 qh chunks to the qh region, then 16
+        // header chunks), copied once per super-block (load)
+        sbbp = sbb;
+        sbba = sbb ? (unsigned) __cvta_generic_to_shared(sbb) : 0u;
+        if constexpr (SNC > 0) {
+#pragma unroll
+            for (int k = 0; k < WITS; k++) {
+                const int i = tid + k * 256, ii = i < WCHS ? i : 0;
+                if constexpr (FMT) {
+                    const int t = ii / 48, cc = ii % 48;
+                    const uint8_t * mbt = TW2 ? (t < ROWS / 32 ? W.w : W2) : W.w;
+                    const int trow = row0 + 16 * (TW2 ? (t & (ROWS / 32 - 1)) : t);
+                    const uint8_t * ubt = mbt + (size_t) (trow >> 4) * (W.K >> 8) * UB;
+                    if (cc < 32) { // qh chunk of lane (gq, tq), as the stage's qs chunks
+                        const int q = cc & 7, rs = cc >> 3, gq = 2 * (q >> 1) + (rs & 1), tq = 2 * (rs >> 1) + (q & 1);
+                        ssrc[k] = ubt + 256 + 16 * (4 * gq + tq);
+                        sdst[k] = FQH + 512 * t + 128 * (2 * (rs & 1) + (rs >> 1)) + 16 * q;
+                    } else { // header of row h of the tile (FM chunk 2 (h & 7) + (h >> 3))
+                        const int h = cc - 32;
+                        ssrc[k] = ubt + 16 * (2 * (h & 7) + (h >> 3));
+                        sdst[k] = FHO + 16 * (16 * t + h);
+                    }
+                } else {
+                    const int rr = ii / SNC, c = ii % SNC;
+                    const uint8_t * mb = TW2 ? (rr < ROWS / 2 ? W.w : W2) : W.w;
+                    const int rowm = row0 + (TW2 ? (rr & (ROWS / 2 - 1)) : rr);
+                    ssrc[k] = LAY ? mb + (size_t) (rowm >> 4) * (W.K >> 8) * UB + (rowm & 15) * BLK + 16 * c
+                                  : mb + (size_t) rowm * W.rb + 16 * c;
+                    sdst[k] = rr * SBR + 16 * c;
+                }
+            }
+        }
     }
 
     // stage st's weight bytes into the stage at shared address s
     __device__ __forceinline__ void load(unsigned s, int st, int tid) const {
         const int sb = st >> 2, p = st & 3;
+        if constexpr (SNC > 0) // the super-block's header + qh, with its first stage (read from stage 4 sb - 1's step on)
+            if (p == 0) {
+                const unsigned d = sbba + (sb & 1) * SBR * ROWS;
+#pragma unroll
+                for (int k = 0; k < WITS; k++)
+                    if (WCHS % 256 == 0 || tid + k * 256 < WCHS) cpa16(d + sdst[k], ssrc[k] + (size_t) sb * (LAY ? UB : BLK));
+            }
 #pragma unroll
         for (int k = 0; k < WIT; k++)
             if (WCH % 256 == 0 || tid + k * 256 < WCH) {
@@ -332,8 +388,8 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
     //   Q4_K / Q5_K: (S, S, -M, -M);  Q6_K: (S_lo, S_lo, S_hi, S_hi) into the row's meta slot;  Q8_0: (d, d, d, d)
     __device__ __forceinline__ void scales(const uint8_t * stg, int st, int hl, int j, uint2 * sws, int hg) const {
         // FMT: the headers at FHO (IQ4_XS: row pair chunk (tile, hl & 7), half hl >> 3 & 1)
-        const uint8_t * row = stg + HB +
-                              (!FMT ? hl * SR : TYPE == TIQ4 ? FHO + 16 * (8 * (hl >> 4) + (hl & 7)) + 8 * ((hl >> 3) & 1) : FHO + 16 * hl);
+        const uint8_t * row = SBR ? sbbp + ((st >> 2) & 1) * SBR * ROWS + (FMT ? FHO + 16 * hl : hl * SBR)
+                              : stg + HB + (!FMT ? hl * SR : TYPE == TIQ4 ? FHO + 16 * (8 * (hl >> 4) + (hl & 7)) + 8 * ((hl >> 3) & 1) : FHO + 16 * hl);
         const int p = st & 3;
         __half2 a, b;
         if constexpr (TYPE == TQ4K || TYPE == TQ5K) {
@@ -407,7 +463,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
         // weight words: wd[j][kk][r] = 4 values of elements 16 kk + 4 t4 .. of sub-block j, row g + 8 r
         unsigned wd[2][2][2];
         if constexpr (TYPE == TQ4K || TYPE == TQ5K) {
-            constexpr int QO = TYPE == TQ4K ? 16 : 48;
+            constexpr int QO = TYPE == TQ4K ? 16 : 0; // (Q5_K stage rows: qs only)
             const unsigned w0 = FMT ? fw(FQS, 0, 0) : *reinterpret_cast<const unsigned *>(ra + QO + 4 * t4);
             const unsigned w1 = FMT ? fw(FQS, 1, 0) : *reinterpret_cast<const unsigned *>(ra + QO + 16 + 4 * t4);
             const unsigned w2 = FMT ? fw(FQS, 0, 1) : *reinterpret_cast<const unsigned *>(rb + QO + 4 * t4);
@@ -416,10 +472,17 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB> struct HalfW {
             wd[1][0][0] = (w0 >> 4) & M4; wd[1][0][1] = (w2 >> 4) & M4;
             wd[1][1][0] = (w1 >> 4) & M4; wd[1][1][1] = (w3 >> 4) & M4;
             if constexpr (TYPE == TQ5K) {
-                const unsigned h0 = (FMT ? fw(FQH, 0, 0) : *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4)) >> (2 * p);
-                const unsigned h1 = (FMT ? fw(FQH, 1, 0) : *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4)) >> (2 * p);
-                const unsigned h2 = (FMT ? fw(FQH, 0, 1) : *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4)) >> (2 * p);
-                const unsigned h3 = (FMT ? fw(FQH, 1, 1) : *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4)) >> (2 * p);
+                // qh from the super-block buffer (FMT: the same word positions as the stage's qs)
+                const uint8_t * sq = sbbp + ((st >> 2) & 1) * SBR * ROWS;
+                auto fs = [&](int half, int sec) {
+                    return *reinterpret_cast<const unsigned *>(sq + FQH + 512 * (rw >> 4) + 128 * (2 * od + half) +
+                                                               16 * (2 * (g >> 1) + (t4 >> 1)) + 8 * (od ^ sec) + 4 * (t4 & 1));
+                };
+                const uint8_t * qa = sq + rw * SBR, * qb = qa + 8 * SBR;
+                const unsigned h0 = (FMT ? fs(0, 0) : *reinterpret_cast<const unsigned *>(qa + 16 + 4 * t4)) >> (2 * p);
+                const unsigned h1 = (FMT ? fs(1, 0) : *reinterpret_cast<const unsigned *>(qa + 32 + 4 * t4)) >> (2 * p);
+                const unsigned h2 = (FMT ? fs(0, 1) : *reinterpret_cast<const unsigned *>(qb + 16 + 4 * t4)) >> (2 * p);
+                const unsigned h3 = (FMT ? fs(1, 1) : *reinterpret_cast<const unsigned *>(qb + 32 + 4 * t4)) >> (2 * p);
                 wd[0][0][0] |= (h0 & 0x01010101u) << 4; wd[0][0][1] |= (h2 & 0x01010101u) << 4;
                 wd[0][1][0] |= (h1 & 0x01010101u) << 4; wd[0][1][1] |= (h3 & 0x01010101u) << 4;
                 wd[1][0][0] |= (h0 & 0x02020202u) << 3; wd[1][0][1] |= (h2 & 0x02020202u) << 3;
@@ -559,12 +622,15 @@ __global__ void __launch_bounds__(256, 1)
     const int lin = blockIdx.y * gridDim.x + blockIdx.x;
     const int row0 = (lin / ntt) * (GLU ? BM / 2 : BM), tok0 = (lin % ntt) * NB;
     const unsigned sbase = (unsigned) __cvta_generic_to_shared(sm);
-    uint2 * sws = reinterpret_cast<uint2 *>(sm + NSH * STG); // [2][2 j][BM] fp16 scale pairs
+    // after the stages: the halves' super-block buffers (SBT), then the scale pairs sws [2][2 j][BM]
+    uint8_t * sbbs = sm + NSH * STG;
+    constexpr int SBBA = 2 * HA::SBR * (MIX ? BM / 2 : BM), SBBU = MIX ? 2 * HU::SBR * BM / 2 : 0;
+    uint2 * sws = reinterpret_cast<uint2 *>(sbbs + SBBA + SBBU);
 
     HA ha;
     HU hu;
-    ha.init(tid, W, W2, row0);
-    if constexpr (MIX) hu.init(tid, Wu, nullptr, row0);
+    ha.init(tid, W, W2, row0, sbbs);
+    if constexpr (MIX) hu.init(tid, Wu, nullptr, row0, sbbs + SBBA);
     const __half * xsrc[XIT];
     unsigned xdst[XIT];
 #pragma unroll
@@ -703,14 +769,22 @@ __global__ void __launch_bounds__(256, 1)
     }
     __syncthreads();
     if constexpr (GLU) {
-        for (int i = tid; i < NB * 4; i += 256) { // (token, 16-group of the 64 outputs)
-            const int tk = i >> 2, q = i & 3;
+        // (token, 16-group of the 64 outputs): lanes 8 q' .. 8 q' + 7 take 8 consecutive tokens of one group, so their float4
+        // reads of se (ELD = 132: rows of 33 16-B units) hit 8 distinct bank quads per quarter warp
+        for (int i = tid; i < NB * 4; i += 256) {
+            const int tk = 8 * (i >> 5) + (i & 7), q = (i >> 3) & 3;
             if (tok0 + tk >= ntok) continue;
             const float * gp = se + tk * ELD + 16 * q;
+            float gf[16], uf[16];
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                *reinterpret_cast<float4 *>(gf + 4 * m) = *reinterpret_cast<const float4 *>(gp + 4 * m);
+                *reinterpret_cast<float4 *>(uf + 4 * m) = *reinterpret_cast<const float4 *>(gp + BM / 2 + 4 * m);
+            }
             __align__(16) __half hv[16];
 #pragma unroll
             for (int e = 0; e < 16; e++) {
-                const float gv = gp[e], v = gv / (1.0f + expf(-gv)) * gp[e + BM / 2];
+                const float gv = gf[e], v = gv / (1.0f + expf(-gv)) * uf[e];
                 hv[hperm(e)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
             }
             uint4 * dst = reinterpret_cast<uint4 *>(O.yh + (size_t) (tok0 + tk) * O.ldy + row0 + 16 * q);
