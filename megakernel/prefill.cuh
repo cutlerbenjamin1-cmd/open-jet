@@ -23,6 +23,8 @@ struct PBufs {
     __half * qh;  // [cap][NH][HD] attention queries (normed, rotated, pre-scaled)
     int * tok;    // [cap]
     int * amax;   // [cap] argmax output (scoring)
+    int wsrow;    // MK_EXACT: the MK_KV_WIN ring / main split per 16-row query tile (kv_ws of its last row, as decode
+                  // takes it per row), not per chunk (kv_ws(n0 + T)): a row's keys then do not depend on its chunk
 };
 
 __constant__ PBufs cP;
@@ -492,8 +494,9 @@ __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
 }
 
 // attention q / k / v post-processing: RMS norms, RoPE, K / V -> cache (fp16), q -> qh
-__global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const float * qn, const float * kn, int do_q) {
-    const int t = blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+// (r0: first chunk row of this launch; MK_EXACT with KV window rings runs the chunk in 640-position pieces)
+__global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const float * qn, const float * kn, int do_q, int r0 = 0) {
+    const int t = r0 + blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const size_t ctx = cB.ctx;
     for (int it = warp; it < 32; it += 8) {
         if (it < NH && !do_q) continue;

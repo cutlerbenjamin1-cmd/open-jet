@@ -77,6 +77,10 @@ class MKEngine {
     // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;
     // instead expose the final normalised hidden row of the last processed position.
     std::vector<float> last_hidden();
+    // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in qwen38_mk.cu (state_digest).
+    std::vector<unsigned long long> state_digest();
+    // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
+    bool exact() const;
 
     int position() const;
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after

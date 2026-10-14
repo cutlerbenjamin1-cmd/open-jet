@@ -4762,10 +4762,32 @@ struct MKEngine::Impl {
         int pos = -1;                                               // -1: free
         cudaEvent_t ev = nullptr;                                   // the copies into this slot (ck_sv) are done
         bool pending = false;                                       // ... may still be running
+        char * ring = nullptr;                                      // MK_EXACT + MK_KV_WIN: the q8 window rings at pos
+        bool ring_ok = false;                                       // ring holds this checkpoint's rings
     };
     struct Snap { int pos, slot; };
     std::vector<CkSlot> ck;
     bool ck_dev = false;
+    // MK_EXACT=1 (exact reuse): every result of a prefill row is independent of how the sequence was cut into prefill
+    // calls and chunks, so a prefill continued from a checkpoint computes bit for bit what a prefill from 0 computes:
+    // - the prefill attention runs unsplit (no a2_plan tail split: one online softmax per row over absolute tiles),
+    // - the MK_KV_WIN ring / main split is taken per query tile (PBufs::wsrow), as decode takes it per row,
+    // - checkpoints sit on the absolute 32-token scan grid (ck_exact is snapped like the others; callers restore only
+    //   checkpoints of a prefill that started on the grid, which every restore and a prefill from 0 do) and are only
+    //   saved inside the batched prefill (no end-of-prompt save: the prompt's last row runs through the megakernel),
+    // - with MK_KV_WIN, a checkpoint also keeps the q8 window rings as of its position (a restore then needs no
+    //   lossy refill from the low-bit main buffer); pinned host, ~NKV * kvrc * 272 B per ring side and slot.
+    // The caller (mk_server --exact-reuse) never appends to decoded rows: it restores the last checkpoint at or
+    // before the divergence and prefills from there (the reply's rows were written by the decode kernels).
+    bool exact = false;
+    struct RingSide { int8_t * q; __half * s; size_t off; }; // device ring values / scales, offset in CkSlot::ring
+    std::vector<RingSide> rsides[N_ATT_SLOTS];
+    size_t ring_bytes_ck = 0;          // per checkpoint
+    cudaEvent_t rs_ev[N_ATT_SLOTS] = {}; // pf_run: a chunk's whole-ring copies of slot s were issued (ck_sv)
+    cudaEvent_t rs_ev_pf = nullptr, rs_ev_done = nullptr;
+    bool rs_busy = false;              // ring copies on ck_sv may still read rings stream 0 will overwrite
+    size_t ring_vb() const { return (size_t) NKV * hb.kvrc * HD; }
+    size_t ring_sb() const { return (size_t) NKV * hb.kvrc * (HD / 32) * sizeof(__half); }
     double ck_ms = 0;             // last save / restore enqueue time (MK_MEMLOG)
     cudaStream_t ck_st = nullptr; // restores
     cudaStream_t ck_sv = nullptr; // saves
@@ -4817,6 +4839,37 @@ struct MKEngine::Impl {
         for (cudaEvent_t * e : {&ck_ev_src, &ck_ev_sv, &ck_ev_scr}) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
         for (auto & e : ck_ev_grp) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         for (auto & e : stg_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        // MK_EXACT (see `exact`): with MK_KV_WIN rings, each checkpoint also holds the rings as of its position
+        if (const char * e = getenv("MK_EXACT")) exact = atoi(e) != 0;
+        if (exact && hb.kvwin > 0) {
+            if (ck_dev) throw std::runtime_error("MK_EXACT with MK_KV_WIN needs host checkpoints (MK_CK_DEVICE=0)");
+            for (int s = 0; s < N_ATT_SLOTS; s++)
+                for (int w = 0; w < 2; w++)
+                    if (hb.kvrp[w][s]) {
+                        rsides[s].push_back({hb.kvrp[w][s], hb.kvrs[w][s], ring_bytes_ck});
+                        ring_bytes_ck += ring_vb() + ring_sb();
+                    }
+            for (auto & s : ck)
+                if (cudaHostAlloc(reinterpret_cast<void **>(&s.ring), ring_bytes_ck, cudaHostAllocDefault) != cudaSuccess) {
+                    cudaGetLastError();
+                    s.ring = nullptr;
+                    fprintf(stderr, "[mk] warning: no pinned host memory for a checkpoint's KV window rings: its restores refill them (not exact)\n");
+                }
+            for (int L = 0, d = 0; L < NL; L++) { // slot L / 4 (pf_run): restore group of the DeltaNet layer before it
+                if (!hw.L[L].attn) {
+                    d++;
+                    continue;
+                }
+                int g = 0;
+                while (g + 1 < CK_NG && ck_gb[g + 1] <= d - 1) g++;
+                ring_grp[L / 4] = g;
+            }
+            ring_grp[N_ATT_SLOTS - 1] = CK_NG - 1; // MTP block: after the trunk
+            for (auto & e : rs_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            for (cudaEvent_t * e : {&rs_ev_pf, &rs_ev_done}) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+            fprintf(stderr, "[mk] MK_EXACT: checkpoints keep the KV window rings (%.1f MiB each, pinned host)\n", ring_bytes_ck / 1048576.0);
+        }
+        if (exact) fprintf(stderr, "[mk] MK_EXACT=1: prefill rows independent of the chunking (attention unsplit, per-tile window, grid checkpoints)\n");
         mem_mark(ck_dev ? "DeltaNet checkpoint" : "DeltaNet checkpoints (host)");
     }
     void ck_free() {
@@ -4825,7 +4878,12 @@ struct MKEngine::Impl {
         for (auto & s : ck) {
             if (s.ev) cudaEventDestroy(s.ev);
             if (s.mem && !ck_dev) cudaFreeHost(s.mem);
+            if (s.ring) cudaFreeHost(s.ring);
         }
+        for (cudaEvent_t e : rs_ev)
+            if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : {rs_ev_pf, rs_ev_done})
+            if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : {ck_ev_src, ck_ev_sv, ck_ev_scr})
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ck_ev_grp)
@@ -4876,6 +4934,61 @@ struct MKEngine::Impl {
         CK(cudaStreamWaitEvent(0, ck[ck_direct].ev, 0));
         ck_direct = -1;
     }
+    // MK_EXACT + MK_KV_WIN, pf_run chunk n .. n + T - 1 with checkpoints sp[0 .. sn) in slots ss: a checkpoint's rings as
+    // of its position P = the rings before the chunk stores its K / V rows (positions P - kvrc .. n - 1: whole-ring
+    // copies, issued at the chunk start) with the rows of positions n .. P - 1 laid over them after the slot's
+    // pk_attn_prep (ring_snap_rows). All copies on ck_sv; stream 0 waits (rs_ev[s]) before slot s's prep overwrites
+    // its rings, and (ring_snap_guard) before a later chunk or launch could overwrite rows a copy still reads.
+    int ring_grp[N_ATT_SLOTS] = {}; // restore group after whose wait stream 0 first touches slot s's rings
+    void ring_snap_begin(int sn, const int * ss) {
+        CK(cudaEventRecord(rs_ev_pf, 0));
+        CK(cudaStreamWaitEvent(ck_sv, rs_ev_pf, 0));
+        for (int j = 0; j < sn; j++) {
+            if (ck[ss[j]].pending) CK(cudaStreamWaitEvent(ck_sv, ck[ss[j]].ev, 0)); // (ck_sv is in order anyway)
+            ck[ss[j]].ring_ok = ck[ss[j]].ring != nullptr;
+        }
+        const bool rs_in = ck_rs_next < CK_NG; // a restore's copies may still be writing the rings
+        for (int s = 0; s < N_ATT_SLOTS; s++) {
+            if (rs_in && !rsides[s].empty()) CK(cudaStreamWaitEvent(ck_sv, ck_ev_grp[ring_grp[s]], 0));
+            for (int j = 0; j < sn; j++) {
+                char * dst = ck[ss[j]].ring;
+                if (!dst) continue;
+                for (const RingSide & r : rsides[s]) {
+                    CK(cudaMemcpyAsync(dst + r.off, r.q, ring_vb(), cudaMemcpyDeviceToHost, ck_sv));
+                    CK(cudaMemcpyAsync(dst + r.off + ring_vb(), r.s, ring_sb(), cudaMemcpyDeviceToHost, ck_sv));
+                }
+            }
+            CK(cudaEventRecord(rs_ev[s], ck_sv));
+        }
+        CK(cudaEventRecord(rs_ev_done, ck_sv));
+        rs_busy = true;
+    }
+    void ring_snap_rows(int s, int n, int sn, const int * sp, const int * ss) {
+        if (rsides[s].empty()) return;
+        CK(cudaEventRecord(rs_ev_pf, 0));
+        CK(cudaStreamWaitEvent(ck_sv, rs_ev_pf, 0));
+        const size_t rc = hb.kvrc, vrow = HD, srow = (HD / 32) * sizeof(__half);
+        for (int j = 0; j < sn; j++) {
+            char * dst = ck[ss[j]].ring;
+            if (!dst) continue;
+            for (int p = n; p < sp[j];) {
+                const int r0 = p % (int) rc, c = std::min(sp[j] - p, (int) rc - r0);
+                for (const RingSide & r : rsides[s]) {
+                    CK(cudaMemcpy2DAsync(dst + r.off + r0 * vrow, rc * vrow, r.q + r0 * vrow, rc * vrow, c * vrow, NKV,
+                                         cudaMemcpyDeviceToHost, ck_sv));
+                    CK(cudaMemcpy2DAsync(dst + r.off + ring_vb() + r0 * srow, rc * srow, reinterpret_cast<const char *>(r.s) + r0 * srow,
+                                         rc * srow, c * srow, NKV, cudaMemcpyDeviceToHost, ck_sv));
+                }
+                p += c;
+            }
+        }
+        CK(cudaEventRecord(rs_ev_done, ck_sv));
+    }
+    void ring_snap_guard() {
+        if (!rs_busy) return;
+        CK(cudaStreamWaitEvent(0, rs_ev_done, 0));
+        rs_busy = false;
+    }
     // Issues a due restore's host-to-device copies on ck_st (5 groups, an event after each). Deferred from ck_restore
     // to just after the next prefill's token upload: a host-to-device copy on stream 0 (ctl, token ids, draft
     // vocabulary rows) queued behind the 0.17 GB on the copy engine would stall the host for the whole restore.
@@ -4886,6 +4999,7 @@ struct MKEngine::Impl {
         ck_rs_slot = -1;
         // stream 0's earlier work on the state (and on the slot's h ring) is complete before ck_st overwrites the
         // state, and so are the slot's save copies and a direct save still reading the state (all normally long done)
+        ring_snap_guard(); // (ring copies of an earlier save still reading the rings)
         CK(cudaEventRecord(ck_ev_src, 0));
         CK(cudaStreamWaitEvent(ck_st, ck_ev_src, 0));
         if (s.pending) CK(cudaStreamWaitEvent(ck_st, s.ev, 0));
@@ -4899,6 +5013,13 @@ struct MKEngine::Impl {
             const size_t l0 = ck_gb[g], nl = ck_gb[g + 1] - ck_gb[g];
             CK(cudaMemcpyAsync(hb.conv + l0 * CK_CL, s.conv + l0 * CK_CL, nl * CK_CL * 4, k, ck_st));
             CK(cudaMemcpyAsync(hb.dstate + l0 * CK_SL, s.dstate + l0 * CK_SL, nl * CK_SL * 4, k, ck_st));
+            if (s.ring_ok) // MK_EXACT: the KV window rings of the attention slots stream 0 reaches after this group
+                for (int a = 0; a < N_ATT_SLOTS; a++)
+                    if (ring_grp[a] == g)
+                        for (const RingSide & r : rsides[a]) {
+                            CK(cudaMemcpyAsync(r.q, s.ring + r.off, ring_vb(), cudaMemcpyHostToDevice, ck_st));
+                            CK(cudaMemcpyAsync(r.s, s.ring + r.off + ring_vb(), ring_sb(), cudaMemcpyHostToDevice, ck_st));
+                        }
             CK(cudaEventRecord(ck_ev_grp[g], ck_st));
         }
         ck_rs_next = 0;
@@ -4944,6 +5065,7 @@ struct MKEngine::Impl {
         }
         s.ctl = hctl;
         s.pos = hctl.dn_c;
+        s.ring_ok = false; // (no KV window rings: a restore refills them)
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog)
             fprintf(stderr, "[mk-mem] checkpoint save at %d enqueued in %.2f ms (%s)\n", s.pos, ck_ms,
@@ -4960,7 +5082,8 @@ struct MKEngine::Impl {
         seq.resize(s.pos);
         for (auto & o : ck) // later checkpoints belong to the abandoned continuation
             if (o.pos > s.pos) o.pos = -1;
-        ring_rewind(s.pos);
+        if (s.ring_ok) kv_top = std::min(kv_top, s.pos); // MK_EXACT: the restore copies the rings as of s.pos
+        else ring_rewind(s.pos);
         ck_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (memlog) fprintf(stderr, "[mk-mem] checkpoint restore to %d enqueued in %.2f ms\n", s.pos, ck_ms);
     }
@@ -4973,6 +5096,7 @@ struct MKEngine::Impl {
         if (hb.kvwin > 0) {
             const int p0 = std::max(0, P - hb.kvrc), p1 = std::min(P, kv_top - hb.kvrc);
             if (p1 > p0) {
+                ring_snap_guard(); // (MK_EXACT: ring copies of a checkpoint save still reading those rows)
                 k_ring_refill<<<std::min(1024, (p1 - p0) * NKV * N_ATT_SLOTS * 2 / 8 + 1), 256>>>(p0, p1);
                 CK(cudaGetLastError());
             }
@@ -6067,6 +6191,7 @@ struct MKEngine::Impl {
         void * args[] = {&L};
         ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
         ck_guard_state();
+        ring_snap_guard();
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
@@ -6222,6 +6347,7 @@ struct MKEngine::Impl {
         hp.qh = dalloc<__half>((size_t) cap * NH * HD);
         hp.tok = dalloc<int>(cap);
         hp.amax = dalloc<int>(cap);
+        hp.wsrow = exact ? 1 : 0;
         mem_mark("prefill scratch");
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         mmh_attr<pf::TQ4K, false>();
@@ -6285,6 +6411,7 @@ struct MKEngine::Impl {
             CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false, false>, A2_NT, A8_SMEM));
             if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
         }
+        if (exact) attn_split = false; // MK_EXACT: one online softmax per row over absolute tiles (see `exact`)
         mem_mark("prefill kernel attributes");
         pf_ready = true;
     }
@@ -6293,7 +6420,8 @@ struct MKEngine::Impl {
     int a2_slots = 0;
     bool attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
-    void attn(int T, int n, int slot) {
+    // (r0: the queries are chunk rows r0 .. r0 + T - 1 at positions n ..: MK_EXACT with KV window rings, see pf_run)
+    void attn(int T, int n, int slot, int r0 = 0) {
         if (attn_old) {
             if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
             else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, slot);
@@ -6312,17 +6440,17 @@ struct MKEngine::Impl {
             const bool s8 = attn_pv16;
             const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
             if (s8 && attn_s8 == 1) {
-                if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-                else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+                else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
             } else if (s8 && attn_s8 == 2) {
-                if (kl) pk_attn8<true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-                else pk_attn8<true, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                if (kl) pk_attn8<true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+                else pk_attn8<true, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
             }
-            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-            else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+            else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
         } else {
-            if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-            else pk_attn2<false, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+            else pk_attn2<false, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
         }
         if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, hp.y1);
     }
@@ -6528,6 +6656,10 @@ struct MKEngine::Impl {
                     if (q.pos > n && q.pos <= n + T && sn < stg_n) sp[sn] = q.pos, ss[sn++] = q.slot;
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
             ck_issue_restore(); // a due checkpoint restore streams in from here on (waited for per layer group below)
+            ring_snap_guard();  // (MK_EXACT: a previous chunk's ring row copies, before this chunk's preps)
+            const bool rsnap = sn > 0 && ring_bytes_ck > 0; // MK_EXACT + MK_KV_WIN: the checkpoints keep the rings
+            for (int j = 0; j < sn; j++) ck[ss[j]].ring_ok = false;
+            if (rsnap) ring_snap_begin(sn, ss);
             pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
@@ -6537,8 +6669,24 @@ struct MKEngine::Impl {
                 if (W.attn) {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
                     pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
-                    pf_time("attn_prep", [&] { pk_attn_prep<<<T, 256>>>(n, L / 4, W.qn, W.kn, 1); });
-                    pf_time("attn", [&] { attn(T, n, L / 4); });
+                    const int sl = L / 4;
+                    if (rsnap) CK(cudaStreamWaitEvent(0, rs_ev[sl], 0)); // (the rings' whole copies are done)
+                    if (exact && (hb.kvrp[0][sl] || hb.kvrp[1][sl])) {
+                        // MK_EXACT with a KV window ring: the chunk in pieces ending at multiples of ATT_BUCKET (as decode
+                        // launches end): a piece's rows read the window of their bucket (PBufs::wsrow), which the ring
+                        // (kvrc rows) still holds after the piece's own rows are stored; a whole chunk's rows would have
+                        // overwritten the oldest window rows of its first queries
+                        for (int a = 0; a < T;) {
+                            const int b = std::min(T, ((n + a) / ATT_BUCKET + 1) * ATT_BUCKET - n);
+                            pf_time("attn_prep", [&] { pk_attn_prep<<<b - a, 256>>>(n, sl, W.qn, W.kn, 1, a); });
+                            pf_time("attn", [&] { attn(b - a, n + a, sl, a); });
+                            a = b;
+                        }
+                    } else {
+                        pf_time("attn_prep", [&] { pk_attn_prep<<<T, 256>>>(n, sl, W.qn, W.kn, 1); });
+                        pf_time("attn", [&] { attn(T, n, sl); });
+                    }
+                    if (rsnap) ring_snap_rows(sl, n, sn, sp, ss);
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(L / 4); });
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
@@ -6637,7 +6785,9 @@ struct MKEngine::Impl {
                 pk_norm_quant<<<T, 256>>>(hp.xm, M.attn_norm);
                 gemm(M.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
                 gemm(M.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
+                if (rsnap) CK(cudaStreamWaitEvent(0, rs_ev[N_ATT_SLOTS - 1], 0));
                 pk_attn_prep<<<T, 256>>>(n, 16, M.qn, M.kn, 0);
+                if (rsnap) ring_snap_rows(N_ATT_SLOTS - 1, n, sn, sp, ss);
             });
             CK(cudaMemcpyAsync(hp.h, hp.h + (size_t) T * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         }
@@ -6905,8 +7055,13 @@ int MKEngine::prefill(const std::vector<int> & tokens, int ck_at) {
     return prefill(tokens, ck_at >= 0 ? std::vector<int>{ck_at} : std::vector<int>{}, ck_at);
 }
 
-int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & cks, int ck_exact) {
+int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & cks_in, int ck_exact) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
+    std::vector<int> cks = cks_in;
+    if (p_->exact && ck_exact >= 0) { // MK_EXACT: on the scan grid like the others (a side scan's state is not on it)
+        cks.push_back(ck_exact);
+        ck_exact = -1;
+    }
     p_->pcnt_clear(); // a new response: the penalties count its generated tokens only
     if (p_->fault_at && ++p_->fault_seen == p_->fault_at) p_->fault_now = true;
     Ctl & c = p_->hctl;
@@ -6922,7 +7077,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     const std::vector<int> feed(seq.begin() + n0, seq.end());
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
-    bool end_save = true; // a checkpoint at the end of the prompt, unless ck_exact is inside the batched part
+    bool end_save = !p_->exact; // a checkpoint at the end of the prompt, unless ck_exact is inside the batched part
     const char * mode = getenv("MK_PREFILL");
     const bool batched = !(mode && std::string(mode) == "mk");
     if (batched && feed.size() >= 2) {
@@ -6930,7 +7085,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         // which produces the first output token and the MTP drafts
         const std::vector<int> head(feed.begin(), feed.end() - 1);
         const int hend = n0 + (int) head.size(); // the batched part: positions n0 .. hend - 1
-        end_save = !(ck_exact > n0 && ck_exact < hend);
+        end_save = !p_->exact && !(ck_exact > n0 && ck_exact < hend); // (MK_EXACT: no megakernel state in checkpoints)
         if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
             if (!end_save) {
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr);
@@ -7143,4 +7298,84 @@ std::vector<float> MKEngine::last_hidden() {
     p_->ck_wait_restore();
     CK(cudaMemcpy(h.data(), p_->hb.h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
+}
+
+bool MKEngine::exact() const { return p_->exact; }
+
+// state_digest (test helper for the exact-reuse probes; slow, host-side hashing): 64-bit words
+//   [0] 0x4d4b444701, [1] n = committed position (dn_c), [2] mtp_valid, [3] kvrc (0: no MK_KV_WIN ring),
+//   [4] ring_lo = max(0, n - kvrc), [5] N_ATT_SLOTS, [6] NKV, [7] H_RING; then
+//   per (slot, w = K / V, kv head g, position p < n): its row in the main buffer (values + scales);
+//   per (slot, w, g, position ring_lo <= p < n): its q8 ring row (0: the side has no ring);
+//   48 DeltaNet states, 48 conv rings, H_RING h ring rows (ring index order).
+static unsigned long long dg_hash(const void * p, size_t nb, unsigned long long h = 0xcbf29ce484222325ULL) {
+    const unsigned char * b = static_cast<const unsigned char *>(p);
+    size_t i = 0;
+    for (; i + 8 <= nb; i += 8) {
+        unsigned long long w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x100000001b3ULL;
+        h ^= h >> 31;
+    }
+    for (; i < nb; i++) h = (h ^ b[i]) * 0x100000001b3ULL;
+    return h;
+}
+std::vector<unsigned long long> MKEngine::state_digest() {
+    Impl & I = *p_;
+    I.ck_wait_restore();
+    I.ring_snap_guard();
+    CK(cudaDeviceSynchronize());
+    Ctl c;
+    CK(cudaMemcpy(&c, I.hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    typedef unsigned long long u64;
+    const int n = c.dn_c, rc = I.hb.kvwin > 0 ? I.hb.kvrc : 0, rlo = rc ? std::max(0, n - rc) : n;
+    std::vector<u64> out = {0x4d4b444701ULL, (u64) n, (u64) c.mtp_valid, (u64) rc, (u64) rlo, (u64) N_ATT_SLOTS, (u64) NKV, (u64) H_RING};
+    const size_t ctx = (size_t) I.ctx, sbq = (HD / 32) * sizeof(__half);
+    std::vector<unsigned char> vb, sb;
+    auto d2h = [&](std::vector<unsigned char> & dst, const void * src, size_t nb) {
+        dst.resize(std::max<size_t>(1, nb));
+        if (nb) CK(cudaMemcpy(dst.data(), src, nb, cudaMemcpyDeviceToHost));
+    };
+    for (int s = 0; s < N_ATT_SLOTS; s++)
+        for (int w = 0; w < 2; w++)
+            for (int g = 0; g < NKV; g++) {
+                size_t rb, srb = 0;
+                if (I.hb.kvq8) {
+                    rb = (size_t) HD * I.hb.kvb[w][s] / 8;
+                    d2h(vb, I.hb.kvp[w][s] + (size_t) g * ctx * rb, n * rb);
+                    srb = sbq;
+                    d2h(sb, I.hb.kvs[w][s] + (size_t) g * ctx * (HD / 32), n * srb);
+                } else {
+                    rb = (size_t) HD * sizeof(__half);
+                    d2h(vb, static_cast<const __half *>(w ? I.hb.vc : I.hb.kc) + ((size_t) s * NKV + g) * ctx * HD, n * rb);
+                }
+                for (int p = 0; p < n; p++) out.push_back(dg_hash(sb.data() + p * srb, srb, dg_hash(vb.data() + p * rb, rb)));
+            }
+    for (int s = 0; s < N_ATT_SLOTS; s++)
+        for (int w = 0; w < 2; w++)
+            for (int g = 0; g < NKV; g++) {
+                if (!rc || !I.hb.kvrp[w][s]) {
+                    out.insert(out.end(), n - rlo, 0ULL);
+                    continue;
+                }
+                d2h(vb, I.hb.kvrp[w][s] + (size_t) g * rc * HD, (size_t) rc * HD);
+                d2h(sb, I.hb.kvrs[w][s] + (size_t) g * rc * (HD / 32), (size_t) rc * sbq);
+                for (int p = rlo; p < n; p++) {
+                    const size_t r = p % rc;
+                    out.push_back(dg_hash(sb.data() + r * sbq, sbq, dg_hash(vb.data() + r * HD, HD)));
+                }
+            }
+    for (int l = 0; l < 48; l++) {
+        d2h(vb, I.hb.dstate + l * Impl::CK_SL, Impl::CK_SL * 4);
+        out.push_back(dg_hash(vb.data(), Impl::CK_SL * 4));
+    }
+    for (int l = 0; l < 48; l++) {
+        d2h(vb, I.hb.conv + l * Impl::CK_CL, Impl::CK_CL * 4);
+        out.push_back(dg_hash(vb.data(), Impl::CK_CL * 4));
+    }
+    for (int r = 0; r < H_RING; r++) {
+        d2h(vb, I.hb.h_hist + (size_t) r * D, (size_t) D * 4);
+        out.push_back(dg_hash(vb.data(), (size_t) D * 4));
+    }
+    return out;
 }

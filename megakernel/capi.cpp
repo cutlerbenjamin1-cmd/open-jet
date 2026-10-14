@@ -196,6 +196,17 @@ int mk_checkpoints(void * hp, int * out, int cap) {
 int mk_rewind_to(void * hp, int pos) {
     return guarded(hp, [&](MKEngine * e) { return e->rewind_to(pos) ? 0 : -1; });
 }
+// 1 if the engine runs MK_EXACT (exact reuse: restore a checkpoint instead of appending to decoded rows)
+int mk_exact(void * hp) { return static_cast<Handle *>(hp)->eng->exact() ? 1 : 0; }
+// test helper: MKEngine::state_digest into out (up to cap words); returns the word count (negative on error)
+int mk_state_digest(void * hp, unsigned long long * out, int cap) {
+    return guarded(hp, [&](MKEngine * e) {
+        const auto v = e->state_digest();
+        if (out)
+            for (int i = 0; i < std::min((int) v.size(), cap); i++) out[i] = v[i];
+        return (int) v.size();
+    });
+}
 
 void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     const auto & s = static_cast<Handle *>(hp)->eng->stats;

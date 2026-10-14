@@ -82,6 +82,11 @@ class Engine:
             raise RuntimeError(L.mk_last_error().decode())
         self.ctx = ctx
         self._pieces = {}
+        # MK_EXACT engines (exact reuse): prefill rows do not depend on the chunking; see Server.load_prompt
+        self.exact = False
+        if hasattr(L, "mk_exact"):
+            L.mk_exact.restype, L.mk_exact.argtypes = ctypes.c_int, [vp]
+            self.exact = L.mk_exact(self.h) == 1
 
     def _err(self, what):
         return RuntimeError(f"{what}: {self.L.mk_last_error().decode()}")
@@ -400,7 +405,11 @@ class Server:
                 if toks[k] == self.im_start:
                     gen = k
                     break
-        if seq and lcp >= eng.committed():
+        # exact reuse (an MK_EXACT engine, --exact-reuse): never append to the sequence. Its last prompt row and the
+        # reply were processed by the decode kernels, whose arithmetic differs from the batched prefill's; restoring
+        # the last checkpoint at or before the divergence (all of them sit inside earlier batched prefills, on the
+        # absolute 32-token scan grid) and prefilling from there computes what a prefill from 0 computes, bit for bit.
+        if seq and lcp >= eng.committed() and not eng.exact:
             eng.truncate(lcp)
             return eng.prefill(toks[lcp:], gen, self.ck_positions(toks, lcp)), lcp
         # the last checkpoint at or before the divergence
@@ -615,8 +624,15 @@ def main():
     ap.add_argument("--ck-every", type=int, default=4096,
                     help="DeltaNet checkpoint every N prompt tokens (0: off); see MK_CK_SLOTS for the pool size")
     ap.add_argument("--ck-msgs", type=int, default=1, help="DeltaNet checkpoint at each message start (1/0)")
+    ap.add_argument("--exact-reuse", action="store_true",
+                    help="reused requests answer exactly as fresh ones (MK_EXACT=1): restore a checkpoint and prefill "
+                         "instead of appending to decoded rows (costs prompt time when a long reply is reused)")
     args = ap.parse_args()
+    if args.exact_reuse:
+        os.environ["MK_EXACT"] = "1"  # read by the engine at construction
     srv = Server(args)
+    if srv.eng.exact:
+        log("exact reuse: on (MK_EXACT)")
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
     httpd.daemon_threads = True
     log(f"listening on http://{args.host}:{args.port}")

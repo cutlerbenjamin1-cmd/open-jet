@@ -316,7 +316,7 @@ __device__ __forceinline__ void a2_cp_f16(__half * dst, const __half * src, int 
 }
 
 template <bool Q8, bool PV16>
-__global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, int nfull, int S, float * __restrict__ part) {
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0) {
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sQ = reinterpret_cast<__half *>(asm_); // [96][A2_LD]
     __half * sK = sQ + 6 * A2_Q * A2_LD;            // [32][A2_LD]
@@ -343,7 +343,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     const size_t row0 = ((size_t) slot * NKV + g) * cB.ctx;
     // q8 cache: the slot's K / V tiles in their MK_KV formats (rows of HD bits / 8 bytes), or the MK_KV_WIN q8 ring for
     // tiles at positions >= wsr (kv_src per tile); kbi / vbi = the bits of the K / V tile in flight (rq)
-    const int wsr = Q8 ? kv_ws(n0 + T) : 0, wsm = Q8 ? kv_wsm(wsr) : 0;
+    const int wsr = Q8 ? kv_ws(cP.wsrow ? pmax + 1 : n0 + T) : 0, wsm = Q8 ? kv_wsm(wsr) : 0; // (MK_EXACT: per query tile)
     int kbi = 8, vbi = 8;
     const int8_t * tq = nullptr;
     const __half * ts = nullptr;
@@ -353,7 +353,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     for (int i = tid; i < 6 * A2_Q * 32; i += A2_NT) { // 96 rows x 32 chunks of 16 B
         const int r = i >> 5, c = i & 31, h = r / A2_Q, tt = r % A2_Q;
         __half * d = sQ + r * A2_LD + 8 * c;
-        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH + g * 6 + h) * HD + 8 * c);
+        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (r0 + t0 + tt) * NH + g * 6 + h) * HD + 8 * c);
         else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
     }
     pf::cpa_commit();
@@ -558,8 +558,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
 #pragma unroll
         for (int j = 0; j < 16; j++) {
             const int d = 128 * hf + 8 * j + 2 * t4;
-            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
-            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
+            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
+            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
         }
     } else {
         float * pp = part + (size_t) (blockIdx.x - nfull) * A2_PART;
@@ -698,7 +698,7 @@ constexpr float A8_L2E = 1.4426950408889634f;
 // KLOW: the slot's K is low-bit (q4..q7): its tiles are expanded to int8 in the staging. The KLOW = false instantiation is the
 // plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot).
 template <bool QROW, bool KLOW>
-__global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part) {
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0) {
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
@@ -725,7 +725,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
     // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
     // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.
-    const int wsr = kv_ws(n0 + T), wsm = kv_wsm(wsr);
+    const int wsr = kv_ws(cP.wsrow ? pmax + 1 : n0 + T), wsm = kv_wsm(wsr); // (MK_EXACT: per query tile, see PBufs)
     const KvFmt kf = kv_fmt(slot); // per-slot formats once; per tile one compare of the tile index (kv_ring_tile)
     const int itr_k = kv_ring_tile(kf.kr, wsr, 0, A2_K), itr_v = kv_ring_tile(kf.vr, wsr, 0, A2_K);
     auto kbt = [&](int it) { return it >= itr_k ? 8 : kf.kb; };
@@ -765,7 +765,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     unsigned qf[8][4];
     float qs[QROW ? 1 : 8][2];
     {
-        const __half * qg = cP.qh + ((size_t) t0 * NH + g * 6 + hq) * HD + 4 * t4;
+        const __half * qg = cP.qh + ((size_t) (r0 + t0) * NH + g * 6 + hq) * HD + 4 * t4;
         auto ldq = [&](int b, int rr, float (&v)[8]) {
             const int t = g8 + 8 * rr;
             uint2 lo = make_uint2(0, 0), hi = make_uint2(0, 0);
@@ -1021,8 +1021,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
 #pragma unroll
         for (int j = 0; j < 16; j++) {
             const int d = 128 * hf + 8 * j + 2 * t4;
-            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
-            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
+            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
+            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
         }
     } else {
         float * pp = part + (size_t) (blockIdx.x - nfull) * A2_PART;
