@@ -166,6 +166,10 @@ struct Uploader {
         void * dst;
         const void * src;
         size_t n;
+        void * dst2 = nullptr; // (put2: a second copy, then post() on the stream)
+        const void * src2 = nullptr;
+        size_t n2 = 0;
+        std::function<cudaError_t(cudaStream_t)> post;
     };
     std::vector<Job> q; // FIFO (head index qh)
     size_t qh = 0;
@@ -195,6 +199,31 @@ struct Uploader {
         std::lock_guard<std::mutex> l(mu);
         raise();
         q.push_back({dst, src, n});
+        cv.notify_one();
+        return ++queued;
+    }
+    // two copies and a kernel launch after them on the worker's stream (the device wv re-layout); synchronous mode: the same
+    // on stream 0, then a device sync
+    uint64_t put2(void * dst, const void * src, size_t n, void * dst2, const void * src2, size_t n2,
+                  std::function<cudaError_t(cudaStream_t)> post) {
+        if (!async) {
+            const auto t0 = lclk::now();
+            CK(cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice));
+            if (n2) CK(cudaMemcpy(dst2, src2, n2, cudaMemcpyHostToDevice));
+            CK(post(0));
+            CK(cudaStreamSynchronize(0));
+            busy_s += lsec(t0);
+            bytes += n + n2;
+            return 0;
+        }
+        std::lock_guard<std::mutex> l(mu);
+        raise();
+        Job j{dst, src, n};
+        j.dst2 = dst2;
+        j.src2 = src2;
+        j.n2 = n2;
+        j.post = std::move(post);
+        q.push_back(std::move(j));
         cv.notify_one();
         return ++queued;
     }
@@ -235,15 +264,17 @@ struct Uploader {
                 std::unique_lock<std::mutex> l(mu);
                 cv.wait(l, [&] { return stop || qh < q.size(); });
                 if (stop) return; // (finish: nothing is left; the destructor of a failed load: the rest is dropped)
-                j = q[qh++];
+                j = std::move(q[qh++]);
             }
             const auto t0 = lclk::now();
             cudaError_t e = err == cudaSuccess ? cudaMemcpyAsync(j.dst, j.src, j.n, cudaMemcpyHostToDevice, st) : err;
+            if (e == cudaSuccess && j.n2) e = cudaMemcpyAsync(j.dst2, j.src2, j.n2, cudaMemcpyHostToDevice, st);
+            if (e == cudaSuccess && j.post) e = j.post(st);
             if (e == cudaSuccess) e = cudaStreamSynchronize(st);
             {
                 std::lock_guard<std::mutex> l(mu);
                 busy_s += lsec(t0);
-                bytes += j.n;
+                bytes += j.n + j.n2;
                 if (e != cudaSuccess && err == cudaSuccess) err = e;
                 done++;
             }

@@ -4496,6 +4496,16 @@ __global__ void __launch_bounds__(256) pk_glu(const float * __restrict__ g, cons
     }
 }
 
+// state files: after a restore the GPU has been idle through the load (clocks down); this keeps every SM busy for ns
+// nanoseconds so the decode that follows starts at the clocks a decode after a fresh prefill sees (touches no memory)
+__global__ void st_warm(unsigned long long ns) {
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < ns);
+}
+
 // ------------------------------------------------------------------------------------------
 // host side: loading / repacking
 // ------------------------------------------------------------------------------------------
@@ -4505,8 +4515,94 @@ uint16_t f2h_bits(float f) {
     return *reinterpret_cast<uint16_t *>(&h);
 }
 
+// A persistent thread pool for parallel_rows: the loader calls it ~1000 times, and spawning hardware_concurrency()
+// threads per call cost ~0.5 s per load. One job at a time; a call while the pool is busy (another thread's job, or a
+// call from inside a job) runs on threads of its own, as before. Rows go out in chunks from a shared counter (every
+// row's work is independent; nothing depends on which thread runs it). MK_LOAD_POOL=0: spawn per call.
+class RowPool {
+  public:
+    static RowPool & get() {
+        static RowPool p;
+        return p;
+    }
+    bool run(int64_t n, const std::function<void(int64_t)> & f) {
+        if (nth_ <= 0) return false;
+        std::unique_lock<std::mutex> job(job_mu_, std::try_to_lock);
+        if (!job.owns_lock()) return false;
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            fn_ = &f;
+            n_ = n;
+            ch_ = std::max<int64_t>(1, n / (8 * (int64_t) (nth_ + 1)));
+            next_ = 0;
+            active_ = nth_;
+            gen_++;
+        }
+        cv_.notify_all();
+        work();
+        std::unique_lock<std::mutex> l(mu_);
+        cvd_.wait(l, [&] { return active_ == 0; });
+        fn_ = nullptr;
+        return true;
+    }
+    ~RowPool() {
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            stop_ = true;
+            gen_++;
+        }
+        cv_.notify_all();
+        for (auto & t : th_) t.join();
+    }
+
+  private:
+    RowPool() {
+        const char * e = getenv("MK_LOAD_POOL");
+        nth_ = e && atoi(e) == 0 ? 0 : (int) std::max(1u, std::thread::hardware_concurrency()) - 1;
+        for (int i = 0; i < nth_; i++) th_.emplace_back([this] { loop(); });
+    }
+    void work() {
+        for (;;) {
+            const int64_t r0 = next_.fetch_add(ch_);
+            if (r0 >= n_) return;
+            const int64_t r1 = std::min(n_, r0 + ch_);
+            for (int64_t r = r0; r < r1; r++) (*fn_)(r);
+        }
+    }
+    void loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> l(mu_);
+                cv_.wait(l, [&] { return gen_ != seen; });
+                seen = gen_;
+                if (stop_) return;
+            }
+            work();
+            {
+                std::lock_guard<std::mutex> l(mu_);
+                active_--;
+            }
+            cvd_.notify_all();
+        }
+    }
+    int nth_ = 0;
+    std::vector<std::thread> th_;
+    std::mutex mu_, job_mu_;
+    std::condition_variable cv_, cvd_;
+    const std::function<void(int64_t)> * fn_ = nullptr;
+    int64_t n_ = 0, ch_ = 1;
+    std::atomic<int64_t> next_{0};
+    int active_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
+
 template <class F>
 void parallel_rows(int64_t n, F f) {
+    if (n <= 0) return;
+    const std::function<void(int64_t)> fn = [&](int64_t r) { f(r); };
+    if (RowPool::get().run(n, fn)) return;
     int nt = std::max(1u, std::thread::hardware_concurrency());
     std::vector<std::thread> th;
     for (int i = 0; i < nt; i++) {
@@ -5368,6 +5464,7 @@ struct MKEngine::Impl {
     // allocations, where cudaMalloc rounds each one up to whole 2 MiB pages (~0.5 GB over the ~900 weight tensors).
     // MK_CUDAMALLOC=1: plain cudaMalloc.
     bool pool_init = false, use_pool = true;
+    double dalloc_s = 0; // time in dalloc (load report)
     template <class T> T * dalloc(size_t n, bool zero = true) {
         void * p;
         if (!pool_init) {
@@ -5383,6 +5480,7 @@ struct MKEngine::Impl {
                 CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr));
             }
         }
+        const auto ta = lclk::now();
         if (use_pool) {
             CK(cudaMallocAsync(&p, n * sizeof(T) + 16, 0));
             CK(cudaStreamSynchronize(0));
@@ -5390,6 +5488,7 @@ struct MKEngine::Impl {
             CK(cudaMalloc(&p, n * sizeof(T) + 16));
         }
         if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
+        dalloc_s += lsec(ta);
         allocs.push_back(p);
         alloc_bytes += n * sizeof(T) + 16;
         if (wrec_on) wrec.push_back({p, n * sizeof(T)});
@@ -5571,6 +5670,7 @@ struct MKEngine::Impl {
     HSet & hset() {
         HSet & S = hs[hs_i];
         hs_i ^= 1;
+        auto _ = lc.scope("upload stall (host buffer set busy)");
         upl.wait(S.seq);
         return S;
     }
@@ -5611,9 +5711,7 @@ struct MKEngine::Impl {
 #if MK_WV
             if (wv_lay) {
                 HSet & S = hset();
-                uint8_t * o = S.o.get(t.nbytes);
-                wv_relay(m, t.data, nullptr, 0, o, nullptr);
-                m.w = dput<uint8_t>(o, t.nbytes, &S);
+                wv_place(m, t.data, t.nbytes, nullptr, 0, S);
             } else
 #endif
             {
@@ -5672,22 +5770,16 @@ struct MKEngine::Impl {
                     }
                 });
             }
-            const uint8_t *wq = qd, *wm = md;
-            size_t wqn = qn, wmn = mn;
 #if MK_MAXT > 5
             // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
             // the meta inline (one stream: no meta, m.d stays null)
-            if (wv_lay && (wv_fd || MK_WV_Q6F)) {
-                uint8_t * o = S.o.get(MK_WV_Q6F ? qn + mn : qn);
-                uint8_t * om = S.om.get(mn);
-                wmn = wv_relay(m, qd, md, mn, o, om);
-                wq = o;
-                wqn = MK_WV_Q6F ? qn + mn : qn;
-                wm = om;
-            }
+            if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_place(m, qd, qn, md, mn, S);
+            else
 #endif
-            m.w = dput<uint8_t>(wq, wqn, &S);
-            if (wmn) m.d = reinterpret_cast<const __half *>(dput<uint8_t>(wm, wmn, &S));
+            {
+                m.w = dput<uint8_t>(qd, qn, &S);
+                m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
+            }
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
             if (nb & 1) throw std::runtime_error(name + ": IQ4_XS rows need an even number of 256-blocks");
@@ -5699,15 +5791,11 @@ struct MKEngine::Impl {
                 auto _ = lc.scope("repack IQ4_XS");
                 parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, qd + (size_t) r * m.rb, nb); });
             }
-            const uint8_t * wq = qd;
 #if MK_WV
-            if (wv_lay) {
-                uint8_t * o = S.o.get(qn);
-                wv_relay(m, qd, nullptr, 0, o, nullptr);
-                wq = o;
-            }
+            if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
+            else
 #endif
-            m.w = dput<uint8_t>(wq, qn, &S);
+            m.w = dput<uint8_t>(qd, qn, &S);
         } else if (t.type == gguf::Q3_K || t.type == gguf::IQ3_S) {
             // native (rows_q3k / rows_iq3s, prefill TQ3K / TIQ3S): values 96 B per block + meta (Q3_K: the Q6_K meta
             // stream, 18 B; IQ3_S: 16 B), checked bit for bit against ggml's dequantization of every row
@@ -5745,18 +5833,14 @@ struct MKEngine::Impl {
                 });
             }
             if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S repack is not exact");
-            const uint8_t *wq = qd, *wm = md;
 #if MK_MAXT > 5
-            if (wv_lay && wv_fd) { // main-layer ffn_down: tile-major values and meta
-                uint8_t * o = S.o.get(qn);
-                uint8_t * om = S.om.get(mn);
-                wv_relay(m, qd, md, mn, o, om);
-                wq = o;
-                wm = om;
-            }
+            if (wv_lay && wv_fd) wv_place(m, qd, qn, md, mn, S); // main-layer ffn_down: tile-major values and meta
+            else
 #endif
-            m.w = dput<uint8_t>(wq, qn, &S);
-            m.d = reinterpret_cast<const __half *>(dput<uint8_t>(wm, mn, &S));
+            {
+                m.w = dput<uint8_t>(qd, qn, &S);
+                m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
+            }
             n_nat++;
             nat_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         } else if (t.type == gguf::IQ4_NL) {
@@ -5769,15 +5853,11 @@ struct MKEngine::Impl {
                 auto _ = lc.scope("repack IQ4_NL");
                 parallel_rows(N, [&](int64_t r) { repack_iq4nl(t.data + (size_t) r * nb * 144, qd + (size_t) r * m.rb, nb); });
             }
-            const uint8_t * wq = qd;
 #if MK_WV
-            if (wv_lay) {
-                uint8_t * o = S.o.get(qn);
-                wv_relay(m, qd, nullptr, 0, o, nullptr);
-                wq = o;
-            }
+            if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
+            else
 #endif
-            m.w = dput<uint8_t>(wq, qn, &S);
+            m.w = dput<uint8_t>(qd, qn, &S);
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
             if (K % 256) throw std::runtime_error(name + ": Q8_0 rows need a multiple of 256 values");
@@ -5805,18 +5885,14 @@ struct MKEngine::Impl {
                     }
                 });
             }
-            const uint8_t *wq = qd, *wm = md;
 #if MK_WV
-            if (wv_lay) {
-                uint8_t * o = S.o.get(qn);
-                uint8_t * om = S.om.get(mn);
-                wv_relay(m, qd, md, mn, o, om);
-                wq = o;
-                wm = om;
-            }
+            if (wv_lay) wv_place(m, qd, qn, md, mn, S);
+            else
 #endif
-            m.w = dput<uint8_t>(wq, qn, &S);
-            m.d = (const __half *) dput<uint16_t>(wm, mn / 2, &S);
+            {
+                m.w = dput<uint8_t>(qd, qn, &S);
+                m.d = (const __half *) dput<uint16_t>(md, mn / 2, &S);
+            }
         } else {
             throw std::runtime_error(name + ": unsupported quant type " + std::to_string(t.type));
         }
@@ -5839,6 +5915,76 @@ struct MKEngine::Impl {
         wv_s += s;
         lc.add("wv re-layout", s);
         return r;
+    }
+    // MK_LOAD_GPURL (default 1): the wv layout made on the device (wv_host.cuh wv_dev_launch, on the upload worker: the
+    // pre-wv bytes go to a staging buffer, a kernel writes them re-laid into the matrix's buffer); 0, or a layout / size the
+    // device path does not take: wv_relayout on the host as before. Same bytes either way.
+    const bool gpurl = !(getenv("MK_LOAD_GPURL") && atoi(getenv("MK_LOAD_GPURL")) == 0);
+    std::map<int, WvProbe> wv_probes;
+    uint8_t * stg_d = nullptr;   // device staging (cudaMalloc, freed after the weights)
+    size_t stg_cap = 0;
+    uint64_t relay_seq = 0;      // the last device re-layout queued
+    std::vector<void *> wv_tabs; // the probes' gather tables (cudaMalloc)
+    int wv_dev_n = 0;
+    void wv_place(Mat & m, const uint8_t * w, size_t wn, const uint8_t * meta, size_t meta_n, HSet & S) {
+        const bool q6f = MK_MAXT > 5 && MK_WV_Q6F && m.type == T_Q6K;
+        const size_t on = q6f ? wn + meta_n : wn, omn = q6f ? 0 : meta_n;
+        const size_t moff = (wn + 255) & ~(size_t) 255;
+        bool dev = gpurl && wv_dev_ok(m.type, m.N, m.K, m.rb, meta_n, wv_probes);
+        if (dev && !stg_d) {
+            stg_cap = (size_t) 192 << 20;
+            if (cudaMalloc(&stg_d, stg_cap) != cudaSuccess) {
+                cudaGetLastError();
+                stg_d = nullptr;
+                stg_cap = 0;
+            }
+        }
+        dev = dev && moff + meta_n <= stg_cap;
+        if (dev && wv_fm(m.type)) {
+            WvProbe & p = wv_probes.at(m.type);
+            if (!p.dtab) {
+                void * d = nullptr;
+                CK(cudaMalloc(&d, p.tab.size() * 4));
+                CK(cudaMemcpy(d, p.tab.data(), p.tab.size() * 4, cudaMemcpyHostToDevice));
+                wv_tabs.push_back(d);
+                p.dtab = static_cast<const uint32_t *>(d);
+            }
+        }
+        if (!dev) {
+            uint8_t * o = S.o.get(on);
+            uint8_t * om = meta_n ? S.om.get(meta_n) : nullptr;
+            wv_relay(m, w, meta, meta_n, o, om);
+            m.w = dput<uint8_t>(o, on, &S);
+            if (omn) m.d = reinterpret_cast<const __half *>(dput<uint8_t>(om, omn, &S));
+            return;
+        }
+        uint8_t * dw = dalloc<uint8_t>(on, false);
+        uint8_t * dm = omn ? dalloc<uint8_t>(omn, false) : nullptr;
+        wbytes += on + omn;
+        const int type = m.type, N = m.N, K = m.K, rb = m.rb;
+        uint8_t * sw = stg_d, * sm = stg_d + moff;
+        const WvProbe * pp = wv_fm(m.type) ? &wv_probes.at(m.type) : nullptr; // (a map node: stable while others are added)
+        const uint64_t q = upl.put2(sw, w, wn, sm, meta, meta_n, [=](cudaStream_t st) {
+            return wv_dev_launch(type, N, K, rb, sw, sm, meta_n, dw, dm, st, pp);
+        });
+        if (q) S.seq = relay_seq = q;
+        m.w = dw;
+        if (omn) m.d = reinterpret_cast<const __half *>(dm);
+        m.fm = 1;
+        wv_n++;
+        wv_dev_n++;
+    }
+    // after the weights: the staging buffer and the gather tables go back (before the KV cache is allocated)
+    void wv_dev_done() {
+        if (!stg_d && wv_tabs.empty()) return;
+        auto _ = lc.scope("wv device re-layout tail (wait)");
+        upl.wait(relay_seq);
+        if (stg_d) cudaFree(stg_d);
+        for (void * t : wv_tabs) cudaFree(t);
+        stg_d = nullptr;
+        stg_cap = 0;
+        wv_tabs.clear();
+        for (auto & kv : wv_probes) kv.second.dtab = nullptr;
     }
 #endif
 
@@ -6055,7 +6201,7 @@ struct MKEngine::Impl {
         mem_mark("weights: 64 layers + MTP");
 #if MK_WV
         wv_lay = false;
-        fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; %s), MAXT %d\n", wv_n, wv_s,
+        fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; %s), MAXT %d\n", wv_n, wv_dev_n, wv_s,
                 MAXT > 5 ? (MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
                                                    : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
                             : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
@@ -6148,6 +6294,9 @@ struct MKEngine::Impl {
         }
         wrec_on = false;
         mem_mark("token_embd");
+#if MK_WV
+        wv_dev_done();
+#endif
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         mem_mark("cW symbol (module load)");
         if (n_conv)
@@ -6393,10 +6542,10 @@ struct MKEngine::Impl {
         auto g = [&](const char * k) { return lc.get(k); };
         fprintf(stderr, "[mk] load %.2f s: context %.2f, read-ahead wait %.2f (%.1f GB read), repack %.2f, wv re-layout %.2f, "
                         "MTP requant wait %.2f (background %.2f), token_embd %.2f, ckpt pool %.2f, prefill scratch %.2f, upload tail %.2f, "
-                        "other %.2f | uploads %.2f GB, %.2f s in copies (%s)\n",
+                        "other %.2f (device allocs %.2f of it), upload stalls %.2f | uploads %.2f GB, %.2f s in copies (%s)\n",
                 tot, g("CUDA context"), pf_wait, pf_bytes / 1e9, rep, g("wv re-layout"), g("MTP Q4_K requant (wait for the background thread)"),
                 rq_s, g("token_embd (pinned table)"), g("checkpoint pool (pinned host)"), g("prefill scratch"), g("upload tail (wait)"),
-                tot - known, upl.bytes / 1e9, upl.busy_s, getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0 ? "synchronous" : "worker thread");
+                tot - known, dalloc_s, g("upload stall (host buffer set busy)"), upl.bytes / 1e9, upl.busy_s, getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0 ? "synchronous" : "worker thread");
         if (getenv("MK_LOADLOG"))
             for (const auto & p : lc.ph) fprintf(stderr, "[mk-load] %-52s %7.3f s\n", p.first.c_str(), p.second);
     }
@@ -7590,8 +7739,16 @@ struct MKEngine::Impl {
         }
         munmap(mp, fsz);
         kv_top = std::max(kv_top, hend); // (as pf_run of 0 .. hend - 1)
+        // MK_STATE_WARM_MS (default 1000; 0: off): GPU warm-up before the decode (st_warm)
+        const double wms = getenv("MK_STATE_WARM_MS") ? atof(getenv("MK_STATE_WARM_MS")) : 1000.0;
+        if (wms > 0) {
+            st_warm<<<nsm * 4, 256>>>((unsigned long long) (wms * 1e6));
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+        }
         st_s = lsec(t0);
-        fprintf(stderr, "[mk] state file restored: %s (%.2f GB, %d positions) in %.2f s\n", path.c_str(), tot / 1e9, hend, st_s);
+        fprintf(stderr, "[mk] state file restored: %s (%.2f GB, %d positions) in %.2f s (incl. %.1f s GPU warm-up, MK_STATE_WARM_MS)\n",
+                path.c_str(), tot / 1e9, hend, st_s, wms / 1000.0);
         return true;
     }
     void reset() {
