@@ -5269,7 +5269,7 @@ struct MKEngine::Impl {
         if (ck_dev) return; // (device checkpoint: the end save copies on stream 0)
         const size_t cap = hp.cap;
         const std::pair<void *, size_t> scr[] = {
-            {hp.y0, cap * FF * 4}, {hp.y1, cap * FF * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
+            {hp.y0, cap * FF * 4}, {hp.y1, y1_floats * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
             {hp.xm, cap * D * 4},  {hp.dq, cap * QKV * 2}, {hp.xh, cap * 2 * D * 2}, {hp.qh, cap * NH * HD * 2}};
         const std::tuple<void *, size_t, size_t> reg[] = { // state, its byte offset in a slot, bytes
             {hb.dstate, 0, CK_NS * 4}, {hb.conv, CK_NS * 4, CK_NC * 4}, {hb.h_hist, (CK_NS + CK_NC) * 4, CK_NH * 4}};
@@ -7032,7 +7032,15 @@ struct MKEngine::Impl {
         hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
         hp.xh2 = dalloc<__half>((size_t) cap * FF);
         hp.y0 = dalloc<float>((size_t) cap * FF);
-        hp.y1 = dalloc<float>((size_t) cap * FF);
+        // y1: [cap][FF] for the two-GEMM gate / up path (up's fp32 output) and as a2_plan's tail-split partials (non-exact
+        // mode: its capacity bounds the split count, i.e. the numerics, so it stays FF there). In MK_EXACT mode with every
+        // gate / up pair fused (same-type or V2 mixed), y1's other users need VD floats per token (DeltaNet z; attention
+        // k / v, 2 KVD; EXA partials, whose split is numerically free): 45 KB less per token. MK_PF_Y1=1: always FF.
+        bool all_fused = true;
+        for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
+        const bool y1full = getenv("MK_PF_Y1") && atoi(getenv("MK_PF_Y1")) == 1;
+        y1_floats = (size_t) cap * (exact && all_fused && !y1full ? VD : FF);
+        hp.y1 = dalloc<float>(y1_floats);
         hp.y2 = dalloc<float>((size_t) cap * VD);
         hp.dq = dalloc<__half>((size_t) cap * QKV);
         hp.gb = dalloc<float>((size_t) cap * 2 * NVH);
@@ -7070,6 +7078,7 @@ struct MKEngine::Impl {
         mmh_attr<pf::TIQ3S, false, 1>();
 #endif
 #endif
+        glu_mix_attr();
         if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
             pf_bn_force = atoi(e);
             if (pf_bn_force != 0 && pf_bn_force != 32 && pf_bn_force != 64 && pf_bn_force != 128)
@@ -7122,6 +7131,7 @@ struct MKEngine::Impl {
 
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
+    size_t y1_floats = 0; // hp.y1 in floats (pf_init: cap x FF, or cap x VD in MK_EXACT mode with every gate / up fused)
     // the slot's main buffer holds K q6 / V q5 (the D / D-prime presets): pk_attn8's compile-time-format instantiation
     bool kv_k6v5(int slot) const { return hb.kvb[0][slot] == 6 && hb.kvb[1][slot] == 5; }
     bool attn_old = false, attn_split = true, attn_pv16 = true;
@@ -7137,7 +7147,7 @@ struct MKEngine::Impl {
         return {pieces ? reinterpret_cast<float *>(hp.xh2) : hp.y1, reinterpret_cast<float *>(hp.xh)};
     }
     std::pair<size_t, size_t> ex_cap(bool pieces) const { // (partial slots)
-        return {(size_t) hp.cap * FF / (pieces ? 2 : 1) / A2_PART, (size_t) hp.cap * D / A2_PART};
+        return {(pieces ? (size_t) hp.cap * FF / 2 : y1_floats) / A2_PART, (size_t) hp.cap * D / A2_PART};
     }
     // MK_EXACT work split (pk_attn8 EXA): numerically free (every split gives the same rows), so this only balances.
     // The last N - nfull items (blockIdx order) are split into a head unit (segments 0 .. h - 1, folded in registers ->
@@ -7231,7 +7241,7 @@ struct MKEngine::Impl {
         // y1 (k, v of the layer) is free between pk_attn_prep and the FFN: partials of split items
         const int N = (T + A2_Q - 1) / A2_Q * NKV;
         int nfull = N, S = 1;
-        if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
+        if (attn_split) a2_plan(T, n, a2_slots, y1_floats, nfull, S);
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
             // pk_attn8 reads K in any MK_KV format (low-bit tiles are expanded to int8 in its staging) and any V format
@@ -7356,9 +7366,58 @@ struct MKEngine::Impl {
                 default: break;
             }
         }
+        if (glu_mix_on && glu_mix(g, u, ntok)) return;
         gemm(g, ntok, hp.y0, g.N, pf::OUT_STORE);
         gemm(u, ntok, hp.y1, u.N, pf::OUT_STORE);
         pk_glu<<<ntok, 256>>>(hp.y0, hp.y1, hp.xh2, g.N);
+    }
+    // V2: a gate / up pair of different types (or layouts) as one mixed-type fused launch, pf::mmh<TG, true, NB, LG, TU, LU>
+    // (warps 0-3 gate rows, 4-7 up rows, each half its own type): the same products, sums and silu * up as the two GEMMs +
+    // pk_glu, so bit-identical, without the fp32 y0 / y1 round trip (y1 can then shrink, pf_init). MK_PF_GLU_MIX=0: off.
+    // The pairs of UD-Q4_K_XL (gate / up, the layout of the build: MK_WV main layers are in the wv layout except Q3_K;
+    // Q6_K only with MK_WV_Q6F at MAXT > 5); any other pair takes the two-GEMM path.
+    bool glu_mix_on = !(getenv("MK_PF_GLU_MIX") && atoi(getenv("MK_PF_GLU_MIX")) == 0);
+    static constexpr int GLW = MK_WV ? 1 : 0, GL6 = MK_WV && MK_MAXT > 5 && MK_WV_Q6F ? 1 : 0;
+#define MK_GLU_MIX_PAIRS(X)                                                                                                \
+    X(pf::TQ4K, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ4K, GLW)                      \
+    X(pf::TQ4K, GLW, pf::TIQ4, GLW) X(pf::TQ6K, GL6, pf::TQ6K, GL6) X(pf::TIQ4, GLW, pf::TQ3K, 0)                        \
+    X(pf::TQ6K, GL6, pf::TQ5K, GLW) X(pf::TQ3K, 0, pf::TIQ4, GLW) X(pf::TIQ4NL, GLW, pf::TIQ4, GLW)                      \
+    X(pf::TIQ4NL, GLW, pf::TQ5K, GLW) X(pf::TQ5K, GLW, pf::TIQ4NL, GLW)
+    template <int TG, int LG, int TU, int LU> void mmh_attr_mix() {
+        CK(cudaFuncSetAttribute(pf::mmh<TG, true, 32, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 32>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TG, true, 64, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 64>()));
+        CK(cudaFuncSetAttribute(pf::mmh<TG, true, 128, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 128>()));
+    }
+    template <int TG, int LG, int TU, int LU> void mmh_launch_mix(int nrt, const pf::WMat & Wg, const pf::WMat & Wu, int ntok, const pf::Out & O) {
+        switch (pf_nb(ntok, nrt)) {
+            case 32: pf::mmh<TG, true, 32, LG, TU, LU><<<dim3(nrt, (ntok + 31) / 32), 256, pf::hm_smem2<TG, TU, 32>()>>>(Wg, hp.xh, ntok, O, nullptr, Wu); break;
+            case 64: pf::mmh<TG, true, 64, LG, TU, LU><<<dim3(nrt, (ntok + 63) / 64), 256, pf::hm_smem2<TG, TU, 64>()>>>(Wg, hp.xh, ntok, O, nullptr, Wu); break;
+            default: pf::mmh<TG, true, 128, LG, TU, LU><<<dim3(nrt, (ntok + 127) / 128), 256, pf::hm_smem2<TG, TU, 128>()>>>(Wg, hp.xh, ntok, O, nullptr, Wu); break;
+        }
+    }
+    void glu_mix_attr() {
+#define MK_GLU_ATTR(TG, LG, TU, LU) mmh_attr_mix<TG, LG, TU, LU>();
+        MK_GLU_MIX_PAIRS(MK_GLU_ATTR)
+#undef MK_GLU_ATTR
+    }
+    // ntok > 0: launch it if the pair has an instantiation; ntok = 0: only whether it has one
+    bool glu_mix(const Mat & g, const Mat & u, int ntok) {
+        if (glu_fused(g, u) || g.K != u.K || g.N != u.N) return false;
+        const pf::WMat Wg{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd}, Wu{u.w, u.d, u.type, u.K, u.N, u.rb, u.nd};
+        const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
+#if MK_WV
+        const int nrt = g.N / (pf::BM / 2), gl = g.fm, ul = u.fm;
+#else
+        const int nrt = g.N / (pf::BM / 2), gl = 0, ul = 0;
+#endif
+#define MK_GLU_GO(TG, LG, TU, LU)                                                                                          \
+    if (g.type == TG && gl == LG && u.type == TU && ul == LU) {                                                            \
+        if (ntok > 0) mmh_launch_mix<TG, LG, TU, LU>(nrt, Wg, Wu, ntok, O);                                                \
+        return true;                                                                                                       \
+    }
+        MK_GLU_MIX_PAIRS(MK_GLU_GO)
+#undef MK_GLU_GO
+        return false;
     }
 
     // MK_PF_PROFILE=1: per-category GPU time of the batched prefill (events around each launch)
@@ -7368,7 +7427,7 @@ struct MKEngine::Impl {
     template <class F> void pf_time(const char * cat, F f) {
         if (!pf_prof) { f(); return; }
         // MK_PF_PROFILE=2: idempotent kernels are timed alone (5 repeats, min)
-        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_ffn_gu2", "gemm_dn_in", "gemm_attn_qkv"};
+        static const char * idem[] = {"attn_prep", "attn_out", "dn_out", "norm_quant", "dn_ab", "attn", "embed", "gemm_ffn_gu", "gemm_ffn_gum", "gemm_ffn_gu2", "gemm_dn_in", "gemm_attn_qkv"};
         if (getenv("MK_PF_PROFILE")[0] == '2' && std::any_of(std::begin(idem), std::end(idem), [&](const char * c) { return !strcmp(c, cat); })) {
             float best = 1e30f;
             for (int r = 0; r < 5; r++) {
@@ -7536,8 +7595,10 @@ struct MKEngine::Impl {
                     dl++;
                 }
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.post_norm); });
-                // (profile: gate / up pairs that run as two GEMMs + pk_glu are reported as gemm_ffn_gu2)
-                pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : "gemm_ffn_gu2", [&] { gemm_glu(W.fg, W.fu, T); });
+                // (profile: mixed-type fused gate / up pairs are reported as gemm_ffn_gum, pairs that run as two GEMMs +
+                // pk_glu as gemm_ffn_gu2)
+                pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : glu_mix_on && glu_mix(W.fg, W.fu, 0) ? "gemm_ffn_gum" : "gemm_ffn_gu2",
+                        [&] { gemm_glu(W.fg, W.fu, T); });
                 pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
             }
             wd_T = T;
