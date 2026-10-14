@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build the two long prompt files h2h_client.py uses: pf38k.txt (~38k tokens of source code) and pf101k.txt (~101k).
+"""Build the long prompt files: pf38k.txt (~38k tokens of source code) and pf101k.txt (~101k) for h2h_client.py, and
+pf64k.txt (~64k) for decode_state.sh.
 
   python3 make_prompts.py [--out DIR] [--source FILE ...] [--extra FILE ...]
 
 pf38k.txt = the first --bytes-38k bytes of the concatenated --source files (default: this repo's megakernel sources).
 pf101k.txt = pf38k.txt followed by the --extra files (default: the rest of the megakernel sources, then any extra
 file given), cut at --bytes-101k.  pf101k therefore starts with pf38k, which is what the prompt-reuse tests need
-(the 101k prompt shares a 38k-token prefix with the earlier request).  The reference numbers in the notes used
+(the 101k prompt shares a 38k-token prefix with the earlier request).  pf64k.txt is the same text cut at --bytes-64k.  The reference numbers in the notes used
 100,000 bytes = 38,049 tokens and 325,100 bytes = 101,586 tokens of the Qwen3.8 tokenizer; other text gives other
 token counts, so count them with the target model's tokenizer (llama-tokenize) when absolute lengths matter.
 """
@@ -32,7 +33,7 @@ def cut_bytes(text, n):
     return text.encode("utf-8")[:n].decode("utf-8", errors="ignore")
 
 
-def build(sources, extra, n38, n101):
+def build(sources, extra, n38, n101, n64=207_975):
     base = read_all(sources)
     if len(base.encode("utf-8")) < n38:
         raise SystemExit(f"--source files hold {len(base.encode('utf-8'))} bytes, need {n38}")
@@ -43,7 +44,7 @@ def build(sources, extra, n38, n101):
         raise SystemExit("internal error: pf101k does not start with pf38k")
     if len(p101.encode("utf-8")) < n101:
         raise SystemExit(f"sources hold only {len(p101.encode('utf-8'))} bytes, need {n101}: add --extra files")
-    return p38, p101
+    return p38, p101, cut_bytes(full, n64)
 
 
 def main(argv=None):
@@ -52,11 +53,12 @@ def main(argv=None):
     ap.add_argument("--source", nargs="+", default=[os.path.join(MKDIR, f) for f in DEFAULT_SOURCES])
     ap.add_argument("--extra", nargs="*", default=[os.path.join(MKDIR, f) for f in DEFAULT_EXTRA])
     ap.add_argument("--bytes-38k", type=int, default=100_000)
+    ap.add_argument("--bytes-64k", type=int, default=207_975)
     ap.add_argument("--bytes-101k", type=int, default=325_100)
     a = ap.parse_args(argv)
-    p38, p101 = build(a.source, a.extra, a.bytes_38k, a.bytes_101k)
+    p38, p101, p64 = build(a.source, a.extra, a.bytes_38k, a.bytes_101k, a.bytes_64k)
     os.makedirs(a.out, exist_ok=True)
-    for name, text in (("pf38k.txt", p38), ("pf101k.txt", p101)):
+    for name, text in (("pf38k.txt", p38), ("pf64k.txt", p64), ("pf101k.txt", p101)):
         with open(os.path.join(a.out, name), "w", encoding="utf-8", newline="") as f:
             f.write(text)
         print(f"{name}: {len(text.encode('utf-8'))} bytes -> {os.path.join(a.out, name)}")
