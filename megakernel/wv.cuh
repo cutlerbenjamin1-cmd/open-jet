@@ -519,7 +519,7 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
 // Tile `tile` (rows 16 tile .. + 15) of m over super-blocks [sb0, sb0 + nsb) (the chunk in shared memory starts at sb0).
 // C fragment: v[n][c] = row 16 tile + g + 8 (c >> 1), token TPG n + 2 tq + (c & 1) (split: tokens 4 n + 2 tq & 3 + (c & 1),
 // valid in threads tq < 2). Out of line per (type, T, X16): each gets its own register allocation (128 cap).
-template <int TYPE, int T, bool X16>
+template <int TYPE, int T, bool X16, int ROLE = 0> // ROLE: separate instances for MK_WV_OUT's out role (wv_tile_off)
 __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, int sb0, int nsb, const WvXS xs) {
     static_assert(!wv_s16(TYPE) || X16, "per-16 weight scales need the split MMAs");
     using C = WvCfg<T, X16>;
@@ -568,6 +568,19 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
         default: return wv_tile<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs);
     }
 }
+
+#if MK_MAXT > 5 && MK_WV_OUT
+// MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's made ptxas re-split the
+// registers around those calls: ffn_down's resid_wv<8, true> spilled 16 / 40 -> 60 / 228 B and ran slower (spill track)
+template <int T>
+__device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+    switch (m.type) {
+        case T_Q6K: return wv_tile<T_Q6K, T, true, 1>(m, tile, sb0, nsb, xs);
+        case T_Q3K: return wv_tile<T_Q3K, T, true, 1>(m, tile, sb0, nsb, xs);
+        default: return wv_tile<T_IQ3S, T, true, 1>(m, tile, sb0, nsb, xs);
+    }
+}
+#endif
 
 // ---- phases ----------------------------------------------------------------------------------------------------------
 // Work split of a phase (bench k_wv): block b takes the tiles [ntile b / G, ntile (b + 1) / G) of the phase's tile space
@@ -843,7 +856,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
 // (G = gridDim / WV_S blocks per chunk). Each chunk's partial sums go to cB.wvpart; the last of the 2 WV_S (tile, chunk)
 // arrivals at a 32-row group adds the chunks in order 0 .. WV_S - 1 (fixed: T-invariant), adds the residual and
 // re-quantises it for the next RMS-normed consumer (weight wnext), like resid32's epilogue.
-template <int T, bool X16, int K>
+template <int T, bool X16, int K, bool OFF = false> // OFF: MK_WV_OUT's out role (wv_tile_off)
 __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float * wnext, int role) {
     constexpr int NSB = K / 256, CH = NSB / WV_S, US = 8 * CH;
     static_assert(NSB % WV_S == 0, "split-K chunks of whole super-blocks");
@@ -863,7 +876,13 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     unsigned * cnt = cB.wvcnt + role * (D / 32);
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
+#if MK_MAXT > 5 && MK_WV_OUT
+        WvAcc<C::NG> a;
+        if constexpr (OFF) a = wv_tile_off<T>(Wm, tile, CH * kc, CH, xs);
+        else a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
+#else
         const WvAcc<C::NG> a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
+#endif
         float * part = cB.wvpart + (size_t) kc * MAXT * D;
         if (!X16 || tq < 2) {
 #pragma unroll
@@ -894,4 +913,18 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
             if (lane == 0) cnt[j] = 0;
         }
     }
+}
+
+// out / ssm_out (K = VD) in the wv layout, residual add into x, re-quantised for the next normed consumer (role 0).
+// MK_WV_OUT (MK_MAXT > 5): the offset types run the split MMAs (X16, min2 fill): their per-16 weight scales need them, and
+// the q32 activations fit the split view as they are (a block's two 16-chunks are units with the block's scale each)
+template <int T>
+__device__ __forceinline__ void resid_out_wv(const Mat & Wm, const float * wnext) {
+#if MK_MAXT > 5 && MK_WV_OUT
+    if (wv_min2(Wm.type)) {
+        resid_wv<T, true, VD, true>(Wm, cB.qo, wnext, 0);
+        return;
+    }
+#endif
+    resid_wv<T, false, VD>(Wm, cB.qo, wnext, 0);
 }

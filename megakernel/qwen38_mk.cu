@@ -69,6 +69,12 @@
 #ifndef MK_WV_FMK
 #define MK_WV_FMK 1
 #endif
+// MK_WV_OUT (MK_MAXT > 5, default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
+// as ffn_down's) on the split MMAs at every T, instead of dp4a resid32 (padded to 8 rows at T 6-7). Changes those matrices'
+// summation order (wv vs dp4a): opt-in, KLD-gated (notes/agent_spill.md M3).
+#ifndef MK_WV_OUT
+#define MK_WV_OUT 0
+#endif
 // MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
 // ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),
 // the conv ring has 16 slots, and the attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
@@ -4164,7 +4170,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_ATTN_CORE);
             attn_combine<T>(n, 0, L / 4);
             gsync(epoch, PH_ATTN_COMB);
-            if (W.o.fm) resid_wv<T, false, VD>(W.o, cB.qo, W.post_norm, 0);
+            if (W.o.fm) resid_out_wv<T>(W.o, W.post_norm);
             else resid_dp<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
         } else {
@@ -4174,7 +4180,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
-            if (W.sout.fm) resid_wv<T, false, VD>(W.sout, cB.qo, W.post_norm, 0);
+            if (W.sout.fm) resid_out_wv<T>(W.sout, W.post_norm);
             else resid_dp<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_SOUT);
             dl++;
@@ -5656,7 +5662,13 @@ struct MKEngine::Impl {
                 L.q = up_mat(blk(i, "attn_q.weight"), D, QG);
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = true; // MK_WV_OUT: the offset types of out / ssm_out in the wv layout too
+#endif
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = false;
+#endif
                 needq(blk(i, "attn_q.weight"), L.q.type);
                 needq(blk(i, "attn_k.weight"), L.k.type);
                 needq(blk(i, "attn_v.weight"), L.v.type);
@@ -5666,7 +5678,13 @@ struct MKEngine::Impl {
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = true;
+#endif
                 L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = false;
+#endif
                 needq(blk(i, "attn_qkv.weight"), L.qkv.type);
                 needq(blk(i, "attn_gate.weight"), L.gate.type);
                 needq(blk(i, "ssm_out.weight"), L.sout.type);
@@ -5742,7 +5760,9 @@ struct MKEngine::Impl {
 #if MK_WV
         wv_lay = false;
         fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; %s), MAXT %d\n", wv_n, wv_s,
-                MAXT > 5 ? "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a" : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
+                MAXT > 5 ? (MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
+                                    : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
+                          : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
 #endif
         req_q4 = mtp_q4 != 0;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
