@@ -92,7 +92,7 @@ def run_mk(args):
             print(f"mk draft={args.draft} prompt{i} rep{rep}: {m.group(1)} tok, {tps:.2f} tok/s, "
                   f"accepted {m.group(4)}/{m.group(5)}")
             if rep == 0 and args.dump:
-                ids = [int(x) for x in re.search(r"IDS:(.*)", out.stdout).group(1).split()]
+                ids = [int(x) for x in re.search(r"^IDS:(.*)", out.stdout, re.M).group(1).split()]
                 with open(os.path.join(args.dump, f"mk_p{i}.json"), "w") as f:
                     json.dump({"tokens": ids}, f)
     print(f"mk draft={args.draft}: mean {sum(results)/len(results):.2f} tok/s")
