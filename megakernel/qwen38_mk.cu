@@ -6464,7 +6464,10 @@ struct MKEngine::Impl {
         const auto f = ex_memo.find(key);
         if (f != ex_memo.end()) return f->second;
         if (ex_memo.size() > 4096) ex_memo.clear();
-        const double c0 = 2.0; // per-CTA overhead (Q fragments, pipeline fill) in key tiles
+        // costs in key tiles (~3.2 us of one CTA): c0 per CTA (Q fragments, pipeline fill); cf per fold of a segment into R
+        // (R.o read + write, 192 KB at a resident CTA's share of DRAM bandwidth); cw per partial slot written; cc per slot
+        // read by pk_attn8_combx (the whole GPU's bandwidth, after the attention kernel)
+        const double c0 = 2.0, cf = 4.0, cw = 3.0, cc = 0.04;
         std::vector<int> nt(N); // key tiles of each item
         for (int i = 0; i < N; i++) {
             const int t0 = i % nqt * A2_Q;
@@ -6478,15 +6481,20 @@ struct MKEngine::Impl {
                 fr.back() += d;
                 std::push_heap(fr.begin(), fr.end(), std::greater<double>());
             };
-            for (int i = 0; i < nfull; i++) run(nt[i] + c0);
+            for (int i = 0; i < nfull; i++) run(nt[i] + c0 + cf * ((nt[i] - 1) / segt));
             const int ns = N - nfull;
             for (int u = 0; u < (ns > 0 ? S : 0); u++)
                 for (int j = 0; j < ns; j++) {
                     const int t = nt[nfull + j], k0 = u == 0 ? 0 : h + u - 1, k1 = u == 0 ? h : k0 + 1;
-                    run(k0 * segt < t ? std::min(t, k1 * segt) - k0 * segt + c0 : 0.1);
+                    if (k0 * segt >= t) {
+                        run(0.1); // (idle unit)
+                        continue;
+                    }
+                    const int e = std::min(t, k1 * segt);
+                    run(e - k0 * segt + c0 + cw + (u == 0 ? cf * ((e - 1) / segt) : 0.0));
                 }
             // + pk_attn8_combx: one more launch, reads S partial slots per split item
-            return *std::max_element(fr.begin(), fr.end()) + (ns > 0 ? c0 + 0.02 * ns * S : 0.0);
+            return *std::max_element(fr.begin(), fr.end()) + (ns > 0 ? c0 + cc * ns * S : 0.0);
         };
         ExPlan best{N, 1, 0, 0};
         double bt = sim(N, 1, 0);

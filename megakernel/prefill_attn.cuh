@@ -944,17 +944,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         else m0 = M0, m1 = M1, l0 = L0, l1 = L1;
     };
 
-    int ex_nb = EXA ? it0 + segt : 0; // EXA: the next segment boundary (it0 is one: 0 or k0 segt)
-    for (int it = it0; it < it1; it++) {
-        const int kb = it * A2_K;
-        pf::cpa_wait<0>(); // own copies of tiles it and it + 1
-        __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
-        if (EXA && it == ex_nb) { // a segment boundary: tiles < it are done
-            ex_nb += segt;
+    // EXA: tiles in segments (it0 is a boundary: 0 or k0 segt), the fold between two segments' tile loops: it touches only
+    // this thread's registers and global memory, so it is the same as folding after tile sb's barrier
+    for (int sb = it0, se; sb < it1; sb = se) {
+        se = EXA ? min(it1, sb + segt) : it1;
+        if (EXA && sb > it0) { // a segment boundary: tiles < sb are done
             if (ex_role != 2) {
                 ex_fold(true);
-            } else { // segment it / segt - 1 -> its slot, then a fresh online softmax
-                float * q = ex_base + (size_t) (1 + it / segt - 1 - ex_h) * A2_PART;
+            } else { // segment sb / segt - 1 -> its slot, then a fresh online softmax
+                float * q = ex_base + (size_t) (1 + sb / segt - 1 - ex_h) * A2_PART;
 #pragma unroll
                 for (int j = 0; j < 16; j++) {
                     float * e = q + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 8 * j + 2 * t4;
@@ -970,6 +968,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 m0 = m1 = -INFINITY, l0 = l1 = 0.f;
             }
         }
+    for (int it = sb; it < se; it++) { // (the tile loop: one pass over it0 .. it1 - 1 unless EXA)
+        const int kb = it * A2_K;
+        pf::cpa_wait<0>(); // own copies of tiles it and it + 1
+        __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
         __half * sVc = sV0 + ((it + 1) & 1) * A2_K * A2_LD; // V(it + 1) is converted into it during this tile
         const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
         const uint8_t * stv = asm_ + ((it + 1) % A8_NS) * A8_STG;
@@ -1128,6 +1130,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             }
         }
         if (ia < it1) a8_st_ks(sta, ksn); // K scales of tile ia (its stage was freed at this tile's first barrier)
+    }
     }
     pf::cpa_wait<0>();
     if (EXA && ex_role != 2) ex_fold(false); // R of all segments of this unit -> o / m / l
