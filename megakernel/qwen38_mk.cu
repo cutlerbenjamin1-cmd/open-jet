@@ -4055,65 +4055,60 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
 // Rows < tau keep their drafts; row tau draws from max(0, w_tau p_tau - q_tau) (tau < g; never d_tau, see notes/
 // agent_mtp.md) or from p_g (tau = g). A later row is drawn fresh from its p only while every row before it emitted its
 // draft (main_control then reads it; its prefix is the drafts, so its p is the target conditional): a fallback only.
-// Single thread (the last lm_head block's thread 0), out of line: its arrays stay out of the main pass's frame.
+// Single thread (the last lm_head block's thread 0), out of line, one pass over the rows with the caller's probability
+// array p (no arrays of its own: a local array here raised mk_cycle's cumulative stack 1104 -> 1360 B, ~31 MiB of VRAM).
+// tau is found in the same forward pass (the last i with eta_i < h_i); the residual is drawn in two passes over row tau.
 __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl, int * tg, const float2 * cand,
-                                                const float2 * dq) {
+                                                const float2 * dq, float (&p)[TOPK_MAX]) {
     const Ctl * c = cB.ctl;
     const unsigned long long n = (unsigned long long) c->n;
     const int g = T - 1;
-    float w[MAXT], h[MAXT];
-    float pa[TOPK_MAX], pb[TOPK_MAX]; // row i - 1's probabilities, row i's
-    int K = cand_probs(cand, P, pa);
-    float wi = 1.f;
-    w[0] = 1.f;
-    for (int i = 1; i <= g; i++) {
-        const float2 * cd = cand + (i - 1) * TOPK_MAX;
-        const int d = c->tok[i];
+    float w = 1.f, wt = 1.f; // w_i; w_tau
+    int tau = 0;
+    for (int i = 0; i < g; i++) { // row i: h_i (i >= 1) from p_i, q_i and w_i, then w_(i + 1) from the draft d_i
+        const float2 * cd = cand + i * TOPK_MAX;
+        const float2 * q = dq + i * TOPK_MAX;
+        const int K = cand_probs(cd, P, p);
+        if (i >= 1) {
+            float r = 0.f; // (q_i's mass outside p_i's candidates adds nothing: max(0, 0 - q) = 0)
+            for (int j = 0; j < K; j++) r += fmaxf(0.f, w * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
+            const float den = r + 1.f - w;
+            const float h = den > 0.f ? r / den : 1.f;
+            if (urand(P.seed, 2 * (n + i - 1)) < h) {
+                tau = i;
+                wt = w;
+            }
+        }
+        const int d = c->tok[i + 1];
         float pd = 0.f;
         for (int j = 0; j < K; j++)
-            if (__float_as_int(cd[j].y) == d) pd += pa[j];
-        const float qd = dq_prob(dq + (i - 1) * TOPK_MAX, d);
-        wi = qd > 0.f ? fminf(wi * pd / qd, 1.f) : 0.f;
-        w[i] = wi;
-        if (i < g) {
-            const float2 * cd2 = cand + i * TOPK_MAX;
-            const float2 * q2 = dq + i * TOPK_MAX;
-            const int K2 = cand_probs(cd2, P, pb);
-            float r = 0.f; // (q_i's mass outside p_i's candidates adds nothing: max(0, 0 - q) = 0)
-            for (int j = 0; j < K2; j++) r += fmaxf(0.f, wi * pb[j] - dq_prob(q2, __float_as_int(cd2[j].y)));
-            const float den = r + 1.f - wi;
-            h[i] = den > 0.f ? r / den : 1.f;
-            for (int j = 0; j < K2; j++) pa[j] = pb[j];
-            K = K2;
-        } else {
-            h[i] = wi;
-        }
+            if (__float_as_int(cd[j].y) == d) pd += p[j];
+        const float qd = dq_prob(q, d);
+        w = qd > 0.f ? fminf(w * pd / qd, 1.f) : 0.f;
     }
-    int tau = 0;
-    for (int i = g; i >= 1; i--)
-        if (urand(P.seed, 2 * (n + i - 1)) < h[i]) {
-            tau = i;
-            break;
-        }
+    if (urand(P.seed, 2 * (n + g - 1)) < w) { // h_g = w_g
+        tau = g;
+        wt = w;
+    }
     for (int i = 0; i < tau; i++) tg[i] = c->tok[i + 1];
     {
         const float2 * cd = cand + tau * TOPK_MAX;
-        K = cand_probs(cd, P, pa);
+        const int K = cand_probs(cd, P, p);
         const float u = urand(P.seed, 2 * (n + tau) + 1);
+        const float2 * q = dq + tau * TOPK_MAX;
         float rs = 0.f;
-        if (tau < g) {
-            const float2 * q = dq + tau * TOPK_MAX;
-            for (int j = 0; j < K; j++) rs += (pb[j] = fmaxf(0.f, w[tau] * pa[j] - dq_prob(q, __float_as_int(cd[j].y))));
-        }
+        if (tau < g)
+            for (int j = 0; j < K; j++) rs += fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
         if (!(rs > 0.f)) { // tau = g: p_g; else rounding only
-            tg[tau] = cand_draw(cd, pa, K, -1, u);
+            tg[tau] = cand_draw(cd, p, K, -1, u);
         } else {
             float x = u * rs;
             int pick = -1;
             for (int j = 0; j < K; j++) {
-                if (pb[j] <= 0.f) continue;
+                const float rj = fmaxf(0.f, wt * p[j] - dq_prob(q, __float_as_int(cd[j].y)));
+                if (rj <= 0.f) continue;
                 pick = __float_as_int(cd[j].y);
-                x -= pb[j];
+                x -= rj;
                 if (x < 0.f) break;
             }
             tg[tau] = pick;
@@ -4121,8 +4116,8 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
     }
     for (int i = tau + 1; i < tl && tg[i - 1] == c->tok[i]; i++) {
         const float2 * cd = cand + i * TOPK_MAX;
-        K = cand_probs(cd, P, pa);
-        tg[i] = cand_draw(cd, pa, K, -1, urand(P.seed, 2 * (n + i) + 1));
+        const int K = cand_probs(cd, P, p);
+        tg[i] = cand_draw(cd, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
     }
 }
 #endif
@@ -4138,13 +4133,16 @@ __device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl,
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
 #if MK_MAXT > 5
+    float p[TOPK_MAX];
     if (P.spec_blk && P.mode == MODE_DECODE && c->dsmp && T >= 2 && tl == T) {
-        sample_targets_blk(P, T, tl, tg, cand, dq);
+        sample_targets_blk(P, T, tl, tg, cand, dq, p);
         return;
     }
-#endif
+    const unsigned long long n = (unsigned long long) c->n;
+#else
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
+#endif
     for (int i = 0; i < tl; i++) {
         const float2 * cd = cand + i * TOPK_MAX;
         const int K = cand_probs(cd, P, p);
@@ -4964,6 +4962,11 @@ struct MKEngine::Impl {
         // context cap: from position dctx on, at most 4 drafts (T <= 5: at long context the wide pass's second
         // head-group pass over K / V costs more than drafts 5..7 gain)
         int dctx = INT_MAX;
+        // g7 (default on): at depth > 5 (the wide tier T 6-8 costs the same per cycle, a draft there only its ~0.5 ms MTP
+        // pass) the gates are stop after drafts 2-4 below 0.25, drop draft 5 below 0.3 (stay at T <= 5), stop after drafts
+        // 5-6 below 0.3, never drop the deepest draft (notes/agent_mtp.md: offline policy search on open-policy logs,
+        // live 38k / 101.6k greedy +1..3% over the gates above, same output). Any explicit stop / drop key turns it off.
+        int g7 = 1;
 #else
         float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
 #endif
@@ -6463,7 +6466,11 @@ struct MKEngine::Impl {
         }
 #if MK_MAXT > 5
         const int top = depth_top(hctl.n); // drop_last: the deepest draft of this position's policy depth
-        if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
+        if (pol.g7 && top > 5) {
+            for (int k = 1; k <= 3; k++) L.gate_stop[k] = 0.25f;
+            L.gate_stop[4] = L.gate_stop[5] = 0.3f;
+            L.gate_drop[4] = 0.3f;
+        } else if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
 #endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
@@ -7395,7 +7402,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
-// blk=0|1 (sampled drafts: block verification, sample_targets_blk);
+// blk=0|1 (sampled drafts: block verification, sample_targets_blk); g7=0|1 (the depth > 5 gates, Impl::Policy);
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -7411,6 +7418,10 @@ void MKEngine::set_policy(const std::string & spec) {
         const size_t e = kv.find('=');
         if (e == std::string::npos) throw std::runtime_error("policy: expected key=value, got " + kv);
         const std::string k = kv.substr(0, e), v = kv.substr(e + 1);
+#if MK_MAXT > 5
+        if (k == "drop" || k == "stop" || (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0)))
+            pol.g7 = 0; // explicit gates replace the depth > 5 defaults
+#endif
         if (k == "depth") pol.depth = std::stoi(v);
         else if (k == "dmin") pol.dmin = std::stoi(v);
         else if (k == "drop") for (float & x : pol.gate_drop) x = std::stof(v);
@@ -7419,7 +7430,8 @@ void MKEngine::set_policy(const std::string & spec) {
                  k[4] < '1' + MAXT - 1) // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
             (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
 #if MK_MAXT > 5
-        else if (k == "droplast") pol.drop_last = std::stof(v); // the deepest draft (k = n_draft - 1)
+        else if (k == "droplast") pol.drop_last = std::stof(v), pol.g7 = 0; // the deepest draft (k = n_draft - 1)
+        else if (k == "g7") pol.g7 = std::stoi(v);
         else if (k == "dctx") pol.dctx = std::stoi(v); // from position dctx on: at most 4 drafts
 #endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
