@@ -495,6 +495,15 @@ __device__ __forceinline__ SX wv_sx() {
 __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
     uint8_t * const sm = smem; return reinterpret_cast<float *>(sm + SM_MISC); }
 
+// threadIdx.x read afresh (an S2R the compiler can neither hoist nor CSE): for values derived from the thread index that
+// would otherwise stay live across a long loop. At the 128-register cap ptxas parks such values in spill slots, and a
+// reload after a long gap misses L1 (the W48 item prologue's reload: ~0.3% of a 38k -d 7 cycle's stall samples, spill track)
+__device__ __forceinline__ int tid_x() {
+    int t;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(t));
+    return t;
+}
+
 __device__ __forceinline__ void cp_async16(void * smem_dst, const void * gsrc) {
     const unsigned d = (unsigned) __cvta_generic_to_shared(smem_dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(gsrc) : "memory");
@@ -3106,7 +3115,10 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
 // conversions take (xm / sub). The softmax warps take 12 rows each (two sub-passes). Per-row arithmetic is attn_core_t's
 // (the same S / softmax / P V code per row): the partials equal attn_core_q8_t's and attn_core_t's for every format.
 constexpr int SM_ATTN_W48 = 48 * (256 + 8) * 2 + 6 * AQ_STG + 2 * 48 * AQ_LDS * 4 + 2 * 48 * (ATP + 8) * 2;
-static_assert(SM_ATTN_W48 <= SM_TOTAL, "attn_core_w48 shared memory");
+static_assert(SM_ATTN_W48 + NW * 8 * 4 <= SM_TOTAL, "attn_core_w48 shared memory (+ MK_W48S's per-warp scalars)");
+#ifndef MK_W48S
+#define MK_W48S 1 // attn_core_w48's scalars (n, ws, CS, L_ctx, nch) from shared memory (0: registers / spill slots)
+#endif
 template <int T, bool MIX>
 __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
@@ -3122,7 +3134,28 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const int ws = mtp_ws(slot, n); // MK_MTP_WIN
     int nch, CS;
     attn_dims_w(L_ctx, ws, nch, CS);
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+    // the call's scalars in shared memory, one copy per warp (MK_W48S), read with volatile loads where used: kept in
+    // registers, ptxas spilled them and their reload at each item's start waited on local memory (L2) behind the K / V
+    // stream (~0.3% of a 38k -d 7 cycle's stall samples, notes/agent_spill.md)
+#if MK_W48S
+    if ((threadIdx.x & 31) < 5) {
+        const int l = threadIdx.x & 31;
+        reinterpret_cast<int *>(sm + SM_ATTN_W48)[8 * (threadIdx.x >> 5) + l] = l == 0 ? n : l == 1 ? ws : l == 2 ? CS : l == 3 ? L_ctx : nch;
+    }
+    __syncwarp();
+    auto w48s = [&](int i) -> int { return reinterpret_cast<volatile const int *>(sm + SM_ATTN_W48)[8 * (tid_x() >> 5) + i]; };
+#define W48_N w48s(0)
+#define W48_WS w48s(1)
+#define W48_CS w48s(2)
+#define W48_LC w48s(3)
+#define W48_NCH w48s(4)
+#else
+#define W48_N n
+#define W48_WS ws
+#define W48_CS CS
+#define W48_LC L_ctx
+#define W48_NCH nch
+#endif
     __half * sQ = reinterpret_cast<__half *>(sm);                 // [RP][LDH]
     uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + RP * LDH); // NSK stages
     uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
@@ -3137,10 +3170,13 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const int wsr = MIX ? kv_ws(L_ctx) : 0, wsm = MIX ? kv_wsm(wsr) : 0;
     const KvFmt kf = MIX ? kv_fmt(slot) : KvFmt{8, 8, 0, 0};
 
-    for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
-        const int g = item / nch, c = item % nch;
+    for (int item = blockIdx.x; item < NKV * W48_NCH; item += gridDim.x) {
+        // thread indices per item (tid_x): hoisted out of the item loop, their derived offsets were spilled and the
+        // prologue's reload missed L1
+        const int tid = tid_x(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+        const int nch_ = W48_NCH, g = item / nch_, c = item % nch_;
         int c0, c1;
-        attn_chunk(c, ws, CS, L_ctx, c0, c1);
+        attn_chunk(c, W48_WS, W48_CS, W48_LC, c0, c1);
         // ---- item prologue, attn_core_t's (q rows -> sQ, this cycle's K / V rows -> cache, m / l init)
         float qw[8];
         load8(W.qn + lane * 8, qw);
@@ -3152,7 +3188,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 float v[8];
                 load8(cB.qbuf + t * QG + head * 512 + lane * 8, v);
                 float2 rc[8];
-                const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+                const float2 * tab = cB.rope + (size_t) (W48_N + t) * 32 + (lane & 3) * 8;
 #pragma unroll
                 for (int k = 0; k < 8; k++) rc[k] = __ldg(tab + k);
                 float ss = 0.f;
@@ -3182,9 +3218,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 }
             }
         }
-        const int pn0 = max(c0, n), pn1 = min(c1, n + T);
+        const int nn = W48_N, pn0 = max(c0, nn), pn1 = min(c1, nn + T);
         for (int pp = pn0 + warp; pp < pn1; pp += NW) {
-            const int t = pp - n;
+            const int t = pp - nn;
             float v[8];
             load8(cB.kbuf + t * KVD + g * 256 + lane * 8, v);
             float ss = 0.f;
@@ -3374,7 +3410,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                     for (int sub = 0; sub < 2; sub++) {
                         if (32 * sub + 8 * (warp - 12) >= R) continue; // (warp-uniform)
                         const int r = 32 * sub + 8 * (warp - 12) + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
-                        const int lim = n + (r % T);
+                        const int lim = W48_N + (r % T);
                         const float * srow = sS + b * RP * LDS + r * LDS;
                         float sv[8];
 #pragma unroll
@@ -3424,6 +3460,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
         }
+        { // item epilogue: thread indices read afresh (not carried across the interval loop)
+        const int tid = tid_x(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+        (void) lane;
         if (warp >= 4 && warp < 12) {
             const int wn = warp - 4;
 #pragma unroll
@@ -3444,8 +3483,14 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 }
         }
         if (tid < R) cB.aml[item * AR + tid] = make_float2(sM(tid), sL(tid));
+        }
         __syncthreads();
     }
+#undef W48_N
+#undef W48_WS
+#undef W48_CS
+#undef W48_LC
+#undef W48_NCH
 }
 template <int T>
 __device__ __noinline__ void attn_core_w48q(const LayerW & W, int slot, int n) {
