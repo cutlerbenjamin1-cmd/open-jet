@@ -75,6 +75,12 @@
 #ifndef MK_WV_OUT
 #define MK_WV_OUT 0
 #endif
+// MK_WV_Q6F (MK_MAXT > 5, default 0): every main-layer Q6_K matrix fragment-ordered with its meta inline (wv.cuh "FM
+// Q6_K") and on wv at every T: out / ssm_out, gate / up, qkv / z, k / v leave dp4a (KLD-gated: new summation order),
+// ffn_down's Q6_K moves from tile-major to FM (bit-identical: the same integer chunk sums and float sequence).
+#ifndef MK_WV_Q6F
+#define MK_WV_Q6F 0
+#endif
 // MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
 // ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),
 // the conv ring has 16 slots, and the attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
@@ -83,6 +89,9 @@
 #endif
 #if MK_MAXT < 5 || MK_MAXT > 8 || (MK_MAXT > 5 && !MK_WV)
 #error "MK_MAXT must be 5, or 6..8 with MK_WV=1"
+#endif
+#if MK_WV_Q6F && MK_MAXT <= 5
+#error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
 #endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
@@ -5426,14 +5435,18 @@ struct MKEngine::Impl {
                 }
             });
 #if MK_MAXT > 5
-            if (wv_lay && wv_fd) wv_relay(m, q, meta); // main-layer ffn_down: tile-major values and meta pairs
+            // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
+            // the meta inline (one stream: meta is emptied, m.d stays null)
+            if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_relay(m, q, meta);
 #endif
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
-            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
             m.w = dq;
-            m.d = reinterpret_cast<const __half *>(dm);
+            if (!meta.empty()) {
+                uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
+                CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
+                m.d = reinterpret_cast<const __half *>(dm);
+            }
             wbytes += q.size() + meta.size();
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
@@ -5760,8 +5773,10 @@ struct MKEngine::Impl {
 #if MK_WV
         wv_lay = false;
         fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; %s), MAXT %d\n", wv_n, wv_s,
-                MAXT > 5 ? (MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
-                                    : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
+                MAXT > 5 ? (MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
+                                                   : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
+                            : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
+                                        : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
                           : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
 #endif
         req_q4 = mtp_q4 != 0;
@@ -6215,6 +6230,11 @@ struct MKEngine::Impl {
                 if (cnt[i])
                     fprintf(stderr, "  %-16s %8.3f ms  %8.2f us/call (fill %5.2f us)  x%d\n", names[i], tot[i] / 1e6,
                             tot[i] / cnt[i] / 1e3, fil[i] / cnt[i] / 1e3, cnt[i]);
+            if (getenv("MK_PROFILE_SEQ")) // every barrier position: its phase and min time (per-layer phase costs)
+                for (size_t k = 0; k < best_ns[T].size(); k++)
+                    if (best_tag[T][k] >= 0)
+                        fprintf(stderr, "[mk-seq] T=%d k=%zu %s %.2f fill %.2f\n", T, k, names[best_tag[T][k]],
+                                best_ns[T][k] / 1e3, best_fill[T][k] / 1e3);
         }
     }
 

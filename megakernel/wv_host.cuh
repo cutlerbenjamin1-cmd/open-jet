@@ -7,6 +7,39 @@
 // x 2 nd bytes) or empty. N % 16 == 0.
 void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::vector<uint8_t> & meta) {
     const int nb = K / 256;
+#if MK_MAXT > 5 && MK_WV_Q6F
+    if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline (meta is emptied)
+        const int mrow = nb * Q6_META;
+        std::vector<uint8_t> f((size_t) N / 16 * nb * Q6F_UNIT);
+        parallel_rows(N / 16, [&](int64_t tile) {
+            for (int rr = 0; rr < 16; rr++) {
+                const int r = (int) tile * 16 + rr, g = rr & 7, half = rr >> 3;
+                for (int sb = 0; sb < nb; sb++) {
+                    uint8_t * u = f.data() + ((size_t) tile * nb + sb) * Q6F_UNIT;
+                    const uint8_t * blk = w.data() + (size_t) r * rb + (size_t) sb * Q6_BLK;
+                    const uint8_t * mp = meta.data() + (size_t) r * mrow + (sb >> 1) * 2 * Q6_META;
+                    memcpy(u + 32 * g + 16 * half, mp + 16 * (sb & 1), 16);
+                    memcpy(u + Q6F_D + 4 * g + 2 * half, mp + 32 + 2 * (sb & 1), 2);
+                    for (int tq = 0; tq < 4; tq++) {
+                        const int l = 4 * g + tq;
+                        for (int p = 0; p < 4; p++) {
+                            memcpy(u + Q6F_LO + 512 * p + 16 * l + 8 * half, blk + 32 * p + 4 * tq, 4);
+                            memcpy(u + Q6F_LO + 512 * p + 16 * l + 8 * half + 4, blk + 32 * p + 16 + 4 * tq, 4);
+                            uint8_t * hd = u + Q6F_HI + 256 * p + 8 * l + 4 * half;
+                            for (int mm = 0; mm < 4; mm++) { // high 2 bits of element 4 tq + mm of (sub-block 2p + part, chunk c)
+                                auto hb = [&](int part, int c) { return (blk[128 + 8 * (2 * p + c) + 4 * part + mm] >> (2 * tq)) & 3; };
+                                hd[mm] = (uint8_t) ((hb(0, 0) << 4) | (hb(1, 0) << 6) | hb(0, 1) | (hb(1, 1) << 2));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        w.swap(f);
+        meta.clear();
+        return;
+    }
+#endif
     std::vector<uint8_t> o(w.size());
     if (wv_fm(type)) {
         const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : 136;

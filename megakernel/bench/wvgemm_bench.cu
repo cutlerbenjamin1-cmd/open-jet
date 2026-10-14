@@ -191,6 +191,11 @@ __device__ __forceinline__ void mma16832(int (&d)[4], const int (&a)[4], int b0,
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
 }
+__device__ __forceinline__ void mma16816(int (&d)[4], int a0, int a1, int b0, const int (&c)[4]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+}
 // float(byte k of w) + 2^23 (k compile-time after unrolling)
 __device__ __forceinline__ float mag23(unsigned w, int k) { return __int_as_float(__byte_perm(w, 0x4b000000u, 0x7540u | k)); }
 
@@ -541,11 +546,20 @@ struct XSm {
     int ld;
     const float4 * md;
     const float2 * mx;
+    const float4 * mx4; // K16: per (32-block j, group n, tq): MAGIC - 32 qsum of (token a, chunk 0), (b, 0), (a, 1), (b, 1)
 };
 
+// WV_Q6FM (spill2, M3): Q6_K in a fragment-ordered unit with the meta inline (wv_tile_q6f); 0 = off (TM / row-major as
+// before), 1 = split m16n8k32 at every T, 2 = m16n8k16 per 16-chunk at every T, 3 = split at T <= 4, k16 at T > 4.
+// All forms are bit-identical to each other and to the split path on the engine layouts (same integer chunk sums, same
+// float sequence per (row, token, chunk), the two chunk accumulators added last).
+#ifndef WV_Q6FM
+#define WV_Q6FM 0
+#endif
 template <int TYPE, int T, bool X16>
 struct Cfg {
-    static constexpr bool SPLIT = WV<TYPE>::S16 || X16;
+    static constexpr bool K16 = TYPE == T_Q6K && (WV_Q6FM == 2 || (WV_Q6FM == 3 && T > 4));
+    static constexpr bool SPLIT = !K16 && (WV<TYPE>::S16 || X16);
     static constexpr int TPG = SPLIT ? 4 : 8;
     static constexpr int NG = (T + TPG - 1) / TPG;
     static constexpr int NTOKP = NG * TPG;
@@ -668,9 +682,165 @@ template <class R> __device__ __forceinline__ void raw_opaque(R & r) {
 #pragma unroll
     for (int i = 0; i < (int) (sizeof(R) / 4); i++) asm volatile("" : "+r"(p[i]));
 }
+// ---- WV_Q6FM: fragment-ordered Q6_K (spill2) ---------------------------------------------------------------------
+// Unit (16-row tile, super-block) = 3360 B = 16 x (192 + 18), meta inline:
+//   [0, 256)     sc: per g {row g sc[16] | row g + 8 sc[16]} (int8, natural 16-chunk order)
+//   [256, 288)   d: per g {row g fp16 | row g + 8 fp16}
+//   [288, 2336)  qlo: 4 groups p x 512 B, lane l = 4 g + tq: {row g | row g + 8} x {word A | word B}; A = the Q4_K-order
+//                nibble bytes 32 p + 4 tq .. + 3 (chunk 0 elements 4 tq .. + 3 of sub-block 2 p in the low nibbles, of
+//                2 p + 1 in the high nibbles), B = bytes 32 p + 16 + 4 tq .. + 3 (chunk 1)
+//   [2336, 3360) qhi: 2 x 512 B (row g, then row g + 8), lane l: H_p, p = 0..3; byte m of H_p = the high 2 bits of element
+//                4 tq + m of (sub-block, chunk) (2p, 0) at bits 4-5, (2p + 1, 0) at 6-7, (2p, 1) at 0-1, (2p + 1, 1) at 2-3.
+// So thread tq supplies elements 4 tq .. + 3 of both 16-chunks of every sub-block: 9 LDG (7 x 16 B per lane, all warp
+// loads contiguous) per unit instead of the TM path's 26 x 4-8 B.
+#ifndef WV_Q6HP
+#define WV_Q6HP 0
+#endif
+constexpr int Q6F_UNIT = 3360, Q6F_D = 256, Q6F_LO = 288, Q6F_HI = 2336;
+struct Q6FRaw { int4 sc[2]; int dd; int2 q[2][4]; int hi[2][4]; };
+__device__ __forceinline__ void q6f_load(Q6FRaw & r, const Mat & m, int row0, int sb, int g, int tq) {
+    const uint8_t * u = m.w + ((size_t) (row0 >> 4) * (m.K >> 8) + sb) * Q6F_UNIT;
+    const int l = 4 * g + tq;
+    r.sc[0] = wld4(u + 32 * g);
+    r.sc[1] = wld4(u + 32 * g + 16);
+    r.dd = wld1(u + Q6F_D + 4 * g);
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        const int4 v = wld4(u + Q6F_LO + 512 * p + 16 * l);
+        r.q[0][p] = make_int2(v.x, v.y);
+        r.q[1][p] = make_int2(v.z, v.w);
+    }
+#if WV_Q6HP // qhi p-major: per p 256 B, lane l: {row g H_p | row g + 8 H_p} (a prefill stage reads one contiguous block)
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        const int2 v = wld2(u + Q6F_HI + 256 * p + 8 * l);
+        r.hi[0][p] = v.x;
+        r.hi[1][p] = v.y;
+    }
+#else
+#pragma unroll
+    for (int rr = 0; rr < 2; rr++) {
+        const int4 v = wld4(u + Q6F_HI + 512 * rr + 16 * l);
+        r.hi[rr][0] = v.x;
+        r.hi[rr][1] = v.y;
+        r.hi[rr][2] = v.z;
+        r.hi[rr][3] = v.w;
+    }
+#endif
+}
+// the int8x4 operand (q + 32) of row rr (0: g, 1: g + 8), sub-block k, chunk c: elements 16 c + 4 tq .. + 3
+__device__ __forceinline__ int q6f_frag(const Q6FRaw & r, int rr, int k, int c) {
+    const int p = k >> 1, part = k & 1;
+    const unsigned base = c ? (unsigned) r.q[rr][p].y : (unsigned) r.q[rr][p].x;
+    const unsigned lo = (part ? base >> 4 : base) & 0x0f0f0f0fu;
+    const unsigned H = (unsigned) r.hi[rr][p];
+    const unsigned hp = c == 0 ? (part ? H >> 2 : H) : (part ? H << 2 : H << 4);
+    return (int) (lo | (hp & 0x30303030u));
+}
+// d sc[cn] of row rr, 16-chunk cn = 2 k + c, as the TM path's wsc2 computes it (fmaf form: exact)
+__device__ __forceinline__ float q6f_fa(const Q6FRaw & r, float d, float nd, int rr, int cn) {
+    const int4 s = r.sc[rr];
+    const int w = (cn >> 2) == 0 ? s.x : (cn >> 2) == 1 ? s.y : (cn >> 2) == 2 ? s.z : s.w;
+    const int v = (int) (signed char) ((unsigned) w >> (8 * (cn & 3)));
+    return fmaf(d, __int_as_float(MAGIC + v), nd);
+}
+template <int T, bool X16>
+__device__ __forceinline__ void wv_tile_q6f(const Mat & m, int row0, int sb0, int nsb, const XSm & xs,
+                                            float (&acc)[Cfg<T_Q6K, T, X16>::NG][4]) {
+    using C = Cfg<T_Q6K, T, X16>;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, h = tq >> 1;
+    float acc1[C::K16 ? C::NG : 1][4]; // K16: chunk 1's accumulators (acc: chunk 0's)
+#pragma unroll
+    for (int n = 0; n < C::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc[n][c] = 0.f;
+#pragma unroll
+    for (int n = 0; n < (C::K16 ? C::NG : 1); n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc1[n][c] = 0.f;
+    // B: K16 token 8 n + g, elements 16 c + 4 tq; split token 4 n + (g & 3), chunk g >> 2 only (k-slots 16 (g >> 2) + ..)
+    const int8_t * xrow = C::K16 ? xs.xq + g * xs.ld + 4 * tq : xs.xq + (g & 3) * xs.ld + 16 * (g >> 2) + 4 * tq;
+#pragma unroll 1
+    for (int sb = 0; sb < nsb; sb++) {
+        Q6FRaw r;
+        q6f_load(r, m, row0, sb0 + sb, g, tq);
+        const float d0 = __half2float(__ushort_as_half((unsigned short) (r.dd & 0xffff)));
+        const float d1 = __half2float(__ushort_as_half((unsigned short) ((unsigned) r.dd >> 16)));
+        const float nd0 = -FMAGIC * d0, nd1 = -FMAGIC * d1;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int j = 8 * sb + k;
+            const int w00 = q6f_frag(r, 0, k, 0), w10 = q6f_frag(r, 1, k, 0);
+            const int w01 = q6f_frag(r, 0, k, 1), w11 = q6f_frag(r, 1, k, 1);
+            if constexpr (C::K16) {
+                const float f00 = q6f_fa(r, d0, nd0, 0, 2 * k), f10 = q6f_fa(r, d1, nd1, 1, 2 * k);
+                const float f01 = q6f_fa(r, d0, nd0, 0, 2 * k + 1), f11 = q6f_fa(r, d1, nd1, 1, 2 * k + 1);
+#pragma unroll
+                for (int n = 0; n < C::NG; n++) {
+                    const int8_t * xb = xrow + 8 * n * xs.ld + 32 * j;
+                    const int b0 = *reinterpret_cast<const int *>(xb), b1 = *reinterpret_cast<const int *>(xb + 16);
+                    const float4 mx = xs.mx4[(j * C::NG + n) * 4 + tq];
+                    float4 m0, m1;
+                    if (X16) {
+                        m0 = xs.md[((2 * j) * C::NG + n) * 4 + tq];
+                        m1 = xs.md[((2 * j + 1) * C::NG + n) * 4 + tq];
+                    } else {
+                        m0 = m1 = xs.md[(j * C::NG + n) * 4 + tq];
+                    }
+                    const int ci0[4] = {__float_as_int(mx.x), __float_as_int(mx.y), __float_as_int(mx.x), __float_as_int(mx.y)};
+                    const int ci1[4] = {__float_as_int(mx.z), __float_as_int(mx.w), __float_as_int(mx.z), __float_as_int(mx.w)};
+                    int c0[4], c1[4];
+                    mma16816(c0, w00, w10, b0, ci0);
+                    mma16816(c1, w01, w11, b1, ci1);
+                    acc[n][0] = fmaf(f00, fmaf(m0.x, __int_as_float(c0[0]), m0.y), acc[n][0]);
+                    acc[n][1] = fmaf(f00, fmaf(m0.z, __int_as_float(c0[1]), m0.w), acc[n][1]);
+                    acc[n][2] = fmaf(f10, fmaf(m0.x, __int_as_float(c0[2]), m0.y), acc[n][2]);
+                    acc[n][3] = fmaf(f10, fmaf(m0.z, __int_as_float(c0[3]), m0.w), acc[n][3]);
+                    acc1[n][0] = fmaf(f01, fmaf(m1.x, __int_as_float(c1[0]), m1.y), acc1[n][0]);
+                    acc1[n][1] = fmaf(f01, fmaf(m1.z, __int_as_float(c1[1]), m1.w), acc1[n][1]);
+                    acc1[n][2] = fmaf(f11, fmaf(m1.x, __int_as_float(c1[2]), m1.y), acc1[n][2]);
+                    acc1[n][3] = fmaf(f11, fmaf(m1.z, __int_as_float(c1[3]), m1.w), acc1[n][3]);
+                }
+            } else {
+                const float fA0 = q6f_fa(r, d0, nd0, 0, 2 * k + h), fA1 = q6f_fa(r, d1, nd1, 1, 2 * k + h);
+                const int a[4] = {w00, w10, w01, w11};
+#pragma unroll
+                for (int n = 0; n < C::NG; n++) {
+                    const int x = *reinterpret_cast<const int *>(xrow + 4 * n * xs.ld + 32 * j);
+                    const int b0 = (g >> 2) ? 0 : x, b1 = (g >> 2) ? x : 0;
+                    const float4 md = xs.md[(j * C::NG + n) * 4 + tq];
+                    const float2 mx = xs.mx[(j * C::NG + n) * 4 + tq];
+                    const int ci[4] = {__float_as_int(mx.x), __float_as_int(mx.y), __float_as_int(mx.x), __float_as_int(mx.y)};
+                    int cc[4];
+                    mma16832(cc, a, b0, b1, ci);
+                    acc[n][0] = fmaf(fA0, fmaf(md.x, __int_as_float(cc[0]), md.y), acc[n][0]);
+                    acc[n][1] = fmaf(fA0, fmaf(md.z, __int_as_float(cc[1]), md.w), acc[n][1]);
+                    acc[n][2] = fmaf(fA1, fmaf(md.x, __int_as_float(cc[2]), md.y), acc[n][2]);
+                    acc[n][3] = fmaf(fA1, fmaf(md.z, __int_as_float(cc[3]), md.w), acc[n][3]);
+                }
+            }
+        }
+    }
+    if constexpr (C::K16) { // chunk 0 + chunk 1 (the split path's tq < 2 sum: own chunk-0 sum + the partner's chunk 1)
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[n][c] += acc1[n][c];
+    } else {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[n][c] += __shfl_xor_sync(0xffffffffu, acc[n][c], 2);
+    }
+}
+
 template <int TYPE, int T, bool X16, int PF>
 __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int nsb, const XSm & xs,
                                         float (&acc)[Cfg<TYPE, T, X16>::NG][4]) {
+    if constexpr (TYPE == T_Q6K && WV_Q6FM) {
+        wv_tile_q6f<T, X16>(m, row0, sb0, nsb, xs, acc);
+        return;
+    }
     using W = WV<TYPE>;
     using C = Cfg<TYPE, T, X16>;
     const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, h = tq >> 1;
@@ -821,16 +991,58 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
 template <int TYPE, int T, bool X16>
 __device__ void wv_fill(const QB & q, int k0, int Kc, uint8_t * sm, XSm & xs) {
     using C = Cfg<TYPE, T, X16>;
-    const int ld = Kc + 32, NJ = Kc / 32;
+    // (K16: the B loads are LDS.32 of 8 token rows x 4 tq: a row stride of 16 mod 128 B keeps them conflict-free)
+    const int ld = Kc + (C::K16 ? 16 : 32), NJ = Kc / 32;
     int8_t * xq = reinterpret_cast<int8_t *>(sm);
     float4 * md = reinterpret_cast<float4 *>(sm + C::NTOKP * ld);
-    float2 * mx = reinterpret_cast<float2 *>(md + NJ * C::NG * 4);
+    float2 * mx = reinterpret_cast<float2 *>(md + NJ * C::NG * 4 * (C::K16 && X16 ? 2 : 1));
     const int u0 = k0 / 32, nu = Kc / 32;
     for (int i = threadIdx.x; i < T * nu * 2; i += NT) {
         const int t = i / (2 * nu), r = i - t * 2 * nu, u = u0 + (r >> 1), part = r & 1;
         const int b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
         const int e = 256 * b + 64 * p + 32 * part + 16 * hh - k0;
         cp16(xq + t * ld + e, (part ? q.xb : q.xa) + ((size_t) t * q.U + u) * 16);
+    }
+    if constexpr (C::K16) { // tokens 8 n + 2 tq + {0, 1}; md per 32-block (X16: per 16-chunk h at 2 j + h), mx4 per chunk
+        float4 * mx4 = reinterpret_cast<float4 *>(mx);
+        for (int i = threadIdx.x; i < NJ * C::NG * 4; i += NT) {
+            const int j = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
+            const int jg = u0 + j, b = jg >> 3, s = jg & 7, p = s >> 1, part = s & 1;
+            float dx[2][2];
+            int qs[2][2];
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const int t = 8 * n + 2 * tq + k;
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+                    dx[k][hh] = 0.f;
+                    qs[k][hh] = 0;
+                    if (t < T) {
+                        const uint2 mm = q.meta[(size_t) t * q.U + 8 * b + 2 * p + hh];
+                        dx[k][hh] = __half2float(reinterpret_cast<const __half *>(&mm.x)[part]);
+                        qs[k][hh] = reinterpret_cast<const short *>(&mm.y)[part];
+                    }
+                }
+            }
+            if (X16) {
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++)
+                    md[((2 * j + hh) * C::NG + n) * 4 + tq] =
+                        make_float4(dx[0][hh], -FMAGIC * dx[0][hh], dx[1][hh], -FMAGIC * dx[1][hh]);
+            } else {
+                md[i] = make_float4(dx[0][0], -FMAGIC * dx[0][0], dx[1][0], -FMAGIC * dx[1][0]);
+            }
+            mx4[i] = make_float4(__int_as_float(MAGIC - 32 * qs[0][0]), __int_as_float(MAGIC - 32 * qs[1][0]),
+                                 __int_as_float(MAGIC - 32 * qs[0][1]), __int_as_float(MAGIC - 32 * qs[1][1]));
+        }
+        cp_wait();
+        __syncthreads();
+        xs.xq = xq;
+        xs.ld = ld;
+        xs.md = md;
+        xs.mx = nullptr;
+        xs.mx4 = mx4;
+        return;
     }
     for (int i = threadIdx.x; i < NJ * C::NG * 4; i += NT) {
         const int j = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
@@ -872,6 +1084,7 @@ __device__ void wv_fill(const QB & q, int k0, int Kc, uint8_t * sm, XSm & xs) {
 }
 template <int TYPE, int T, bool X16>
 constexpr int wv_smem(int Kc) {
+    if (Cfg<TYPE, T, X16>::K16) return Cfg<TYPE, T, X16>::NTOKP * (Kc + 16) + (Kc / 32) * Cfg<TYPE, T, X16>::NG * 4 * (X16 ? 48 : 32);
     return Cfg<TYPE, T, X16>::NTOKP * (Kc + 32) + (Kc / 32) * Cfg<TYPE, T, X16>::NG * 4 * 24;
 }
 
@@ -1584,6 +1797,9 @@ static Role ROLES[] = {
     {"attn_proj", 12288 + 2048, 5120, 5, false, 1}, // q (+gate) + k + v
     {"out", 5120, 6144, 6, false, 4},            // attn_output / ssm_out
     {"ffn_down", 5120, 17408, 17, true, 4},
+    {"gu1", 17408, 5120, 5, false, 1},  // one ffn_gate / ffn_up matrix (UD-Q4_K_XL: 4 + 2 of them are Q6_K)
+    {"qkv", 10240, 5120, 5, false, 1},  // attn_qkv (1 Q6_K)
+    {"kv", 1024, 5120, 5, false, 1},    // attn_k / attn_v (12 + 3 Q6_K)
 };
 
 // ---- dispatch tables ------------------------------------------------------------------------------------------------
@@ -1668,7 +1884,9 @@ static float wv_T(int T, bool q16, WvArgs & a, int reps) {
 #define WV_PF 0
 #endif
 static float dp4a_any(int ty, int T, int IT, DpArgs & a, int reps) {
-#ifdef WV_QUICK
+#if defined(WV_Q6ONLY) // spill2 go / no-go builds: Q6_K only
+    return ty == T_Q6K ? dp4a_T<T_Q6K>(T, IT, a, reps) : -1.f;
+#elif defined(WV_QUICK)
     if (T != 1) return -1.f;
     switch (ty) {
         case T_Q4K: return dp4a_T<T_Q4K>(T, IT, a, reps);
@@ -1692,6 +1910,8 @@ static float dp4a_any(int ty, int T, int IT, DpArgs & a, int reps) {
 static float wv_any(int ty, int T, bool q16, WvArgs & a, int reps) {
 #if defined(WV_DPONLY)
     return -1.f;
+#elif defined(WV_Q6ONLY)
+    return ty == T_Q6K ? wv_T<T_Q6K, WV_PF>(T, q16, a, reps) : -1.f;
 #elif defined(WV_QUICK)
     switch (ty) {
         case T_Q4K: return wv_T<T_Q4K, WV_PF>(T, q16, a, reps);
@@ -1724,7 +1944,40 @@ struct Dev {
 // Host re-layout of a row-major engine matrix for WV_TILEMAJ (the load-time repack the wv kernel would need):
 // 1: tile-major units (16-row tile, block idx) of 16 whole blocks, value and meta streams alike;
 // 2: Q4_K / Q5_K / IQ4_XS fragment-ordered inside each unit (see wv_load2), the other types as 1.
+// WV_Q6FM: Q6_K into the fragment-ordered units of wv_tile_q6f (values + meta in one stream; d is emptied)
+static void relayout_q6f(int M, int K, std::vector<uint8_t> & w, std::vector<uint16_t> & d) {
+    const int nb = K / 256, rb = nb * Q6_BLK, ndb = nb * Q6_META;
+    std::vector<uint8_t> o((size_t) M * nb * 3360 / 16);
+    const uint8_t * meta = reinterpret_cast<const uint8_t *>(d.data());
+    for (int r = 0; r < M; r++)
+        for (int sb = 0; sb < nb; sb++) {
+            uint8_t * u = o.data() + ((size_t) (r >> 4) * nb + sb) * 3360;
+            const int g = r & 7, half = (r >> 3) & 1;
+            const uint8_t * blk = w.data() + (size_t) r * rb + (size_t) sb * Q6_BLK;
+            const uint8_t * mp = meta + (size_t) r * ndb + (sb >> 1) * 2 * Q6_META;
+            memcpy(u + 32 * g + 16 * half, mp + 16 * (sb & 1), 16);
+            memcpy(u + 256 + 4 * g + 2 * half, mp + 32 + 2 * (sb & 1), 2);
+            for (int tq = 0; tq < 4; tq++) {
+                const int l = 4 * g + tq;
+                for (int p = 0; p < 4; p++) {
+                    memcpy(u + 288 + 512 * p + 16 * l + 8 * half, blk + 32 * p + 4 * tq, 4);
+                    memcpy(u + 288 + 512 * p + 16 * l + 8 * half + 4, blk + 32 * p + 16 + 4 * tq, 4);
+                    for (int mm = 0; mm < 4; mm++) {
+                        auto hb = [&](int part, int c) { return (blk[128 + 8 * (2 * p + c) + 4 * part + mm] >> (2 * tq)) & 3; };
+                        u[(WV_Q6HP ? 2336 + 256 * p + 8 * l + 4 * half : 2336 + 512 * half + 16 * l + 4 * p) + mm] =
+                            (uint8_t) ((hb(0, 0) << 4) | (hb(1, 0) << 6) | hb(0, 1) | (hb(1, 1) << 2));
+                    }
+                }
+            }
+        }
+    w.swap(o);
+    d.clear();
+}
 static void relayout(int ty, int M, int K, std::vector<uint8_t> & w, std::vector<uint16_t> & d, int mode) {
+    if (WV_Q6FM && ty == T_Q6K) {
+        relayout_q6f(M, K, w, d);
+        return;
+    }
     if (!mode) return;
     const int rb = row_bytes(ty, K), nb = K / 256, ndb = 2 * row_meta_halves(ty, K);
     std::vector<uint8_t> o(w.size());
@@ -1914,10 +2167,16 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
                     }
                 }
             rms = sqrt(rms / n);
+            unsigned long long hsh = 1469598103934665603ull; // FNV-1a of rows t < 8 (compare across layouts / builds)
+            {
+                const unsigned char * hb = reinterpret_cast<const unsigned char *>(best.data());
+                const size_t nbh = (size_t) 4 * R.M * (Tmax < 8 ? Tmax : 8);
+                for (size_t i = 0; i < nbh; i++) hsh = (hsh ^ hb[i]) * 1099511628211ull;
+            }
             printf("%-9s %-6s T-inv(%d T's, ref T=%d) %s (%d rows differ) | rel err vs fp64: wv rms %.2e max %.2e, dp4a rms "
-                   "%.2e max %.2e | max |wv-dp4a| %.2e\n",
+                   "%.2e max %.2e | max |wv-dp4a| %.2e | hash %016llx\n",
                    R.name, tname(ty), ntested, Tmax, tinv_bad ? "FAIL" : "ok", tinv_bad, sqrt(ew / n) / rms, mw / rms,
-                   sqrt(ed / nd) / rms, md / rms, dwd / rms);
+                   sqrt(ed / nd) / rms, md / rms, dwd / rms, hsh);
             if (tinv_bad || sqrt(ew / n) / rms > 1e-4) bad++;
             cudaFree(out); cudaFree(part); cudaFree(cnt); cudaFree(ref); cudaFree(idot);
             release(D);
@@ -1940,7 +2199,14 @@ static void timing(const std::vector<int> & roles, const std::vector<int> & type
             const size_t mb = (size_t) R.M * row_bytes(ty, R.K) + (size_t) R.M * row_meta_halves(ty, R.K) * 2;
             int nlay = (int) ((320u << 20) / mb);
             nlay = nlay < 2 ? 2 : nlay > 24 ? 24 : nlay;
-            Dev D = upload(ty, R.M, R.K, nlay, rng);
+            // dp4a reads the row-major copy, wv its own layout (the same bytes per matrix; separate copies since FM Q6_K
+            // also moves the meta stream into the value units)
+            std::vector<uint8_t> hw;
+            std::vector<uint16_t> hd16;
+            make_weights(ty, R.M, R.K, hw, hd16, rng);
+            Dev D = upload_wd(ty, R.M, R.K, nlay, hw, hd16);
+            relayout(ty, R.M, R.K, hw, hd16, WV_TILEMAJ);
+            Dev D2 = upload_wd(ty, R.M, R.K, nlay, hw, hd16);
             float * out, * part;
             unsigned * cnt;
             CK(cudaMalloc(&out, sizeof(float) * 16 * R.M));
@@ -1956,7 +2222,7 @@ static void timing(const std::vector<int> & roles, const std::vector<int> & type
                 else printf(" dp4a%d %6.1fus %4.0f", T, 1e3 * ms / nlay, gb / ms * 1e3);
             }
             printf(" |");
-            WvArgs a{D.dmats, nlay, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
+            WvArgs a{D2.dmats, nlay, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
             for (int T : wvT) {
                 const float ms = wv_any(ty, T, R.q16, a, reps);
                 if (ms < 0) printf(" wv%d    -    ", T);
@@ -1966,6 +2232,7 @@ static void timing(const std::vector<int> & roles, const std::vector<int> & type
             fflush(stdout);
             cudaFree(out); cudaFree(part); cudaFree(cnt);
             release(D);
+            release(D2);
         }
         cudaFree(X.xa); cudaFree(X.xb); cudaFree(X.meta);
     }
