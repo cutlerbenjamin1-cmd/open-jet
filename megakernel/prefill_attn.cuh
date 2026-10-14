@@ -697,8 +697,21 @@ __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, 
 constexpr float A8_L2E = 1.4426950408889634f;
 // KLOW: the slot's K is low-bit (q4..q7): its tiles are expanded to int8 in the staging. The KLOW = false instantiation is the
 // plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot).
-template <bool QROW, bool KLOW>
-__global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0) {
+// EXA (MK_EXACT): a row's result is a function of its position only, whatever the chunk / launch / split: its key range
+// is cut into absolute segments of segt tiles (segment k = tiles k segt ..), each computed from a fresh online softmax,
+// and folded in order: R <- ex_fold(R, s_k) (ex_ab / ex_f; max in log2 units). A unit computes either a whole item
+// (folding in registers + R in y2), the head of a split item (segments 0 .. nsg - Q - 1, R -> its partial slot) or
+// one tail segment (-> its slot); pk_attn8_combx folds the tails into the head's R in segment order.
+__device__ __forceinline__ void ex_ab(float M, float m, float & Mn, float & a, float & b) {
+    Mn = fmaxf(M, m);
+    a = M == -INFINITY ? 0.f : exp2f(M - Mn);
+    b = m == -INFINITY ? 0.f : exp2f(m - Mn);
+}
+__device__ __forceinline__ float ex_f(float a, float R, float b, float s) { return __fadd_rn(__fmul_rn(a, R), __fmul_rn(b, s)); }
+
+template <bool QROW, bool KLOW, bool EXA = false>
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
+                                                     int segt = 0) {
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
@@ -718,7 +731,26 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
     const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
     const int ntile = pmax / A2_K + 1;
-    const int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
+    int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
+    int ex_role = 0; // EXA: 0 whole item (final output), 1 head of a split item, 2 one tail segment (both -> part)
+    if (EXA) {
+        const int nsg = (ntile + segt - 1) / segt;
+        it0 = 0;
+        it1 = ntile;
+        if (nseg > 1) {
+            const int Q = min(nseg - 1, nsg - 1);
+            if (seg == 0) {
+                it1 = min(ntile, (nsg - Q) * segt);
+                ex_role = 1;
+            } else if (seg <= Q) {
+                it0 = (nsg - Q + seg - 1) * segt;
+                it1 = min(ntile, it0 + segt);
+                ex_role = 2;
+            } else {
+                return; // (idle unit: the item has fewer segments than units)
+            }
+        }
+    }
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
     // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
     // cache kvp / kvs give exactly the old addresses
@@ -842,11 +874,62 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     uint4 * p_own = xp + (2 * hq + hf) * 32 + lane;
     const uint4 * p_oth = xp + (2 * hq + (hf ^ 1)) * 32 + lane;
     float2 * xs = xsum + hq * 32 + lane;
+    // EXA: the fold R of the finished segments: M / L (L: half 1) in registers, R.o in global memory at this thread's own
+    // elements (whole item: its y2 rows; head of a split item: its partial slot)
+    float M0 = -INFINITY, M1 = -INFINITY, L0 = 0.f, L1 = 0.f;
+    bool have_r = false, rv0 = true, rv1 = true;
+    float *rb0 = nullptr, *rb1 = nullptr;
+    if (EXA) {
+        if (ex_role == 0) {
+            rb0 = cP.y2 + (size_t) (r0 + t0 + g8) * VD + (g * 6 + hq) * HD + 128 * hf + 2 * t4;
+            rb1 = rb0 + (size_t) 8 * VD;
+            rv0 = g8 < nq;
+            rv1 = g8 + 8 < nq;
+        } else {
+            rb0 = part + (size_t) (blockIdx.x - nfull) * A2_PART + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 2 * t4;
+            rb1 = rb0 + (size_t) 8 * HD;
+        }
+    }
+    // R <- fold(R, this segment); reset: store R.o and start the next segment, else (the last one) R stays in o / m / l
+    auto ex_fold = [&](bool reset) {
+        float Mn0, a0, b0, Mn1, a1, b1;
+        ex_ab(M0, m0, Mn0, a0, b0);
+        ex_ab(M1, m1, Mn1, a1, b1);
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            float2 *p0 = reinterpret_cast<float2 *>(rb0 + 8 * j), *p1 = reinterpret_cast<float2 *>(rb1 + 8 * j);
+            float2 v0 = make_float2(o[j][0], o[j][1]), v1 = make_float2(o[j][2], o[j][3]);
+            if (have_r && rv0) {
+                const float2 r = *p0;
+                v0 = make_float2(ex_f(a0, r.x, b0, v0.x), ex_f(a0, r.y, b0, v0.y));
+            }
+            if (have_r && rv1) {
+                const float2 r = *p1;
+                v1 = make_float2(ex_f(a1, r.x, b1, v1.x), ex_f(a1, r.y, b1, v1.y));
+            }
+            if (reset) {
+                if (rv0) *p0 = v0;
+                if (rv1) *p1 = v1;
+                o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+            } else {
+                o[j][0] = v0.x, o[j][1] = v0.y, o[j][2] = v1.x, o[j][3] = v1.y;
+            }
+        }
+        if (have_r) {
+            L0 = ex_f(a0, L0, b0, l0), L1 = ex_f(a1, L1, b1, l1), M0 = Mn0, M1 = Mn1;
+        } else {
+            L0 = l0, L1 = l1, M0 = m0, M1 = m1;
+        }
+        have_r = true;
+        if (reset) m0 = m1 = -INFINITY, l0 = l1 = 0.f;
+        else m0 = M0, m1 = M1, l0 = L0, l1 = L1;
+    };
 
     for (int it = it0; it < it1; it++) {
         const int kb = it * A2_K;
         pf::cpa_wait<0>(); // own copies of tiles it and it + 1
         __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
+        if (EXA && it > it0 && it % segt == 0) ex_fold(true); // (a segment boundary: tiles < it are folded)
         __half * sVc = sV0 + ((it + 1) & 1) * A2_K * A2_LD; // V(it + 1) is converted into it during this tile
         const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
         const uint8_t * stv = asm_ + ((it + 1) % A8_NS) * A8_STG;
@@ -1007,6 +1090,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         if (ia < it1) a8_st_ks(sta, ksn); // K scales of tile ia (its stage was freed at this tile's first barrier)
     }
     pf::cpa_wait<0>();
+    if (EXA && ex_role != 2) ex_fold(false); // R of all segments of this unit -> o / m / l
     // row sums: half 1 -> half 0 (the maxima slot is no longer read)
     if (hf) *mx_own = make_float2(l0, l1);
     a2_pair_sync(hq);
@@ -1035,9 +1119,39 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         }
         if (hf && t4 == 0) {
             float2 * ml = reinterpret_cast<float2 *>(pp + 6 * A2_Q * HD);
-            ml[r0] = make_float2(m0 * (1.f / A8_L2E), l0); // natural-log units for pk_attn2_comb
-            ml[r0 + 8] = make_float2(m1 * (1.f / A8_L2E), l1);
+            ml[r0] = make_float2(EXA ? m0 : m0 * (1.f / A8_L2E), l0); // natural-log units for pk_attn2_comb (EXA: log2)
+            ml[r0 + 8] = make_float2(EXA ? m1 : m1 * (1.f / A8_L2E), l1);
         }
     }
 }
 
+
+// EXA: the split items' results: the head unit's R (slot 0) folded with the tail segments (slots 1 .. Q) in segment
+// order, with pk_attn8's own ex_ab / ex_f arithmetic, then normalised -> y2 (rows r0 + ..). Block = split item.
+__global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int r0, const float * __restrict__ part) {
+    const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
+    const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
+    const int ntile = (n0 + t0 + nq - 1) / A2_K + 1, nsg = (ntile + segt - 1) / segt, Q = min(S - 1, nsg - 1);
+    const float * P = part + (size_t) blockIdx.x * S * A2_PART;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = warp; r < 6 * A2_Q; r += 8) {
+        const int h = r / A2_Q, tt = r % A2_Q;
+        if (tt >= nq) continue;
+        float M = P[6 * A2_Q * HD + 2 * r], L = P[6 * A2_Q * HD + 2 * r + 1], acc[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) acc[k] = P[(size_t) r * HD + 8 * lane + k];
+        for (int q = 1; q <= Q; q++) {
+            const float * ps = P + (size_t) q * A2_PART;
+            float Mn, a, b;
+            ex_ab(M, ps[6 * A2_Q * HD + 2 * r], Mn, a, b);
+            L = ex_f(a, L, b, ps[6 * A2_Q * HD + 2 * r + 1]);
+#pragma unroll
+            for (int k = 0; k < 8; k++) acc[k] = ex_f(a, acc[k], b, ps[(size_t) r * HD + 8 * lane + k]);
+            M = Mn;
+        }
+        const float il = L > 0.f ? 1.f / L : 0.f;
+        float * dst = cP.y2 + (size_t) (r0 + t0 + tt) * VD + (g * 6 + h) * HD + 8 * lane;
+#pragma unroll
+        for (int k = 0; k < 8; k++) dst[k] = acc[k] * il;
+    }
+}
