@@ -1,0 +1,38 @@
+{
+  "port": 8096,
+  "host": "127.0.0.1",
+  "out_dir": "benchmark_results/suite",
+  "data_dir": "bench_data",
+  "ready_timeout": 600,
+  "settle_s": 15,
+  "vars": {
+    "model": "${HOME}/models/Qwen3.8-27B-Q4_K_M.gguf",
+    "mk_server": "megakernel/server/mk_server.py",
+    "llama_server": "${HOME}/llama.cpp/build/bin/llama-server",
+    "ctx": "120000"
+  },
+  "systems": {
+    "megakernel": {
+      "cmd": ["python3", "{mk_server}", "-m", "{model}", "--host", "{host}", "--port", "{port}", "-c", "{ctx}", "--kv", "q8", "-d", "4"],
+      "env": {"MK_PF_CAP": "1024"}
+    },
+    "llama": {
+      "cmd": ["{llama_server}", "-m", "{model}", "-ngl", "99", "-c", "{ctx}", "-np", "1", "-fa", "on",
+              "-ctk", "q8_0", "-ctv", "q8_0", "-b", "2048", "-ub", "1024", "--keep", "4096",
+              "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--jinja",
+              "--chat-template-kwargs", "{\"preserve_thinking\": true}",
+              "--temp", "1", "--top-p", "0.95", "--presence-penalty", "0.0", "--host", "{host}", "--port", "{port}"],
+      "env": {}
+    }
+  },
+  "runs": [
+    {"label": "mk", "system": "megakernel", "clients": [
+      {"kind": "h2h", "mode": "all", "out": "h2h.jsonl"},
+      {"kind": "qa", "out": "qa.jsonl"}
+    ]},
+    {"label": "llama", "system": "llama", "clients": [
+      {"kind": "h2h", "mode": "all", "out": "h2h.jsonl"},
+      {"kind": "qa", "out": "qa.jsonl"}
+    ]}
+  ]
+}
