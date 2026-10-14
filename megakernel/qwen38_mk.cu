@@ -6431,20 +6431,27 @@ struct MKEngine::Impl {
     // EXA partials: the ffn_down input scratch xh2 (idle until the FFN). Not y1 as for a2_plan: with KV window rings the
     // chunk's attention runs in pieces, and a piece's partials in y1 would overwrite the k / v of the next piece's rows
     float * ex_part() { return reinterpret_cast<float *>(hp.xh2); }
-    // MK_EXACT work split (pk_attn8 EXA): numerically free (every split gives the same rows), so this only balances:
-    // the items of the last partial wave (all items when they do not fill one) get S units each, at segment granularity
-    void ex_plan(int T, int n0, int & nfull, int & S) {
+    // MK_EXACT work split (pk_attn8 EXA): numerically free (every split gives the same rows), so this only balances.
+    // Items that fill at most half a wave of resident CTAs (all items of a short chunk, or the last partial wave of a long
+    // one) are cut into S units of whole segments (sl partial slots each); otherwise items run whole.
+    void ex_plan(int T, int n0, int & nfull, int & S, int & sl) {
         const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV, slots = std::max(1, a2_slots);
         nfull = N;
         S = 1;
+        sl = 0;
         const int nsplit = N >= slots ? N % slots : N;
-        if (nsplit == 0) return;
+        if (nsplit == 0 || 2 * nsplit > slots) return;
         const int ntile = (n0 + T - 1) / A2_K + 1, nsg = (ntile + ex_segt - 1) / ex_segt; // (the longest item)
-        int s = std::min(nsg, (slots + nsplit - 1) / nsplit);
-        s = std::min(s, (int) std::min<size_t>(64, (size_t) hp.cap * FF / 2 / ((size_t) A2_PART * nsplit)));
-        if (s <= 1) return;
-        S = s;
-        nfull = N - nsplit;
+        const size_t cap_slots = (size_t) hp.cap * FF / 2 / A2_PART; // ex_part (xh2)
+        for (int s = std::min(nsg, slots / nsplit); s > 1; s--) {
+            const int need = nsg - nsg / s + 1;
+            if ((size_t) need * nsplit <= cap_slots) {
+                S = s;
+                sl = need;
+                nfull = N - nsplit;
+                return;
+            }
+        }
     }
     // (r0: the queries are chunk rows r0 .. r0 + T - 1 at positions n ..: MK_EXACT with KV window rings, see pf_run)
     void attn(int T, int n, int slot, int r0 = 0) {
@@ -6455,12 +6462,12 @@ struct MKEngine::Impl {
         }
         if (exact && hb.kvq8 && attn_pv16 && attn_s8 == 1) { // MK_EXACT: pk_attn8's EXA form
             const int N = (T + A2_Q - 1) / A2_Q * NKV;
-            int nfull, S;
-            ex_plan(T, n, nfull, S);
+            int nfull, S, sl;
+            ex_plan(T, n, nfull, S, sl);
             const int grid = nfull + (N - nfull) * S;
-            if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt);
-            else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt);
-            if (N > nfull) pk_attn8_combx<<<N - nfull, 256>>>(T, n, nfull, S, ex_segt, r0, ex_part());
+            if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt, sl);
+            else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt, sl);
+            if (N > nfull) pk_attn8_combx<<<N - nfull, 256>>>(T, n, nfull, S, ex_segt, sl, r0, ex_part());
             return;
         }
         // y1 (k, v of the layer) is free between pk_attn_prep and the FFN: partials of split items

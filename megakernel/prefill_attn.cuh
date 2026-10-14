@@ -711,7 +711,7 @@ __device__ __forceinline__ float ex_f(float a, float R, float b, float s) { retu
 
 template <bool QROW, bool KLOW, bool EXA = false>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
-                                                     int segt = 0) {
+                                                     int segt = 0, int sl = 0) {
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
@@ -732,23 +732,22 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
     const int ntile = pmax / A2_K + 1;
     int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
-    int ex_role = 0; // EXA: 0 whole item (final output), 1 head of a split item, 2 one tail segment (both -> part)
+    // EXA: 0 whole item (final output); split item (sl partial slots): unit seg covers segments k0 .. k1 - 1 of an even
+    // cut, 1 = the unit holding segment 0 (folds, R -> slot 0), 2 = another (each segment k -> slot 1 + k - ex_h)
+    int ex_role = 0, ex_h = 0;
+    float * ex_base = nullptr;
     if (EXA) {
         const int nsg = (ntile + segt - 1) / segt;
         it0 = 0;
         it1 = ntile;
         if (nseg > 1) {
-            const int Q = min(nseg - 1, nsg - 1);
-            if (seg == 0) {
-                it1 = min(ntile, (nsg - Q) * segt);
-                ex_role = 1;
-            } else if (seg <= Q) {
-                it0 = (nsg - Q + seg - 1) * segt;
-                it1 = min(ntile, it0 + segt);
-                ex_role = 2;
-            } else {
-                return; // (idle unit: the item has fewer segments than units)
-            }
+            const int k0 = nsg * seg / nseg, k1 = nsg * (seg + 1) / nseg;
+            if (k0 == k1) return; // (idle unit: fewer segments than units)
+            it0 = k0 * segt;
+            it1 = min(ntile, k1 * segt);
+            ex_h = nsg / nseg;
+            ex_role = k0 == 0 && ex_h > 0 ? 1 : 2;
+            ex_base = part + (size_t) (item - nfull) * sl * A2_PART;
         }
     }
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
@@ -886,7 +885,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             rv0 = g8 < nq;
             rv1 = g8 + 8 < nq;
         } else {
-            rb0 = part + (size_t) (blockIdx.x - nfull) * A2_PART + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 2 * t4;
+            rb0 = ex_base + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 2 * t4; // (slot 0)
             rb1 = rb0 + (size_t) 8 * HD;
         }
     }
@@ -929,7 +928,26 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         const int kb = it * A2_K;
         pf::cpa_wait<0>(); // own copies of tiles it and it + 1
         __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
-        if (EXA && it > it0 && it % segt == 0) ex_fold(true); // (a segment boundary: tiles < it are folded)
+        if (EXA && it > it0 && it % segt == 0) { // a segment boundary: tiles < it are done
+            if (ex_role != 2) {
+                ex_fold(true);
+            } else { // segment it / segt - 1 -> its slot, then a fresh online softmax
+                float * q = ex_base + (size_t) (1 + it / segt - 1 - ex_h) * A2_PART;
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    float * e = q + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 8 * j + 2 * t4;
+                    *reinterpret_cast<float2 *>(e) = make_float2(o[j][0], o[j][1]);
+                    *reinterpret_cast<float2 *>(e + 8 * HD) = make_float2(o[j][2], o[j][3]);
+                    o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+                }
+                if (hf && t4 == 0) {
+                    float2 * ml = reinterpret_cast<float2 *>(q + 6 * A2_Q * HD);
+                    ml[hq * A2_Q + g8] = make_float2(m0, l0);
+                    ml[hq * A2_Q + g8 + 8] = make_float2(m1, l1);
+                }
+                m0 = m1 = -INFINITY, l0 = l1 = 0.f;
+            }
+        }
         __half * sVc = sV0 + ((it + 1) & 1) * A2_K * A2_LD; // V(it + 1) is converted into it during this tile
         const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
         const uint8_t * stv = asm_ + ((it + 1) % A8_NS) * A8_STG;
@@ -1109,7 +1127,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
         }
     } else {
-        float * pp = part + (size_t) (blockIdx.x - nfull) * A2_PART;
+        float * pp = !EXA ? part + (size_t) (blockIdx.x - nfull) * A2_PART
+                          : ex_base + (size_t) (ex_role == 1 ? 0 : 1 + (it1 - 1) / segt - ex_h) * A2_PART;
         const int r0 = hq * A2_Q + g8;
 #pragma unroll
         for (int j = 0; j < 16; j++) {
@@ -1126,21 +1145,23 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
 }
 
 
-// EXA: the split items' results: the head unit's R (slot 0) folded with the tail segments (slots 1 .. Q) in segment
+// EXA: the split items' results: the head unit's R (slot 0) folded with the other segments (slots 1 ..) in segment
 // order, with pk_attn8's own ex_ab / ex_f arithmetic, then normalised -> y2 (rows r0 + ..). Block = split item.
-__global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int r0, const float * __restrict__ part) {
+__global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, int S, int segt, int sl, int r0, const float * __restrict__ part) {
     const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
-    const int ntile = (n0 + t0 + nq - 1) / A2_K + 1, nsg = (ntile + segt - 1) / segt, Q = min(S - 1, nsg - 1);
-    const float * P = part + (size_t) blockIdx.x * S * A2_PART;
+    const int ntile = (n0 + t0 + nq - 1) / A2_K + 1, nsg = (ntile + segt - 1) / segt, sh = nsg / S; // (sh: segments of the head unit)
+    const float * P = part + (size_t) blockIdx.x * sl * A2_PART; // slot 0: R of segments 0 .. sh - 1; 1 + k - sh: segment k
+    const int q0 = sh > 0 ? 0 : 1; // (no head unit: R starts as segment 0)
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int r = warp; r < 6 * A2_Q; r += 8) {
         const int h = r / A2_Q, tt = r % A2_Q;
         if (tt >= nq) continue;
-        float M = P[6 * A2_Q * HD + 2 * r], L = P[6 * A2_Q * HD + 2 * r + 1], acc[8];
+        const float * P0 = P + (size_t) q0 * A2_PART;
+        float M = P0[6 * A2_Q * HD + 2 * r], L = P0[6 * A2_Q * HD + 2 * r + 1], acc[8];
 #pragma unroll
-        for (int k = 0; k < 8; k++) acc[k] = P[(size_t) r * HD + 8 * lane + k];
-        for (int q = 1; q <= Q; q++) {
+        for (int k = 0; k < 8; k++) acc[k] = P0[(size_t) r * HD + 8 * lane + k];
+        for (int q = q0 + 1; q <= nsg - sh; q++) {
             const float * ps = P + (size_t) q * A2_PART;
             float Mn, a, b;
             ex_ab(M, ps[6 * A2_Q * HD + 2 * r], Mn, a, b);
