@@ -153,7 +153,7 @@ def main(argv=None):
     ap.add_argument("labels", nargs="*", help="run only these labels (default: all, in config order)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands, start nothing")
     ap.add_argument("--list", action="store_true", help="list the labels and exit")
-    a = ap.parse_args(argv)
+    a = ap.parse_intermixed_args(argv)  # options may sit between the labels (plain parse_args rejects that on <= 3.12)
     cfg = load_config(a.config)
     runs = [r for r in cfg["runs"] if not a.labels or r["label"] in a.labels]
     unknown = set(a.labels) - {r["label"] for r in cfg["runs"]}
