@@ -1,0 +1,32 @@
+276d469 bench/suite: README and tests
+f8828c9 bench/suite: KLD, quantization comparison, T-invariance and state-file decode scripts
+885864d bench/suite: CLI benchmark over several builds, GPU clock keeper, context probe
+edf0c36 bench/suite: make_prompts also writes pf64k.txt (decode at 64k)
+0347ddb bench/suite: long-context sets (NIAH multi-key, LongBench v2) and max-context client
+d6700a3 bench/suite: quality set (fetch, client, scorer)
+5ab4969 bench/suite: config-driven runner and summary table
+052f57f bench/suite: head-to-head client (speed, TTFT, prefill, decode at depth, prompt reuse, VRAM)
+
+ 21 files changed, 2404 insertions(+)
+ .gitignore                                 |   1 +
+ megakernel/bench/suite/README.md           | 137 +++++++++++++++
+ megakernel/bench/suite/cli_bench.py        | 175 +++++++++++++++++++
+ megakernel/bench/suite/ctx_probe.sh        |  36 ++++
+ megakernel/bench/suite/decode_state.sh     |  47 +++++
+ megakernel/bench/suite/example_config.json |  38 +++++
+ megakernel/bench/suite/gpu_keep.cu         |  22 +++
+ megakernel/bench/suite/h2h_client.py       | 175 +++++++++++++++++++
+ megakernel/bench/suite/h2h_summ.py         | 166 ++++++++++++++++++
+ megakernel/bench/suite/kld_compare.sh      |  33 ++++
+ megakernel/bench/suite/make_prompts.py     |  68 ++++++++
+ megakernel/bench/suite/maxctx_client.py    | 136 +++++++++++++++
+ megakernel/bench/suite/qa_client.py        | 138 +++++++++++++++
+ megakernel/bench/suite/qa_fetch.py         | 172 +++++++++++++++++++
+ megakernel/bench/suite/qa_prep_long.py     | 233 +++++++++++++++++++++++++
+ megakernel/bench/suite/qa_score.py         | 225 ++++++++++++++++++++++++
+ megakernel/bench/suite/ref_ppl.py          |  76 +++++++++
+ megakernel/bench/suite/run_suite.py        | 181 ++++++++++++++++++++
+ megakernel/bench/suite/state_aba.sh        |  46 +++++
+ megakernel/bench/suite/tinv_batch.sh       |  35 ++++
+ tests/test_bench_suite.py                  | 264 +++++++++++++++++++++++++++++
+ 21 files changed, 2404 insertions(+)

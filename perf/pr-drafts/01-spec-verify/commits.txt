@@ -1,0 +1,118 @@
+# PR 1 (01-spec-verify): 20 commits, in logical order, not strictly by date. hash subject
+b9349ce megakernel: draft confidence gate, runtime draft policy, sampled MTP drafts (H1), MK_SPEC_LOG logging
+943c1bc megakernel: default draft policy = confidence gate + sampled MTP drafts (H1)
+1e23ba6 megakernel: sampled-draft residual fallback never returns the rejected draft (rs == 0 only through rounding)
+d487e7e megakernel: the MTP draft head reads lm_head rows through draft_ids instead of a gathered copy (-158 MiB VRAM; output bit-identical)
+17e775f megakernel: re-quantize the MTP draft block to Q4_K at load (MK_MTP_Q4, default on)
+f58e21e megakernel: cheaper sampled lm_head epilogues (bitonic top-32 merges, shared-memory sampling inputs)
+c0a1783 megakernel: spread the embedding prologue and the MTP M0 phase over more blocks
+38521b7 bench: wvgemm_bench, int8 mma.m16n8k32 verify GEMM (all 8 UD types, native layouts) vs the engine dp4a GEMV; T-invariant, exactness + timing modes
+5e653f7 bench: wvgemm2 - load diagnostics (WV_MODE), v2 kernel (stream-K, LDS.128), tile-major / fragment-ordered weight layout (WV_TILEMAJ 1/2) with host relayout for check, dp4a T=6..8 + K-sliced k_dp4a_k2
+820b77b megakernel: MK_WV M0 - wv tensor-core verify GEMM (wv.cuh, port of bench k_wv on the FM layout) for dn_proj on temporary wv-layout copies of qkv / gate (measurement build; default MK_WV=0 unchanged)
+15c8003 megakernel: MK_WV M1 WIP - every main-pass matrix of Q4_K / Q5_K / IQ4_XS (FM) and IQ4_NL / Q8_0 (tile-major) re-laid-out in place at load; wv phases dn_proj / attn_proj / ffn_gu (GLU) / out + ffn_down (split-K 4, ordered last-arrival combine); hybrid Q6_K / Q3_K / IQ3_S on dp4a from the padded wv fill (rows_* XP); prefill mmh<.., LAY=1> reads the wv layout; md / mx fill from staged meta. Built (wv1), gates not yet run
+dc91306 megakernel: MK_WV build memory + M2 WIP (MK_MAXT 6..8) + MK_WV_FMK. PairOut: one gemv_pairs store functor in MK_WV builds (gemv_pairs 275 -> 58 instances, PTX -28%; the merged MK_WV build hit 25 GB in ptxas). MK_MAXT > 5: T = 6..MAXT as one padded MAXT-row pass (run_wide), every main-layer ffn_down on wv (WV<Q6_K / Q3_K / IQ3_S> tile-major, MIN-2 fill, prefill mmh LAY=1 readers), conv ring 16, attn_core_q8 head-group passes at T > 5 (all-q8 KV only), lm_head misc slots, gate arrays [MAXT - 1] + drop_last, prefill / scoring launches <= MAXT_PF = 5. MK_WV_FMK=0 (new default): Q4_K / Q5_K tile-major instead of FM (prefill). Not yet built / gated: MK_WV_FMK=0; wv8 (MAXT 8) building
+2292859 megakernel: MK_WV M1 final - wv tensor-core verify GEMM in every main-pass phase (MK_WV=1, MAXT 5), FM layout default (MK_WV_FMK=1)
+a675751 megakernel: MK_WV prefill reads the FM layout whole (FMT stage layout) + MK_MAXT > 5 depth cap policy key dctx
+447a87c megakernel: T > 5 decode attention in one pass over all 48 query rows (attn_core_w48, MK_W48=1)
+805ce7e megakernel: W48 spill fix: per-item thread indices + the call's scalars in shared memory (MK_W48S)
+22bda66 megakernel: MK_WV_OUT (opt-in, default 0): out / ssm_out offset types on wv (measured slower; kept for reference)
+9fed197 megakernel: MK_WV_Q6F (opt-in, default 0): every main-layer Q6_K fragment-ordered on wv (M3)
+624803c megakernel (WIP, MAXT > 5 only): MK_MTP_KVC K/V-only MTP catch-up rows (env MK_MTP_KVC=0 off), policy blk=1 block verification (S6, sample_targets_blk), policy chain=2
+a5631b7 megakernel (MAXT > 5): depth > 5 default gates (policy g7), S6 without local arrays
+
+# Moved out: 535e80c megakernel: T-invariant attention split-K partition (greedy output independent of draft depth) -> PR 2 (02-decode)
+# Moved in:  f58e21e (listed above) from PR 2
+
+# Per-file totals (sum of per-commit numstat; the commits touch the same files repeatedly, so the net diff is smaller)
+megakernel/qwen38_mk.h                   +4 -0
+megakernel/README.md                     +8 -1
+megakernel/wv_host.cuh                   +96 -3
+megakernel/wv.cuh                        +1197 -65
+megakernel/capi.cpp                      +19 -0
+megakernel/bench/wv_ref.cuh              +509 -0
+megakernel/bench/wv_extract.py           +40 -0
+megakernel/prefill_gemm.cuh              +188 -68
+megakernel/qwen38_mk.cu                  +1835 -299
+megakernel/bench/wvgemm_bench.cu         +2339 -43
+TOTAL 10 files +6235 -479
+
+# git show --stat per commit
+b9349ce 2026-10-11 megakernel: draft confidence gate, runtime draft policy, sampled MTP drafts (H1), MK_SPEC_LOG logging
+ megakernel/capi.cpp     |  19 +++
+ megakernel/qwen38_mk.cu | 334 ++++++++++++++++++++++++++++++++++++++++++++----
+ megakernel/qwen38_mk.h  |   4 +
+ 3 files changed, 330 insertions(+), 27 deletions(-)
+943c1bc 2026-10-11 megakernel: default draft policy = confidence gate + sampled MTP drafts (H1)
+ megakernel/qwen38_mk.cu | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+1e23ba6 2026-10-11 megakernel: sampled-draft residual fallback never returns the rejected draft (rs == 0 only through rounding)
+ megakernel/qwen38_mk.cu | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+d487e7e 2026-10-11 megakernel: the MTP draft head reads lm_head rows through draft_ids instead of a gathered copy (-158 MiB VRAM; output bit-identical)
+ megakernel/qwen38_mk.cu | 41 ++++++++++++++++++++++-------------------
+ 1 file changed, 22 insertions(+), 19 deletions(-)
+17e775f 2026-10-12 megakernel: re-quantize the MTP draft block to Q4_K at load (MK_MTP_Q4, default on)
+ megakernel/README.md    |  9 ++++++-
+ megakernel/qwen38_mk.cu | 69 ++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 70 insertions(+), 8 deletions(-)
+f58e21e 2026-10-12 megakernel: cheaper sampled lm_head epilogues (bitonic top-32 merges, shared-memory sampling inputs)
+ megakernel/qwen38_mk.cu | 172 ++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 139 insertions(+), 33 deletions(-)
+c0a1783 2026-10-12 megakernel: spread the embedding prologue and the MTP M0 phase over more blocks
+ megakernel/qwen38_mk.cu | 38 +++++++++++++++++++++++++-------------
+ 1 file changed, 25 insertions(+), 13 deletions(-)
+38521b7 2026-10-12 bench: wvgemm_bench, int8 mma.m16n8k32 verify GEMM (all 8 UD types, native layouts) vs the engine dp4a GEMV; T-invariant, exactness + timing modes
+ megakernel/bench/wv_extract.py   |   40 ++
+ megakernel/bench/wv_ref.cuh      |  509 +++++++++++++++
+ megakernel/bench/wvgemm_bench.cu | 1293 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1842 insertions(+)
+5e653f7 2026-10-12 bench: wvgemm2 - load diagnostics (WV_MODE), v2 kernel (stream-K, LDS.128), tile-major / fragment-ordered weight layout (WV_TILEMAJ 1/2) with host relayout for check, dp4a T=6..8 + 
+ megakernel/bench/wvgemm_bench.cu | 806 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 771 insertions(+), 35 deletions(-)
+820b77b 2026-10-13 megakernel: MK_WV M0 - wv tensor-core verify GEMM (wv.cuh, port of bench k_wv on the FM layout) for dn_proj on temporary wv-layout copies of qkv / gate (measurement build; default M
+ megakernel/qwen38_mk.cu |  51 +++++
+ megakernel/wv.cuh       | 492 ++++++++++++++++++++++++++++++++++++++++++++++++
+ megakernel/wv_host.cuh  |  56 ++++++
+ 3 files changed, 599 insertions(+)
+15c8003 2026-10-13 megakernel: MK_WV M1 WIP - every main-pass matrix of Q4_K / Q5_K / IQ4_XS (FM) and IQ4_NL / Q8_0 (tile-major) re-laid-out in place at load; wv phases dn_proj / attn_proj / ffn_gu (G
+ megakernel/prefill_gemm.cuh |  61 +++++++--
+ megakernel/qwen38_mk.cu     | 275 ++++++++++++++++++++++++++++++-----------
+ megakernel/wv.cuh           | 295 ++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 513 insertions(+), 118 deletions(-)
+dc91306 2026-10-13 megakernel: MK_WV build memory + M2 WIP (MK_MAXT 6..8) + MK_WV_FMK. PairOut: one gemv_pairs store functor in MK_WV builds (gemv_pairs 275 -> 58 instances, PTX -28%; the merged MK_WV
+ megakernel/prefill_gemm.cuh |  28 ++++--
+ megakernel/qwen38_mk.cu     | 225 +++++++++++++++++++++++++++++++++++--------
+ megakernel/wv.cuh           | 226 ++++++++++++++++++++++++++++++++++++++++----
+ megakernel/wv_host.cuh      |  10 +-
+ 4 files changed, 418 insertions(+), 71 deletions(-)
+2292859 2026-10-13 megakernel: MK_WV M1 final - wv tensor-core verify GEMM in every main-pass phase (MK_WV=1, MAXT 5), FM layout default (MK_WV_FMK=1)
+ megakernel/qwen38_mk.cu | 6 +++---
+ megakernel/wv.cuh       | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+a675751 2026-10-13 megakernel: MK_WV prefill reads the FM layout whole (FMT stage layout) + MK_MAXT > 5 depth cap policy key dctx
+ megakernel/prefill_gemm.cuh | 104 ++++++++++++++++++++++++++------------------
+ megakernel/qwen38_mk.cu     |  24 +++++++---
+ 2 files changed, 80 insertions(+), 48 deletions(-)
+447a87c 2026-10-13 megakernel: T > 5 decode attention in one pass over all 48 query rows (attn_core_w48, MK_W48=1)
+ megakernel/qwen38_mk.cu | 426 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 424 insertions(+), 2 deletions(-)
+805ce7e 2026-10-14 megakernel: W48 spill fix: per-item thread indices + the call's scalars in shared memory (MK_W48S)
+ megakernel/qwen38_mk.cu | 63 ++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 54 insertions(+), 9 deletions(-)
+22bda66 2026-10-14 megakernel: MK_WV_OUT (opt-in, default 0): out / ssm_out offset types on wv (measured slower; kept for reference)
+ megakernel/qwen38_mk.cu | 26 +++++++++++++++++++++++---
+ megakernel/wv.cuh       | 37 +++++++++++++++++++++++++++++++++++--
+ 2 files changed, 58 insertions(+), 5 deletions(-)
+9fed197 2026-10-14 megakernel: MK_WV_Q6F (opt-in, default 0): every main-layer Q6_K fragment-ordered on wv (M3)
+ megakernel/bench/wvgemm_bench.cu | 283 +++++++++++++++++++++++++++++++++++++--
+ megakernel/prefill_gemm.cuh      |  63 +++++++--
+ megakernel/qwen38_mk.cu          |  32 ++++-
+ megakernel/wv.cuh                | 208 +++++++++++++++++++++++++++-
+ megakernel/wv_host.cuh           |  33 +++++
+ 5 files changed, 593 insertions(+), 26 deletions(-)
+624803c 2026-10-14 megakernel (WIP, MAXT > 5 only): MK_MTP_KVC K/V-only MTP catch-up rows (env MK_MTP_KVC=0 off), policy blk=1 block verification (S6, sample_targets_blk), policy chain=2
+ megakernel/qwen38_mk.cu | 218 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 215 insertions(+), 3 deletions(-)
+a5631b7 2026-10-14 megakernel (MAXT > 5): depth > 5 default gates (policy g7), S6 without local arrays
+ megakernel/qwen38_mk.cu | 108 +++++++++++++++++++++++++++---------------------
+ 1 file changed, 60 insertions(+), 48 deletions(-)

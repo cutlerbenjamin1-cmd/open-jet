@@ -1,0 +1,13 @@
+fbae2d3 megakernel: pk_attn2 prefill attention (12 warps, bit-exact), tail split, optional fp16 P.V
+6b320e4 megakernel: fp16 P.V on by default in prefill attention, attention microbenchmark, README
+60af318 megakernel: pk_attn8, int8 Q K^T prefill attention on the q8 cache (MK_ATTN_S8)
+da119d6 megakernel: pk_attn8 final form (exp2, I2FP, one barrier per tile), attention microbench S8 variants, README
+568e86b megakernel: pk_glu reads gate / up as float4 (coalesced), bench/mmq_bench.cu compiles again
+0e19805 megakernel: narrow token tiles (32 / 64) for short-prompt prefill GEMMs (F2)
+bd8a22e megakernel prefill GEMMs: pipelined fragments (S4) + mixed-type fused gate / up (V2), y1 shrink in exact mode
+167b509 megakernel prefill GEMMs: Q5_K super-block buffer (4 cp.async stages), GLU epilogue without bank conflicts
+bbf4cd0 megakernel: prefill xh sized for its largest GEMM input (2 D = MTP eh), not FF (-14 MiB at cap 1024)
+
+# totals (sum of per-commit numstat): 7 files touched, +1982 -576
+# no commits moved in or out. Depends on: bd8a22e/167b509 use LAY/FMT/FM6 (PR 1/2 wide-verify layout) and MK_EXACT (PR 5).
+# 0e19805 is the "F2" item of the ttft track; its other commits (5057c03 F6, a5b6c41/032a1b0 F9, 78873a0 F10, 9297c43 F11) are not in this PR.

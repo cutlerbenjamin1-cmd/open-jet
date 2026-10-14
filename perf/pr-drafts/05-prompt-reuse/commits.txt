@@ -1,0 +1,99 @@
+b655092 megakernel: DeltaNet checkpoint (state + conv ring + h ring) in pinned host memory (-159 MiB VRAM, ~13 ms PCIe copy per prompt / rewind; MK_CK_DEVICE=1 keeps it on the device)
+5057c03 megakernel: allocate the pinned DeltaNet checkpoint and the batched-prefill scratch at construction (F6)
+a5b6c41 megakernel: checkpoint save / restore off the prompt's critical path (F9)
+032a1b0 megakernel: issue the checkpoint restore after the prefill's token upload (F9 follow-up)
+646a6a5 megakernel server: rewind checkpoint at the generation prompt (last <|im_start|>), so thinking-mode follow-up turns reuse the prefix instead of re-prefilling (prefill(tokens, ck_at), mk_prefil
+bd894d1 megakernel: DeltaNet checkpoints saved inside one prefill pass, and a pool of them
+0c899f7 megakernel: saving a checkpoint inside a prefill no longer changes its arithmetic
+a191db9 mk_server: reuse the last DeltaNet checkpoint before the divergence (checkpoint pool)
+4c23523 megakernel: MK_EXACT=1 exact reuse: prefill rows independent of the chunking (WIP)
+4ca650d megakernel: MK_EXACT prefill attention with absolute key segments (pk_attn8 EXA), work split free again
+ade2195 megakernel: MK_EXACT split = even cuts of whole key segments (pk_attn8 EXA units store each segment)
+43d67cd megakernel: MK_EXACT split v2 = head unit + single-segment units, list-scheduling plan (pk_attn8 EXA)
+1db6d85 megakernel: MK_EXACT segments of 4096 positions by default; EXA partials in two scratch buffers
+5f30a10 megakernel: MK_EXACT segment folds outside the tile loop; ex_plan counts fold and partial traffic
+3d84349 megakernel: pk_attn8 KB / VB template parameters: compile-time K6 / V5 instantiation for the D / D' presets  [moved from PR 4, depends on MK_EXACT]
+
+git show --stat totals (sum of per-commit shortstat; a file touched by several commits is counted once per commit):
+34 commits-files, +1620 -428 lines
+
+per-commit stat:
+== b655092
+
+ megakernel/qwen38_mk.cu | 38 +++++++++++++++++++++++++++++---------
+ 1 file changed, 29 insertions(+), 9 deletions(-)
+== 5057c03
+
+ megakernel/qwen38_mk.cu | 36 +++++++++++++++++++++---------------
+ 1 file changed, 21 insertions(+), 15 deletions(-)
+== a5b6c41
+
+ megakernel/qwen38_mk.cu | 188 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 161 insertions(+), 27 deletions(-)
+== 032a1b0
+
+ megakernel/qwen38_mk.cu | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+== 646a6a5
+
+ megakernel/capi.cpp            | 10 ++++++++++
+ megakernel/qwen38_mk.cu        | 18 +++++++++++++++---
+ megakernel/qwen38_mk.h         |  5 ++++-
+ megakernel/server/mk_server.py | 21 ++++++++++++++++-----
+ 4 files changed, 45 insertions(+), 9 deletions(-)
+== bd894d1
+
+ megakernel/capi.cpp     |  26 ++-
+ megakernel/prefill.cuh  |  40 +++-
+ megakernel/qwen38_mk.cu | 517 +++++++++++++++++++++++++++++++++++-------------
+ megakernel/qwen38_mk.h  |  16 +-
+ 4 files changed, 446 insertions(+), 153 deletions(-)
+== 0c899f7
+
+ megakernel/qwen38_mk.cu | 58 ++++++++++++++++++++++++++++++++-----------------
+ megakernel/qwen38_mk.h  |  4 ++--
+ 2 files changed, 40 insertions(+), 22 deletions(-)
+== a191db9
+
+ megakernel/server/mk_server.py   | 62 +++++++++++++++++++++++++----
+ tests/test_megakernel_backend.py | 85 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 139 insertions(+), 8 deletions(-)
+== 4c23523
+
+ megakernel/capi.cpp            |  11 ++
+ megakernel/prefill.cuh         |   7 +-
+ megakernel/prefill_attn.cuh    |  20 ++--
+ megakernel/qwen38_mk.cu        | 265 ++++++++++++++++++++++++++++++++++++++---
+ megakernel/qwen38_mk.h         |   4 +
+ megakernel/server/mk_server.py |  18 ++-
+ 6 files changed, 297 insertions(+), 28 deletions(-)
+== 4ca650d
+
+ megakernel/prefill_attn.cuh | 124 ++++++++++++++++++++++++++++++++++++++++++--
+ megakernel/qwen38_mk.cu     |  38 +++++++++++++-
+ 2 files changed, 156 insertions(+), 6 deletions(-)
+== ade2195
+
+ megakernel/prefill_attn.cuh | 67 +++++++++++++++++++++++++++++----------------
+ megakernel/qwen38_mk.cu     | 35 +++++++++++++----------
+ 2 files changed, 65 insertions(+), 37 deletions(-)
+== 43d67cd
+
+ megakernel/prefill_attn.cuh | 47 +++++++++++++---------
+ megakernel/qwen38_mk.cu     | 96 ++++++++++++++++++++++++++++++++-------------
+ 2 files changed, 97 insertions(+), 46 deletions(-)
+== 1db6d85
+
+ megakernel/prefill_attn.cuh | 17 +++++++++-----
+ megakernel/qwen38_mk.cu     | 54 +++++++++++++++++++++++++++------------------
+ 2 files changed, 43 insertions(+), 28 deletions(-)
+== 5f30a10
+
+ megakernel/prefill_attn.cuh | 21 ++++++++++++---------
+ megakernel/qwen38_mk.cu     | 16 ++++++++++++----
+ 2 files changed, 24 insertions(+), 13 deletions(-)
+== 3d84349
+
+ megakernel/prefill_attn.cuh | 35 +++++++++++++++++++++++------------
+ megakernel/qwen38_mk.cu     | 10 ++++++++--
+ 2 files changed, 31 insertions(+), 14 deletions(-)

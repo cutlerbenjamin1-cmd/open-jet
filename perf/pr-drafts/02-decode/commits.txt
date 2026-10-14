@@ -1,0 +1,62 @@
+# PR 2 (02-decode): 11 commits, in logical order, not strictly by date. hash subject
+535e80c megakernel: T-invariant attention split-K partition (greedy output independent of draft depth)
+ad79468 megakernel: attn_core_q8, a pipelined decode attention for the all-q8 KV cache (bit-identical, ~2x faster at long context)
+8316b32 megakernel: attn_core_q8 issues the next tiles' copies from warps 4-15 only; bench/dattn_bench.cu
+d78252e megakernel README: attn_core_q8 (pipelined q8 decode attention, MK_DATTN=0 for the previous kernel), measured +18.7% decode at 101.6K depth, +7.3% at 38K
+7996cfa megakernel: decode attention chunks of one K/V tile run attn_core_t (MK_DA_ROUTE)
+370b529 megakernel: decode attention prologue without conditionally assigned / pointer-aliased arrays (attn_core spills 768 B -> 0, mk_cycle stack frame 2848 -> 992 B) and stack-size limit 0: the local-memory reservation (frame x 1536 threads x 82 SMs) drops from 342 to 119 MiB
+a001f2e megakernel: Q6_K in two streams per row, 192 B of values + an 18 B/block meta stream (pairs: sc even | sc odd | d even | d odd): 210 B per block like GGUF instead of 224 (-182 MiB on UD incl. the Q3_K / IQ3_S re-encodes); bit-identical
+1d63ab7 megakernel: Q8_0 ssm_alpha / ssm_beta (UD) kept as int8 rows + fp16 scales, (q * d) * attn_norm formed in the kernels = the folded fp32 values (-66 MiB; bit-identical; MK_AB_F32=1 = old; F32 files unchanged)
+2b8605c megakernel: 2-row gate / up step at every T; ffn_down rows out of line at T = 2..4
+a8d7c0a megakernel: T=5 ffn_down split-fill K-halves in __noinline__ half_rows (resid32<5,17,*> hot-loop spills 136-188 B -> 0); exp-verify 50e4de4 without the probe knobs
+58ce261 megakernel: drop the pre-fill L2 prefetch of the first weight rows (pf_rows)
+
+# Moved in:  535e80c (T-invariant attention partition) from PR 1: prerequisite of attn_core_q8 / MK_DA_ROUTE, removes a circular dependency
+# Moved out: f58e21e (cheaper sampled lm_head epilogues) -> PR 1: depends on PR 1's gate / sampled-draft code
+# Note: 370b529 also contains MK_MEMLOG / MK_KV_EMU_SPEC hunks (PR 6 / PR 4); a8d7c0a replaces the verify track's 50e4de4 (not listed)
+
+# Per-file totals (sum of per-commit numstat; the commits touch the same files repeatedly, so the net diff is smaller)
+megakernel/README.md                     +9 -3
+megakernel/bench/dattn_bench.cu          +1121 -0
+megakernel/prefill_gemm.cuh              +9 -5
+megakernel/qwen38_mk.cu                  +625 -105
+megakernel/prefill.cuh                   +14 -2
+TOTAL 5 files +1778 -115
+
+# git show --stat per commit
+535e80c 2026-10-11 megakernel: T-invariant attention split-K partition (greedy output independent of draft depth)
+ megakernel/qwen38_mk.cu | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+ad79468 2026-10-12 megakernel: attn_core_q8, a pipelined decode attention for the all-q8 KV cache (bit-identical, ~2x faster at long context)
+ megakernel/qwen38_mk.cu | 379 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 376 insertions(+), 3 deletions(-)
+8316b32 2026-10-12 megakernel: attn_core_q8 issues the next tiles' copies from warps 4-15 only; bench/dattn_bench.cu
+ megakernel/bench/dattn_bench.cu | 1121 +++++++++++++++++++++++++++++++++++++++
+ megakernel/qwen38_mk.cu         |   27 +-
+ 2 files changed, 1136 insertions(+), 12 deletions(-)
+d78252e 2026-10-12 megakernel README: attn_core_q8 (pipelined q8 decode attention, MK_DATTN=0 for the previous kernel), measured +18.7% decode at 101.6K depth, +7.3% at 38K
+ megakernel/README.md | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+7996cfa 2026-10-12 megakernel: decode attention chunks of one K/V tile run attn_core_t (MK_DA_ROUTE)
+ megakernel/qwen38_mk.cu | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+370b529 2026-10-11 megakernel: decode attention prologue without conditionally assigned / pointer-aliased arrays (attn_core spills 768 B -> 0, mk_cycle stack frame 2848 -> 992 B) and stack-size limit 
+ megakernel/qwen38_mk.cu | 88 +++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 78 insertions(+), 10 deletions(-)
+a001f2e 2026-10-12 megakernel: Q6_K in two streams per row, 192 B of values + an 18 B/block meta stream (pairs: sc even | sc odd | d even | d odd): 210 B per block like GGUF instead of 224 (-182 MiB o
+ megakernel/prefill_gemm.cuh | 14 ++++++++----
+ megakernel/qwen38_mk.cu     | 56 +++++++++++++++++++++++++++------------------
+ 2 files changed, 43 insertions(+), 27 deletions(-)
+1d63ab7 2026-10-12 megakernel: Q8_0 ssm_alpha / ssm_beta (UD) kept as int8 rows + fp16 scales, (q * d) * attn_norm formed in the kernels = the folded fp32 values (-66 MiB; bit-identical; MK_AB_F32=1 =
+ megakernel/prefill.cuh  | 16 ++++++++++--
+ megakernel/qwen38_mk.cu | 65 +++++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 71 insertions(+), 10 deletions(-)
+2b8605c 2026-10-12 megakernel: 2-row gate / up step at every T; ffn_down rows out of line at T = 2..4
+ megakernel/qwen38_mk.cu | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+a8d7c0a 2026-10-11 megakernel: T=5 ffn_down split-fill K-halves in __noinline__ half_rows (resid32<5,17,*> hot-loop spills 136-188 B -> 0); exp-verify 50e4de4 without the probe knobs
+ megakernel/qwen38_mk.cu | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+58ce261 2026-10-12 megakernel: drop the pre-fill L2 prefetch of the first weight rows (pf_rows)
+ megakernel/qwen38_mk.cu | 34 ----------------------------------
+ 1 file changed, 34 deletions(-)

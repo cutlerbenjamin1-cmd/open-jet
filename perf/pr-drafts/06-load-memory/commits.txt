@@ -1,0 +1,83 @@
+a730f00 megakernel: MK_MEMLOG device-memory accounting (cudaMalloc'd bytes vs free-memory drop per load stage, mk_cycle local memory and limits); MK_KV_EMU=1 build: MK_KV_EMU_SPEC rounds chosen K / V 
+8585087 megakernel: device buffers from the default memory pool (cudaMallocAsync) instead of one cudaMalloc each: no 2 MiB rounding per weight tensor (~-470 MiB on UD); MK_CUDAMALLOC=1 = old
+5f69600 megakernel: watchdog on every device wait (wait_device: event poll with a deadline, MK_WATCHDOG seconds, exit 3 with diagnostics) after mk_cycle launches, prefill chunks / tail and the checkpo
+fa27118 megakernel: name the awaited GPU work when the watchdog event poll returns a CUDA error (F10 follow-up)
+78873a0 megakernel: CUDA errors throw MKCudaError instead of exit(1) inside the library (F10)
+9297c43 megakernel: allocate the scoring logits buffer (hb.logits, 5 MB) on the first score_logits call (F11)
+89e9754 megakernel: native IQ4_NL (144 B blocks: 8 fp16 d + indices; same arithmetic as the Q8_0 re-encode it replaces, bit-identical; MK_IQ4NL_Q8=1 = old) and IQ4_XS in 272 B block pairs without padd
+9c4b08c megakernel: native Q3_K and IQ3_S (no load-time Q6_K re-encode), bit-identical
+9801b98 megakernel + server: presence / frequency penalty (vLLM semantics), exact under speculation
+d96f7d6 megakernel: fast model load (read-ahead, upload worker, reused buffers), CLI --batch, post-prefill state files
+2e604fd WIP (NOT GATED): megakernel load round 2: RowPool, device wv re-layout, more load phases, restore GPU warm-up
+21523be round 2 gated (2e604fd): device wv re-layout, RowPool, restore warm-up; bench.py --dump fix
+
+totals (sum of per-commit shortstat; a file touched by several commits is counted once per commit):
+30 file-changes, +2653 -475 lines
+
+per-commit stat:
+== a730f00
+
+ megakernel/prefill.cuh  |   5 ++
+ megakernel/qwen38_mk.cu | 120 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+== 8585087
+
+ megakernel/qwen38_mk.cu | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+== 5f69600
+
+ megakernel/qwen38_mk.cu | 65 +++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 57 insertions(+), 8 deletions(-)
+== fa27118
+
+ megakernel/qwen38_mk.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+== 78873a0
+
+ megakernel/capi.cpp     | 51 ++++++++++++++++++++++++----------
+ megakernel/main.cu      | 13 +++++++++
+ megakernel/qwen38_mk.cu | 73 ++++++++++++++++++++++++++++++++++++++++++-------
+ megakernel/qwen38_mk.h  |  7 +++++
+ 4 files changed, 119 insertions(+), 25 deletions(-)
+== 9297c43
+
+ megakernel/qwen38_mk.cu | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+== 89e9754
+
+ megakernel/prefill_gemm.cuh |  38 +++++++++-----
+ megakernel/qwen38_mk.cu     | 119 ++++++++++++++++++++++++++++++++++----------
+ 2 files changed, 119 insertions(+), 38 deletions(-)
+== 9c4b08c
+
+ megakernel/README.md        |   7 +-
+ megakernel/prefill_gemm.cuh |  72 ++++++++++-
+ megakernel/qwen38_mk.cu     | 303 +++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 371 insertions(+), 11 deletions(-)
+== 9801b98
+
+ megakernel/README.md           |  10 ++--
+ megakernel/capi.cpp            |  11 +++++
+ megakernel/main.cu             |   6 ++-
+ megakernel/qwen38_mk.cu        | 106 ++++++++++++++++++++++++++++++++++++-----
+ megakernel/qwen38_mk.h         |   5 ++
+ megakernel/server/mk_server.py |  17 ++++++-
+ 6 files changed, 135 insertions(+), 20 deletions(-)
+== d96f7d6
+
+ megakernel/loader.cuh   | 268 ++++++++++++++++
+ megakernel/main.cu      | 461 ++++++++++++++++++++-------
+ megakernel/qwen38_mk.cu | 804 ++++++++++++++++++++++++++++++++++++++----------
+ megakernel/qwen38_mk.h  |  11 +
+ megakernel/wv_host.cuh  |  66 ++--
+ 5 files changed, 1297 insertions(+), 313 deletions(-)
+== 2e604fd
+
+ megakernel/loader.cuh   |  35 ++++++-
+ megakernel/qwen38_mk.cu | 263 ++++++++++++++++++++++++++++++++++++++----------
+ megakernel/wv_host.cuh  | 147 +++++++++++++++++++++++++++
+ 3 files changed, 390 insertions(+), 55 deletions(-)
+== 21523be
+
+ megakernel/bench/bench.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)

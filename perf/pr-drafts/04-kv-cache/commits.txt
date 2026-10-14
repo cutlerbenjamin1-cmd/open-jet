@@ -1,0 +1,22 @@
+f138d36 megakernel: MK_KV per-slot KV cache formats (16 attention layers + MTP, K / V separately): q8_0 or q4 (q4_0 rounding, fp16 scale per 32), optional Hadamard-rotated K (4r); decode attention, prefill pk_attn2 and stores; all-q8 bit-identical, opt-in
+097aee7 megakernel: a non-empty MK_KV selects the q8_0 cache in auto KV mode (bench.py runs without --kv)
+680d412 megakernel: q4 MK_KV slots on the pipelined decode attention (attn_core_q8m, MK_DA_Q4)
+251849d megakernel: pk_attn8 reads the q8 slots through the MK_KV slot pointers (C3a)
+91b0551 megakernel: KV emulation modes + batch KLD scoring (MK_KV_EMU builds)
+380d2dd megakernel: q5 / q6 / q7 KV formats with K and V rotation; MK_MTP_WIN knob; emulation window + TurboAngle
+074b37a megakernel: fix the a2_st_q8 overload ambiguity (380d2dd did not compile)
+9b05adb megakernel: MK_KV_WIN recent-window q8 ring over a low-bit MK_KV cache (opt-in, default off)
+abe5556 megakernel: attn_core_q8m expands low-bit K / V tiles to int8 once in shared memory
+23905b4 megakernel: pk_attn8 reads low-bit (unrotated) K: int8 expansion in its staging
+f292074 megakernel: MK_KV_WIN ring refill only for the rows a rewind actually overwrote
+71ac710 megakernel: pk_attn8<QROW, KLOW>: q8-K slots keep the plain kernel; MK_XP_SM knob
+f64ff51 megakernel: kv_rows_expand: load the warp's rows first, then convert and store
+ceb7d44 megakernel: MIX decode attention: early copy issue, consumer-side bias, no per-tile modulo
+1548b89 megakernel: prefill attention: rotated-K slots run pk_attn8 too
+eb133a5 megakernel: MK_AQ_EARLY defaults to 0: issuing the MIX copies first costs 2% per cycle at 101.6k (A-B-A, notes/kvq/spxq)
+2ea89b6 megakernel: KV tile format / source decided per launch (KvFmt, kv_ring_tile), not per tile
+5245602 megakernel: low-bit MK_KV slots at T > 5 (MK_MAXT=8, -d 5..7): attn_core_q8m in the wide pass
+3d84349 megakernel: pk_attn8 KB / VB template parameters: compile-time K6 / V5 instantiation for the D / D' presets   [RECOMMENDED MOVE TO PR 5: needs the EXA template parameter from 4ca650d/43d67cd]
+
+# totals (sum of per-commit numstat): 7 files touched, +1601 -603
+# depends on other PRs: 680d412 (PR 2 pipelined q8 decode attention), pk_attn8 commits (PR 3), 5245602 (PR 1 MK_MAXT=8), 3d84349 (PR 5 EXA)
