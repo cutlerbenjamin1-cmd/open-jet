@@ -305,6 +305,9 @@ struct Bufs {
 #endif
     int dattn;   // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
+#if MK_MAXT > 5
+    int mtp_kvc; // MK_MTP_KVC builds: K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
+#endif
 #if MK_WV
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
@@ -334,6 +337,9 @@ struct Launch {
     // position (Bufs::pcnt: the committed ones; a verify row adds the drafts in its own context). Applied to the main
     // decode rows and to the MTP draft head before the argmax / top-k; 0 / 0: off (the kernels without the penalty).
     float pres, freq;
+#if MK_MAXT > 5
+    int spec_blk; // sampled drafts: block verification of the verify rows (policy blk=1, sample_targets_blk)
+#endif
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
 
@@ -395,7 +401,7 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 enum {
     PH_EMBED, PH_ATTN_PROJ, PH_ATTN_CORE, PH_ATTN_COMB, PH_RESID_O, PH_DN_PROJ, PH_DN_CORE, PH_RESID_SOUT, PH_FFN_GU,
     PH_FFN_DOWN, PH_LMHEAD, PH_MTP_M0, PH_MTP_EH, PH_MTP_ATTN_PROJ, PH_MTP_ATTN_CORE, PH_MTP_ATTN_COMB, PH_MTP_RESID_O,
-    PH_MTP_FFN_GU, PH_MTP_FFN_DOWN, PH_MTP_LMHEAD, PH_COUNT
+    PH_MTP_FFN_GU, PH_MTP_FFN_DOWN, PH_MTP_LMHEAD, PH_MTP_KV_M0, PH_MTP_KV_EH, PH_MTP_KV_PROJ, PH_COUNT
 };
 
 __device__ __forceinline__ unsigned long long gtimer() {
@@ -4039,6 +4045,88 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
     return pick >= 0 ? pick : last;
 }
 
+#if MK_MAXT > 5
+// Block verification (Sun et al. 2024, arXiv 2403.10444, Alg. 2) of the g = T - 1 sampled drafts (Ctl::dsmp; policy blk=1,
+// Launch::spec_blk). Same output distribution as the per-token rule, at least as many accepted drafts in expectation (it
+// judges the drafts as a block: a draft the token rule rejects can still be kept when the ones before it had weight
+// to spare). Row i verifies draft d_i = tok[i + 1] (target p_i, draft distribution q_i). Weights w_0 = 1, w_i = min(1,
+// w_(i-1) p_(i-1)(d_(i-1)) / q_(i-1)(d_(i-1))); h_i = r_i / (r_i + 1 - w_i) with r_i = sum_x max(0, w_i p_i(x) - q_i(x))
+// for i < g, h_g = w_g; tau = the largest i with eta_i < h_i (0 if none; eta_i = row i - 1's acceptance uniform).
+// Rows < tau keep their drafts; row tau draws from max(0, w_tau p_tau - q_tau) (tau < g; never d_tau, see notes/
+// agent_mtp.md) or from p_g (tau = g). A later row is drawn fresh from its p only while every row before it emitted its
+// draft (main_control then reads it; its prefix is the drafts, so its p is the target conditional): a fallback only.
+// Single thread (the last lm_head block's thread 0), out of line: its arrays stay out of the main pass's frame.
+__device__ __noinline__ void sample_targets_blk(const Launch & P, int T, int tl, int * tg, const float2 * cand,
+                                                const float2 * dq) {
+    const Ctl * c = cB.ctl;
+    const unsigned long long n = (unsigned long long) c->n;
+    const int g = T - 1;
+    float w[MAXT], h[MAXT];
+    float pa[TOPK_MAX], pb[TOPK_MAX]; // row i - 1's probabilities, row i's
+    int K = cand_probs(cand, P, pa);
+    float wi = 1.f;
+    w[0] = 1.f;
+    for (int i = 1; i <= g; i++) {
+        const float2 * cd = cand + (i - 1) * TOPK_MAX;
+        const int d = c->tok[i];
+        float pd = 0.f;
+        for (int j = 0; j < K; j++)
+            if (__float_as_int(cd[j].y) == d) pd += pa[j];
+        const float qd = dq_prob(dq + (i - 1) * TOPK_MAX, d);
+        wi = qd > 0.f ? fminf(wi * pd / qd, 1.f) : 0.f;
+        w[i] = wi;
+        if (i < g) {
+            const float2 * cd2 = cand + i * TOPK_MAX;
+            const float2 * q2 = dq + i * TOPK_MAX;
+            const int K2 = cand_probs(cd2, P, pb);
+            float r = 0.f; // (q_i's mass outside p_i's candidates adds nothing: max(0, 0 - q) = 0)
+            for (int j = 0; j < K2; j++) r += fmaxf(0.f, wi * pb[j] - dq_prob(q2, __float_as_int(cd2[j].y)));
+            const float den = r + 1.f - wi;
+            h[i] = den > 0.f ? r / den : 1.f;
+            for (int j = 0; j < K2; j++) pa[j] = pb[j];
+            K = K2;
+        } else {
+            h[i] = wi;
+        }
+    }
+    int tau = 0;
+    for (int i = g; i >= 1; i--)
+        if (urand(P.seed, 2 * (n + i - 1)) < h[i]) {
+            tau = i;
+            break;
+        }
+    for (int i = 0; i < tau; i++) tg[i] = c->tok[i + 1];
+    {
+        const float2 * cd = cand + tau * TOPK_MAX;
+        K = cand_probs(cd, P, pa);
+        const float u = urand(P.seed, 2 * (n + tau) + 1);
+        float rs = 0.f;
+        if (tau < g) {
+            const float2 * q = dq + tau * TOPK_MAX;
+            for (int j = 0; j < K; j++) rs += (pb[j] = fmaxf(0.f, w[tau] * pa[j] - dq_prob(q, __float_as_int(cd[j].y))));
+        }
+        if (!(rs > 0.f)) { // tau = g: p_g; else rounding only
+            tg[tau] = cand_draw(cd, pa, K, -1, u);
+        } else {
+            float x = u * rs;
+            int pick = -1;
+            for (int j = 0; j < K; j++) {
+                if (pb[j] <= 0.f) continue;
+                pick = __float_as_int(cd[j].y);
+                x -= pb[j];
+                if (x < 0.f) break;
+            }
+            tg[tau] = pick;
+        }
+    }
+    for (int i = tau + 1; i < tl && tg[i - 1] == c->tok[i]; i++) {
+        const float2 * cd = cand + i * TOPK_MAX;
+        K = cand_probs(cd, P, pa);
+        tg[i] = cand_draw(cd, pa, K, -1, urand(P.seed, 2 * (n + i) + 1));
+    }
+}
+#endif
+
 // Sampled targets for the verified rows.  Point-mass drafts (argmax of the MTP): draft token d at row
 // i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i without d.
 // Sampled drafts (Ctl::dsmp, d ~ q'_i): accepted with probability min(1, p_i(d) / q'_i(d)); on
@@ -4049,6 +4137,12 @@ __device__ int draft_sample(const Launch & P, const float2 * src, float2 * dst, 
 // SM_CAND), dq: the drafts' proposals (cB.dq, staged at SM_DQ): single-thread code, so every load is latency.
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
     const Ctl * c = cB.ctl;
+#if MK_MAXT > 5
+    if (P.spec_blk && P.mode == MODE_DECODE && c->dsmp && T >= 2 && tl == T) {
+        sample_targets_blk(P, T, tl, tg, cand, dq);
+        return;
+    }
+#endif
     const unsigned long long n = (unsigned long long) c->n;
     float p[TOPK_MAX];
     for (int i = 0; i < tl; i++) {
@@ -4351,6 +4445,20 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             Ctl * c = cB.ctl;
             const float * mm = misc(sm);
             const float conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
+#if MK_MAXT > 5
+#if MK_SPEC_LOG
+            cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
+#endif
+            // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
+            const int dt = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
+                                                     (unsigned long long) c->mtp_P + 1 + k)
+                                      : s_tok[0];
+            c->tok[1 + k] = dt;
+            // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
+            // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
+            const float chain = (k == 0 ? 1.f : c->dchain) * (P.gate_chain == 2 && P.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
+            const float f = P.gate_chain ? chain : conf;
+#else
             const float chain = (k == 0 ? 1.f : c->dchain) * conf;
 #if MK_SPEC_LOG
             cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
@@ -4360,6 +4468,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             c->tok[1 + k] = P.spec_smp ? draft_sample(P, reinterpret_cast<const float2 *>(sm + SM_CAND), cB.dq + k * TOPK_MAX,
                                                       (unsigned long long) c->mtp_P + 1 + k)
                                        : s_tok[0];
+#endif
             c->dsmp = P.spec_smp;
             c->dconf[k] = conf;
             c->dchain = chain;
@@ -4370,6 +4479,82 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         gsync(epoch, PH_MTP_LMHEAD);
     }
 }
+
+#ifndef MK_MTP_KVC
+#define MK_MTP_KVC 1 // MAXT > 5 builds: K / V-only MTP catch-up rows (mtp_kv_pass); 0: every catch-up row runs the full pass
+#endif
+#define MTP_KVC (MK_MTP_KVC && MK_MAXT > 5 && MK_WV && !MK_KV_EMU)
+#if MTP_KVC
+// K / V-only MTP catch-up rows (MK_MTP_KVC). Of a cycle's catch-up rows (the accepted drafts + the bonus, R = a + 1) only
+// the last row's MTP output is ever read (write_h_rows keeps the last row: it feeds the draft head and the chain); the
+// other rows are there for their K / V rows in the MTP slot. With R > 5 the catch-up took two full passes (the dp4a
+// ffn_down holds <= 5 rows); now rows 0 .. R - 6 run this pass (M0, eh, the k / v projections, K norm + RoPE + store: the
+// same code and per-row arithmetic as the full pass, hence the same K / V bits) and the last 5 rows the full pass.
+// The K / V store runs in the next pass's M0 phase (nothing there reads kbuf / vbuf or the MTP slot): no barrier of its own.
+template <int R>
+__device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
+    uint8_t * const sm = smem;
+    volatile Ctl * vc = cB.ctl;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int pos0 = vc->mtp_pos[row0];
+    constexpr int M0_NB = 10; // (M0 of mtp_pass, catch-up rows)
+    if (blockIdx.x < R * M0_NB) {
+        const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
+        const int pos = pos0 + r;
+        const int tok = vc->mtp_tok[row0 + r];
+        const float * hsrc = pos >= 1 ? cB.h_hist + (size_t) ((pos - 1) % H_RING) * D : nullptr;
+        float * se = reinterpret_cast<float *>(sm);
+        float * sh = se + D;
+        float * red = sh + D;
+        const uint8_t * erow = stage_embd_row(tok, reinterpret_cast<uint8_t *>(red + 32));
+        float ae = 0.f, ah = 0.f;
+        for (int e = tid; e < D; e += NT) {
+            const float v = dequant_q4k(erow, e);
+            const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
+            se[e] = v;
+            sh[e] = hv;
+            ae += v * v;
+            ah += hv * hv;
+        }
+        ae = bsum(ae, red);
+        ah = bsum(ah, red + 16);
+        const float rse = rsqrtf(ae / (float) D + EPS), rsh = rsqrtf(ah / (float) D + EPS);
+        for (int j = s * NW + warp; j < 2 * U_D; j += M0_NB * NW) {
+            const int e = 32 * (j % U_D) + lane;
+            const float v = j < U_D ? se[e] * rse * cW.enorm[e] : sh[e] * rsh * cW.hnorm[e];
+            q32_store(cB.qe, r, j, v, 0.f, false);
+        }
+    }
+    gsync(epoch, PH_MTP_KV_M0);
+    const LayerW & W = cW.L[NL];
+    resid_any<R, 10>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
+    gsync(epoch, PH_MTP_KV_EH);
+    {
+        const SX sx = make_sx(sm, U_D);
+        fill_xs<R>(cB.qn, 0, true, sx, misc(sm));
+        const int nk = KVD / 2;
+        gemv_pairs_any<R, 5>(W.k, 0, nk, PairOut{cB.kbuf, KVD, -1});
+        gemv_pairs_any<R, 5>(W.v, nk, 2 * nk, PairOut{cB.vbuf, KVD, -1});
+    }
+    gsync(epoch, PH_MTP_KV_PROJ);
+    constexpr int slot = N_ATT_SLOTS - 1;
+    for (int it = gwarp(); it < R * NKV; it += nwarps()) { // (as attn_core's K / V store of the cycle's rows)
+        const int t = it / NKV, g = it - t * NKV, pp = pos0 + t;
+        float v[8];
+        load8(cB.kbuf + t * KVD + g * 256 + lane * 8, v);
+        float ss = 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; k++) ss += v[k] * v[k];
+        const float rs = rsqrtf(wsum(ss) / 256.0f + EPS);
+#pragma unroll
+        for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
+        rope8(v, lane, pp);
+        kv_store(0, slot, g, pp, v);
+        load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
+        kv_store(1, slot, g, pp, v);
+    }
+}
+#endif
 
 template <int T>
 __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
@@ -4442,6 +4627,17 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     const int Rtot = vc->mtp_R;
     const bool lg = vc->mtp_logits;
     int done = 0;
+#if MTP_KVC
+    while (cB.mtp_kvc && Rtot - done > 5) { // all but the last 5 rows: K / V only (at most 3 rows per pass)
+        const int R = min(3, Rtot - done - 5);
+        switch (R) {
+            case 1: mtp_kv_pass<1>(done, epoch); break;
+            case 2: mtp_kv_pass<2>(done, epoch); break;
+            default: mtp_kv_pass<3>(done, epoch); break;
+        }
+        done += R;
+    }
+#endif
     while (done < Rtot) {
         const int R = min(5, Rtot - done); // (the MTP block's dp4a ffn_down holds at most 5 rows)
         const bool last_pass = done + R == Rtot;
@@ -4773,6 +4969,9 @@ struct MKEngine::Impl {
 #endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
+#if MK_MAXT > 5
+        int blk = 0; // sampled drafts: block verification (Launch::spec_blk)
+#endif
     } pol;
     // the policy's draft depth at position pos: n_draft, or (MK_MAXT > 5) at most 4 from Policy::dctx on
 #if MK_MAXT > 5
@@ -6022,6 +6221,10 @@ struct MKEngine::Impl {
             // the KV layout are unchanged). Drafts are verified, so the output is exact; acceptance can change.
             hb.mtp_win = getenv("MK_MTP_WIN") ? atoi(getenv("MK_MTP_WIN")) : 0;
             if (hb.mtp_win > 0) fprintf(stderr, "[mk] MTP decode attention window %d positions (MK_MTP_WIN)\n", hb.mtp_win);
+#if MK_MAXT > 5
+            // MK_MTP_KVC builds: the catch-up rows before the last 5 run K / V only (same drafts); env MK_MTP_KVC=0: off
+            hb.mtp_kvc = !(getenv("MK_MTP_KVC") && atoi(getenv("MK_MTP_KVC")) == 0);
+#endif
             // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default), q4 (kv_store_q4) or q5 / q6 / q7
             // (kv_store_qn), e.g. "V*=6r,K16=4r": comma-separated <K|V|*><slot>=<4..8>[r], slot 0..15 = attention layer
             // 4 slot + 3, 16 = MTP block, * or empty = all slots; r: stored Hadamard-rotated (K: the queries get the same
@@ -6264,6 +6467,9 @@ struct MKEngine::Impl {
 #endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
+#if MK_MAXT > 5
+        L.spec_blk = L.spec_smp && pol.blk;
+#endif
         if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
             L.pres = pen_pres;
             L.freq = pen_freq;
@@ -6326,7 +6532,8 @@ struct MKEngine::Impl {
         static const char * names[PH_COUNT] = {"embed", "attn_proj", "attn_core", "attn_comb", "resid_o", "dn_proj",
                                                "dn_core", "resid_sout", "ffn_gu", "ffn_down", "lm_head", "mtp_m0",
                                                "mtp_eh", "mtp_attn_proj", "mtp_attn_core", "mtp_attn_comb",
-                                               "mtp_resid_o", "mtp_ffn_gu", "mtp_ffn_down", "mtp_lm_head"};
+                                               "mtp_resid_o", "mtp_ffn_gu", "mtp_ffn_down", "mtp_lm_head",
+                                               "mtp_kv_m0", "mtp_kv_eh", "mtp_kv_proj"};
         fprintf(stderr, "[mk-profile] %ld decode launches, mean %.3f ms in barriers-to-barrier phases\n", launches,
                 launch_ns / launches / 1e6);
         for (int i = 0; i < PH_COUNT; i++) {
@@ -7186,7 +7393,9 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
 // stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
 // sampling); mtpq=0|1 (MK_MTP_Q4=ab only: the MTP block as stored / re-quantised to Q4_K; kept until changed);
-// MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts);
+// MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
+// chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
+// blk=0|1 (sampled drafts: block verification, sample_targets_blk);
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -7215,6 +7424,9 @@ void MKEngine::set_policy(const std::string & spec) {
 #endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
+#if MK_MAXT > 5
+        else if (k == "blk") pol.blk = std::stoi(v);
+#endif
         else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
         else throw std::runtime_error("policy: unknown key " + k);
     }
