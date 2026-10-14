@@ -3,21 +3,24 @@
 #pragma once
 
 // ---- host: load-time re-layout (exact byte permutation of the device layout) --------------------------------------
-// w: N rows x rb bytes in the device layout of `type` (after the loader's repacks); meta: Q8_0's scale stream (N rows
-// x 2 nd bytes) or empty. N % 16 == 0.
-void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::vector<uint8_t> & meta) {
+// w: N rows x rb bytes in the device layout of `type` (after the loader's repacks; may be the GGUF mapping itself);
+// meta: its meta stream, meta_n bytes (N rows of meta_n / N bytes: Q8_0's scales, Q6_K / Q3_K / IQ3_S's meta) or none
+// (meta_n 0). Writes the wv layout to out (N rb bytes; MK_WV_Q6F Q6_K: N rb + meta_n bytes with the meta inline) and a
+// re-laid meta stream to out_meta. Returns the bytes left in the meta stream (0: none, or folded into out). N % 16 == 0.
+// out / out_meta must not overlap w / meta. Every output byte is written.
+size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out,
+                   uint8_t * out_meta) {
     const int nb = K / 256;
 #if MK_MAXT > 5 && MK_WV_Q6F
-    if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline (meta is emptied)
+    if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline
         const int mrow = nb * Q6_META;
-        std::vector<uint8_t> f((size_t) N / 16 * nb * Q6F_UNIT);
         parallel_rows(N / 16, [&](int64_t tile) {
             for (int rr = 0; rr < 16; rr++) {
                 const int r = (int) tile * 16 + rr, g = rr & 7, half = rr >> 3;
                 for (int sb = 0; sb < nb; sb++) {
-                    uint8_t * u = f.data() + ((size_t) tile * nb + sb) * Q6F_UNIT;
-                    const uint8_t * blk = w.data() + (size_t) r * rb + (size_t) sb * Q6_BLK;
-                    const uint8_t * mp = meta.data() + (size_t) r * mrow + (sb >> 1) * 2 * Q6_META;
+                    uint8_t * u = out + ((size_t) tile * nb + sb) * Q6F_UNIT;
+                    const uint8_t * blk = w + (size_t) r * rb + (size_t) sb * Q6_BLK;
+                    const uint8_t * mp = meta + (size_t) r * mrow + (sb >> 1) * 2 * Q6_META;
                     memcpy(u + 32 * g + 16 * half, mp + 16 * (sb & 1), 16);
                     memcpy(u + Q6F_D + 4 * g + 2 * half, mp + 32 + 2 * (sb & 1), 2);
                     for (int tq = 0; tq < 4; tq++) {
@@ -35,20 +38,17 @@ void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::
                 }
             }
         });
-        w.swap(f);
-        meta.clear();
-        return;
+        return 0;
     }
 #endif
-    std::vector<uint8_t> o(w.size());
     if (wv_fm(type)) {
         const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : 136;
         parallel_rows(N / 16, [&](int64_t tile) {
             for (int rr = 0; rr < 16; rr++) {
                 const int r = (int) tile * 16 + rr, g = rr & 7, half = rr >> 3;
-                const uint8_t * row = w.data() + (size_t) r * rb;
+                const uint8_t * row = w + (size_t) r * rb;
                 for (int sb = 0; sb < nb; sb++) {
-                    uint8_t * u = o.data() + ((size_t) tile * nb + sb) * 16 * BS;
+                    uint8_t * u = out + ((size_t) tile * nb + sb) * 16 * BS;
                     if (type == T_IQ4X) { // source: the loader's 272-B block pairs (hdr0 | hdr1 | qs0 | qs1)
                         const uint8_t * pr = row + (sb >> 1) * 272;
                         const int odd = sb & 1;
@@ -69,25 +69,23 @@ void wv_relayout(int type, int N, int K, int rb, std::vector<uint8_t> & w, std::
                 }
             }
         });
-    } else { // tile-major whole blocks of BS bytes (per super-block), the meta stream likewise (MB-byte entries)
-        auto tm = [&](const uint8_t * src, uint8_t * dst, int rowb, int BS) {
-            const int nbk = rowb / BS;
-            parallel_rows(N / 16, [&](int64_t tile) {
-                for (int rr = 0; rr < 16; rr++)
-                    for (int i = 0; i < nbk; i++)
-                        memcpy(dst + (((size_t) tile * nbk + i) * 16 + rr) * BS, src + ((size_t) tile * 16 + rr) * rowb + (size_t) i * BS, BS);
-            });
-        };
-        // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
-        // pairs), IQ3_S 96 (+ 16-B meta per block)
-        const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
-        const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
-        tm(w.data(), o.data(), rb, BS);
-        if (!meta.empty()) {
-            std::vector<uint8_t> om(meta.size());
-            tm(meta.data(), om.data(), (int) (meta.size() / N), MB);
-            meta.swap(om);
-        }
+        return 0;
     }
-    w.swap(o);
+    // tile-major whole blocks of BS bytes (per super-block), the meta stream likewise (MB-byte entries)
+    auto tm = [&](const uint8_t * src, uint8_t * dst, int rowb, int BS) {
+        const int nbk = rowb / BS;
+        parallel_rows(N / 16, [&](int64_t tile) {
+            for (int rr = 0; rr < 16; rr++)
+                for (int i = 0; i < nbk; i++)
+                    memcpy(dst + (((size_t) tile * nbk + i) * 16 + rr) * BS, src + ((size_t) tile * 16 + rr) * rowb + (size_t) i * BS, BS);
+        });
+    };
+    // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
+    // pairs), IQ3_S 96 (+ 16-B meta per block)
+    const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
+    const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
+    tm(w, out, rb, BS);
+    if (meta_n) tm(meta, out_meta, (int) (meta_n / N), MB);
+    return meta_n;
 }
+

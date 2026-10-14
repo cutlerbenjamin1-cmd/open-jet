@@ -21,7 +21,11 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <map>
+#include <mutex>
+#include <memory>
+#include <sstream>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +44,8 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "qwen38_mk.h"
+
+extern char ** environ; // (state files: the MK_* settings in the key)
 
 // MK_SPEC_LOG=1: the draft head keeps its top logits, and with MK_SPEC_LOG_FILE=<path> every decode
 // cycle appends a JSON line (drafts + their MTP top logits, verify rows, outcome). Analysis only.
@@ -4734,11 +4740,14 @@ bool repack_iq3s(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const
 #if MK_WV
 #include "wv_host.cuh"
 #endif
+#include "loader.cuh"
 
 } // namespace
 
 struct MKEngine::Impl {
     gguf::File file;
+    LoadClock lc;                         // load phases (MK_LOADLOG=1 prints them)
+    lclk::time_point t_load = lclk::now(); // (after the GGUF parse)
     ModelW hw{};
     Bufs hb{};
     std::vector<void *> allocs;
@@ -5383,6 +5392,7 @@ struct MKEngine::Impl {
         if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
         allocs.push_back(p);
         alloc_bytes += n * sizeof(T) + 16;
+        if (wrec_on) wrec.push_back({p, n * sizeof(T)});
         return (T *) p;
     }
 
@@ -5423,8 +5433,63 @@ struct MKEngine::Impl {
     double nat_s = 0;
     bool iq3s_grid_up = false;
 
-    Src want(const std::string & name, int to = -1) {
+    // The GGUF tensor `name`, its bytes read in (Prefetch, MK_LOAD_IO)
+    std::unique_ptr<Prefetch> pfx;
+    const gguf::Tensor & tget(const std::string & name) {
         const auto & t = file.get(name);
+        if (pfx) pfx->need(t);
+        return t;
+    }
+    // MK_MTP_Q4 re-quantisation of one tensor's rows to Q4_K (rs_to bytes per row into out)
+    static void requant_q4k(const gguf::Tensor & t, uint8_t * out) {
+        const int64_t K = (int64_t) t.ne[0];
+        int64_t rows = 1;
+        for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
+        const size_t rs_from = ggml_row_size((ggml_type) t.type, K), rs_to = ggml_row_size(GGML_TYPE_Q4_K, K);
+        const auto * tr = ggml_get_type_traits((ggml_type) t.type);
+        parallel_rows(rows, [&](int64_t r) {
+            thread_local std::vector<float> f;
+            f.resize((size_t) K);
+            tr->to_float(t.data + (size_t) r * rs_from, f.data(), K);
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (mtp_q4)
+        });
+    }
+    static bool requant_type(uint32_t t) { return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0; }
+    // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
+    // (rq_start; MK_LOAD_RQBG=0: inline as before); want() takes its results. Same rows, same calls, same bytes.
+    std::map<std::string, std::vector<uint8_t>> rq_res;
+    double rq_s = 0; // the background thread's own time
+    struct Joiner {
+        std::thread t;
+        ~Joiner() {
+            if (t.joinable()) t.join();
+        }
+    } rq_th;
+    bool rq_bg = false;
+    void rq_start() {
+        rq_bg = mtp_q4 != 0 && !(getenv("MK_LOAD_RQBG") && atoi(getenv("MK_LOAD_RQBG")) == 0);
+        if (!rq_bg) return;
+        std::vector<const gguf::Tensor *> ts;
+        for (const char * r : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+                               "ffn_down.weight", "nextn.eh_proj.weight"}) {
+            const auto it = file.tensors.find("blk." + std::to_string(NL) + "." + r);
+            if (it != file.tensors.end() && requant_type(it->second.type)) ts.push_back(&it->second);
+        }
+        rq_th.t = std::thread([this, ts] {
+            const auto t0 = lclk::now();
+            for (const gguf::Tensor * t : ts) {
+                int64_t rows = 1;
+                for (size_t d = 1; d < t->ne.size(); d++) rows *= (int64_t) t->ne[d];
+                std::vector<uint8_t> v(ggml_row_size(GGML_TYPE_Q4_K, (int64_t) t->ne[0]) * (size_t) rows);
+                requant_q4k(*t, v.data());
+                rq_res[t->name] = std::move(v);
+            }
+            rq_s = lsec(t0);
+        });
+    }
+
+    Src want(const std::string & name, int to = -1) {
+        const auto & t = tget(name);
         Src s;
         s.type = t.type;
         s.ne = t.ne;
@@ -5442,6 +5507,19 @@ struct MKEngine::Impl {
         for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
         const size_t rs_from = ggml_row_size(from, K), rs_to = ggml_row_size(dst, K);
         const auto t0 = std::chrono::steady_clock::now();
+        if (to_q4 && rq_bg) { // the background thread's result (rq_start)
+            if (rq_th.t.joinable()) {
+                auto _ = lc.scope("MTP Q4_K requant (wait for the background thread)");
+                rq_th.t.join();
+            }
+            const auto it = rq_res.find(name);
+            if (it != rq_res.end()) s.own = std::move(it->second);
+            if (it != rq_res.end()) rq_res.erase(it);
+        }
+        if (to_q4 && s.own.empty()) {
+            s.own.resize(rs_to * (size_t) rows);
+            requant_q4k(t, s.own.data());
+        } else if (!to_q4) {
         s.own.resize(rs_to * (size_t) rows);
         const auto * tr = ggml_get_type_traits(from);
         const auto * tr_dst = ggml_get_type_traits(dst);
@@ -5456,10 +5534,6 @@ struct MKEngine::Impl {
                 memcpy(out, f.data(), (size_t) K * 4);
                 return;
             }
-            if (to_q4) { // lossy by design (see mtp_q4)
-                ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out, 0, 1, K, nullptr);
-                return;
-            }
             if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
             else reencode_iq4nl_q80(src, out, K);
             g.resize((size_t) K);
@@ -5467,6 +5541,7 @@ struct MKEngine::Impl {
             if (memcmp(f.data(), g.data(), (size_t) K * 4) != 0) exact = false;
         });
         if (!exact) throw std::runtime_error(name + ": re-encoding is not exact");
+        }
         s.type = (uint32_t) dst;
         s.data = s.own.data();
         s.nbytes = s.own.size();
@@ -5481,114 +5556,158 @@ struct MKEngine::Impl {
         return s;
     }
 
-    const float * up_f32(const std::string & name, size_t expect) {
-        const auto & t = file.get(name);
-        if (t.type != gguf::F32) throw std::runtime_error(name + " not f32");
-        size_t n = t.nbytes / 4;
-        if (expect && n != expect) throw std::runtime_error(name + " bad size");
-        float * d = dalloc<float>(n, false);
-        CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
-        wbytes += t.nbytes;
+    // ---- weight upload ----
+    // Every weight goes up through `upl` (loader.cuh Uploader: a worker thread, MK_LOAD_ASYNC=0 synchronous). Tensors the
+    // kernels read as stored are copied straight from the GGUF mapping; repacked ones are built in one of two reused host
+    // buffer sets (hset), so the next tensor is prepared while the previous one is copied. The bytes are the same as
+    // before (the repacks write every byte they upload).
+    struct HSet {
+        HBuf q, m, o, om;
+        uint64_t seq = 0; // last upload reading this set
+    };
+    HSet hs[2];
+    int hs_i = 0;
+    Uploader upl;
+    HSet & hset() {
+        HSet & S = hs[hs_i];
+        hs_i ^= 1;
+        upl.wait(S.seq);
+        return S;
+    }
+    void put(void * d, const void * s, size_t n, HSet * S = nullptr) {
+        const uint64_t q = upl.put(d, s, n);
+        if (S && q) S->seq = q;
+        wbytes += n;
+    }
+    // device buffer of n bytes holding s (the weight allocations are recorded for MK_WDIGEST)
+    template <class T> T * dput(const void * s, size_t n_elem, HSet * S = nullptr) {
+        T * d = dalloc<T>(n_elem, false);
+        put(d, s, n_elem * sizeof(T), S);
         return d;
     }
 
+    const float * up_f32(const std::string & name, size_t expect) {
+        const auto & t = tget(name);
+        if (t.type != gguf::F32) throw std::runtime_error(name + " not f32");
+        size_t n = t.nbytes / 4;
+        if (expect && n != expect) throw std::runtime_error(name + " bad size");
+        return dput<float>(t.data, n);
+    }
+
     Mat up_mat(const std::string & name, int K, int N, int to = -1) {
-        const Src t = want(name, to < 0 ? (int) file.get(name).type : to);
+        Src t = want(name, to < 0 ? (int) file.get(name).type : to);
         if ((int) t.ne[0] != K || (int) t.ne[1] != N) throw std::runtime_error(name + " bad shape");
         Mat m{};
         m.K = K;
         m.N = N;
         m.type = (int) t.type;
         const int nb = K / 256;
+        // a source owned by want() (re-encoded / re-quantised copy) must stay alive until its upload is done
+        auto keep = [&](Src & s) {
+            if (!s.own.empty()) own_keep.push_back(std::move(s.own));
+        };
         if (t.type == gguf::Q4_K || t.type == gguf::Q5_K) {
             m.rb = (int) gguf::type_row_bytes(t.type, K);
-            uint8_t * d = dalloc<uint8_t>(t.nbytes, false);
 #if MK_WV
             if (wv_lay) {
-                std::vector<uint8_t> w(t.data, t.data + t.nbytes), meta;
-                wv_relay(m, w, meta);
-                CK(cudaMemcpy(d, w.data(), w.size(), cudaMemcpyHostToDevice));
+                HSet & S = hset();
+                uint8_t * o = S.o.get(t.nbytes);
+                wv_relay(m, t.data, nullptr, 0, o, nullptr);
+                m.w = dput<uint8_t>(o, t.nbytes, &S);
             } else
 #endif
-            CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
-            m.w = d;
-            wbytes += t.nbytes;
+            {
+                m.w = dput<uint8_t>(t.data, t.nbytes);
+                keep(t);
+            }
         } else if (t.type == gguf::Q6_K) {
             // two streams (rows_q6k): 192 B of values per block, and per row a meta stream of 18 B per block in
             // pairs (sc even | sc odd | d even | d odd)
             if (nb & 1) throw std::runtime_error(name + ": Q6_K rows need an even number of 256-blocks");
             m.rb = nb * Q6_BLK;
             m.nd = nb * (Q6_META / 2); // halves
-            std::vector<uint8_t> q((size_t) N * m.rb, 0), meta((size_t) N * nb * Q6_META, 0);
+            HSet & S = hset();
+            const size_t qn = (size_t) N * m.rb, mn = (size_t) N * nb * Q6_META;
+            uint8_t * qd = S.q.get(qn);
+            uint8_t * md = S.m.get(mn);
             const uint8_t * src = t.data;
-            parallel_rows(N, [&](int64_t r) {
-                for (int b = 0; b < nb; b++) {
-                    const uint8_t * blk = src + ((size_t) r * nb + b) * 210;
-                    const uint8_t * ql = blk;
-                    const uint8_t * qh = blk + 128;
-                    const int8_t * sc = (const int8_t *) (blk + 192);
-                    uint16_t dbits;
-                    memcpy(&dbits, blk + 208, 2);
-                    uint8_t vals[256];
-                    for (int nn = 0; nn < 2; nn++)
-                        for (int l = 0; l < 32; l++) {
-                            const uint8_t * L = ql + 64 * nn;
-                            const uint8_t * H = qh + 32 * nn;
-                            vals[128 * nn + l + 0] = (L[l] & 0xF) | (((H[l] >> 0) & 3) << 4);
-                            vals[128 * nn + l + 32] = (L[l + 32] & 0xF) | (((H[l] >> 2) & 3) << 4);
-                            vals[128 * nn + l + 64] = (L[l] >> 4) | (((H[l] >> 4) & 3) << 4);
-                            vals[128 * nn + l + 96] = (L[l + 32] >> 4) | (((H[l] >> 6) & 3) << 4);
-                        }
-                    uint8_t * dst = q.data() + (size_t) r * m.rb + b * Q6_BLK;
-                    for (int p = 0; p < 4; p++)
-                        for (int i = 0; i < 32; i++)
-                            dst[32 * p + i] = (vals[64 * p + i] & 0xF) | ((vals[64 * p + 32 + i] & 0xF) << 4);
-                    for (int p = 0; p < 4; p++)
-                        for (int hh = 0; hh < 2; hh++) {
-                            uint32_t hA = 0, hB = 0;
-                            for (int i = 0; i < 16; i++) {
-                                const int sh = 8 * (i % 4) + 2 * (i / 4);
-                                hA |= (uint32_t) (vals[64 * p + 16 * hh + i] >> 4) << sh;
-                                hB |= (uint32_t) (vals[64 * p + 32 + 16 * hh + i] >> 4) << sh;
+            {
+                auto _ = lc.scope("repack Q6_K two-stream");
+                parallel_rows(N, [&](int64_t r) {
+                    for (int b = 0; b < nb; b++) {
+                        const uint8_t * blk = src + ((size_t) r * nb + b) * 210;
+                        const uint8_t * ql = blk;
+                        const uint8_t * qh = blk + 128;
+                        const int8_t * sc = (const int8_t *) (blk + 192);
+                        uint16_t dbits;
+                        memcpy(&dbits, blk + 208, 2);
+                        uint8_t vals[256];
+                        for (int nn = 0; nn < 2; nn++)
+                            for (int l = 0; l < 32; l++) {
+                                const uint8_t * L = ql + 64 * nn;
+                                const uint8_t * H = qh + 32 * nn;
+                                vals[128 * nn + l + 0] = (L[l] & 0xF) | (((H[l] >> 0) & 3) << 4);
+                                vals[128 * nn + l + 32] = (L[l + 32] & 0xF) | (((H[l] >> 2) & 3) << 4);
+                                vals[128 * nn + l + 64] = (L[l] >> 4) | (((H[l] >> 4) & 3) << 4);
+                                vals[128 * nn + l + 96] = (L[l + 32] >> 4) | (((H[l] >> 6) & 3) << 4);
                             }
-                            memcpy(dst + 128 + 8 * (2 * p + hh), &hA, 4);
-                            memcpy(dst + 128 + 8 * (2 * p + hh) + 4, &hB, 4);
-                        }
-                    uint8_t * mp = meta.data() + ((size_t) r * nb + (b & ~1)) * Q6_META;
-                    memcpy(mp + 16 * (b & 1), sc, 16);
-                    memcpy(mp + 32 + 2 * (b & 1), &dbits, 2);
-                }
-            });
+                        uint8_t * dst = qd + (size_t) r * m.rb + b * Q6_BLK;
+                        for (int p = 0; p < 4; p++)
+                            for (int i = 0; i < 32; i++)
+                                dst[32 * p + i] = (vals[64 * p + i] & 0xF) | ((vals[64 * p + 32 + i] & 0xF) << 4);
+                        for (int p = 0; p < 4; p++)
+                            for (int hh = 0; hh < 2; hh++) {
+                                uint32_t hA = 0, hB = 0;
+                                for (int i = 0; i < 16; i++) {
+                                    const int sh = 8 * (i % 4) + 2 * (i / 4);
+                                    hA |= (uint32_t) (vals[64 * p + 16 * hh + i] >> 4) << sh;
+                                    hB |= (uint32_t) (vals[64 * p + 32 + 16 * hh + i] >> 4) << sh;
+                                }
+                                memcpy(dst + 128 + 8 * (2 * p + hh), &hA, 4);
+                                memcpy(dst + 128 + 8 * (2 * p + hh) + 4, &hB, 4);
+                            }
+                        uint8_t * mp = md + ((size_t) r * nb + (b & ~1)) * Q6_META;
+                        memcpy(mp + 16 * (b & 1), sc, 16);
+                        memcpy(mp + 32 + 2 * (b & 1), &dbits, 2);
+                    }
+                });
+            }
+            const uint8_t *wq = qd, *wm = md;
+            size_t wqn = qn, wmn = mn;
 #if MK_MAXT > 5
             // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
-            // the meta inline (one stream: meta is emptied, m.d stays null)
-            if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_relay(m, q, meta);
-#endif
-            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
-            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            m.w = dq;
-            if (!meta.empty()) {
-                uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
-                CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
-                m.d = reinterpret_cast<const __half *>(dm);
+            // the meta inline (one stream: no meta, m.d stays null)
+            if (wv_lay && (wv_fd || MK_WV_Q6F)) {
+                uint8_t * o = S.o.get(MK_WV_Q6F ? qn + mn : qn);
+                uint8_t * om = S.om.get(mn);
+                wmn = wv_relay(m, qd, md, mn, o, om);
+                wq = o;
+                wqn = MK_WV_Q6F ? qn + mn : qn;
+                wm = om;
             }
-            wbytes += q.size() + meta.size();
+#endif
+            m.w = dput<uint8_t>(wq, wqn, &S);
+            if (wmn) m.d = reinterpret_cast<const __half *>(dput<uint8_t>(wm, wmn, &S));
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
             if (nb & 1) throw std::runtime_error(name + ": IQ4_XS rows need an even number of 256-blocks");
             m.rb = nb * 136;
-            std::vector<uint8_t> q((size_t) N * m.rb);
-            parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, q.data() + (size_t) r * m.rb, nb); });
+            HSet & S = hset();
+            const size_t qn = (size_t) N * m.rb;
+            uint8_t * qd = S.q.get(qn);
+            {
+                auto _ = lc.scope("repack IQ4_XS");
+                parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, qd + (size_t) r * m.rb, nb); });
+            }
+            const uint8_t * wq = qd;
 #if MK_WV
             if (wv_lay) {
-                std::vector<uint8_t> meta;
-                wv_relay(m, q, meta);
+                uint8_t * o = S.o.get(qn);
+                wv_relay(m, qd, nullptr, 0, o, nullptr);
+                wq = o;
             }
 #endif
-            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
-            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            m.w = dq;
-            wbytes += q.size();
+            m.w = dput<uint8_t>(wq, qn, &S);
         } else if (t.type == gguf::Q3_K || t.type == gguf::IQ3_S) {
             // native (rows_q3k / rows_iq3s, prefill TQ3K / TIQ3S): values 96 B per block + meta (Q3_K: the Q6_K meta
             // stream, 18 B; IQ3_S: 16 B), checked bit for bit against ggml's dequantization of every row
@@ -5607,87 +5726,103 @@ struct MKEngine::Impl {
                     iq3s_grid_up = true;
                 }
             }
-            std::vector<uint8_t> q((size_t) N * m.rb), meta((size_t) N * nb * mb);
+            HSet & S = hset();
+            const size_t qn = (size_t) N * m.rb, mn = (size_t) N * nb * mb;
+            uint8_t * qd = S.q.get(qn);
+            uint8_t * md = S.m.get(mn);
             const auto * tr = ggml_get_type_traits((ggml_type) t.type);
             std::atomic<bool> exact{true};
-            parallel_rows(N, [&](int64_t r) {
-                thread_local std::vector<float> f;
-                f.resize((size_t) K);
-                const uint8_t * src = t.data + (size_t) r * nb * 110;
-                tr->to_float(src, f.data(), K);
-                uint8_t * qo = q.data() + (size_t) r * m.rb;
-                uint8_t * mo = meta.data() + (size_t) r * nb * mb;
-                if (!(q3 ? repack_q3k(src, qo, mo, nb, f.data()) : repack_iq3s(src, qo, mo, nb, f.data(), grid))) exact = false;
-            });
+            {
+                auto _ = lc.scope("repack Q3_K / IQ3_S native (+ check)");
+                parallel_rows(N, [&](int64_t r) {
+                    thread_local std::vector<float> f;
+                    f.resize((size_t) K);
+                    const uint8_t * src = t.data + (size_t) r * nb * 110;
+                    tr->to_float(src, f.data(), K);
+                    uint8_t * qo = qd + (size_t) r * m.rb;
+                    uint8_t * mo = md + (size_t) r * nb * mb;
+                    if (!(q3 ? repack_q3k(src, qo, mo, nb, f.data()) : repack_iq3s(src, qo, mo, nb, f.data(), grid))) exact = false;
+                });
+            }
             if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S repack is not exact");
+            const uint8_t *wq = qd, *wm = md;
 #if MK_MAXT > 5
-            if (wv_lay && wv_fd) wv_relay(m, q, meta); // main-layer ffn_down: tile-major values and meta
+            if (wv_lay && wv_fd) { // main-layer ffn_down: tile-major values and meta
+                uint8_t * o = S.o.get(qn);
+                uint8_t * om = S.om.get(mn);
+                wv_relay(m, qd, md, mn, o, om);
+                wq = o;
+                wm = om;
+            }
 #endif
-            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
-            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
-            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
-            m.w = dq;
-            m.d = reinterpret_cast<const __half *>(dm);
-            wbytes += q.size() + meta.size();
+            m.w = dput<uint8_t>(wq, qn, &S);
+            m.d = reinterpret_cast<const __half *>(dput<uint8_t>(wm, mn, &S));
             n_nat++;
             nat_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         } else if (t.type == gguf::IQ4_NL) {
             m.type = T_IQ4NL;
             m.rb = nb * 144;
-            std::vector<uint8_t> q((size_t) N * m.rb);
-            parallel_rows(N, [&](int64_t r) { repack_iq4nl(t.data + (size_t) r * nb * 144, q.data() + (size_t) r * m.rb, nb); });
+            HSet & S = hset();
+            const size_t qn = (size_t) N * m.rb;
+            uint8_t * qd = S.q.get(qn);
+            {
+                auto _ = lc.scope("repack IQ4_NL");
+                parallel_rows(N, [&](int64_t r) { repack_iq4nl(t.data + (size_t) r * nb * 144, qd + (size_t) r * m.rb, nb); });
+            }
+            const uint8_t * wq = qd;
 #if MK_WV
             if (wv_lay) {
-                std::vector<uint8_t> meta;
-                wv_relay(m, q, meta);
+                uint8_t * o = S.o.get(qn);
+                wv_relay(m, qd, nullptr, 0, o, nullptr);
+                wq = o;
             }
 #endif
-            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
-            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            m.w = dq;
-            wbytes += q.size();
+            m.w = dput<uint8_t>(wq, qn, &S);
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
+            if (K % 256) throw std::runtime_error(name + ": Q8_0 rows need a multiple of 256 values");
             m.rb = K;
             m.nd = nb32;
-            std::vector<uint8_t> q((size_t) N * K);
-            std::vector<uint16_t> ds((size_t) N * nb32);
+            HSet & S = hset();
+            const size_t qn = (size_t) N * K, mn = (size_t) N * nb32 * 2;
+            uint8_t * qd = S.q.get(qn);
+            uint8_t * md = S.m.get(mn); // fp16 scales, one per natural 32-block
             const uint8_t * src = t.data;
-            parallel_rows(N, [&](int64_t r) {
-                const uint8_t * row = src + (size_t) r * nb32 * 34;
-                std::vector<int8_t> vals(K);
-                for (int j = 0; j < nb32; j++) {
-                    memcpy(&ds[(size_t) r * nb32 + j], row + 34 * j, 2);
-                    memcpy(&vals[32 * j], row + 34 * j + 2, 32);
-                }
-                uint8_t * dst = q.data() + (size_t) r * K;
-                for (int u = 0; u < K / 32; u++) {
-                    const int b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
-                    memcpy(dst + 32 * u, &vals[256 * b + 64 * p + 16 * hh], 16);
-                    memcpy(dst + 32 * u + 16, &vals[256 * b + 64 * p + 32 + 16 * hh], 16);
-                }
-            });
+            {
+                auto _ = lc.scope("repack Q8_0");
+                parallel_rows(N, [&](int64_t r) {
+                    const uint8_t * row = src + (size_t) r * nb32 * 34;
+                    int8_t vals[256];
+                    uint8_t * dst = qd + (size_t) r * K;
+                    for (int j = 0; j < nb32; j++) memcpy(md + ((size_t) r * nb32 + j) * 2, row + 34 * j, 2);
+                    for (int b = 0; b < K / 256; b++) { // (K % 256 == 0: the 32-unit permutation stays inside a 256-block)
+                        for (int j = 0; j < 8; j++) memcpy(&vals[32 * j], row + 34 * (8 * b + j) + 2, 32);
+                        for (int u = 8 * b; u < 8 * b + 8; u++) {
+                            const int p = (u >> 1) & 3, hh = u & 1;
+                            memcpy(dst + 32 * u, &vals[64 * p + 16 * hh], 16);
+                            memcpy(dst + 32 * u + 16, &vals[64 * p + 32 + 16 * hh], 16);
+                        }
+                    }
+                });
+            }
+            const uint8_t *wq = qd, *wm = md;
 #if MK_WV
             if (wv_lay) {
-                std::vector<uint8_t> meta(ds.size() * 2);
-                memcpy(meta.data(), ds.data(), meta.size());
-                wv_relay(m, q, meta);
-                memcpy(ds.data(), meta.data(), meta.size());
+                uint8_t * o = S.o.get(qn);
+                uint8_t * om = S.om.get(mn);
+                wv_relay(m, qd, md, mn, o, om);
+                wq = o;
+                wm = om;
             }
 #endif
-            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
-            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            uint16_t * dd = dalloc<uint16_t>(ds.size(), false);
-            CK(cudaMemcpy(dd, ds.data(), ds.size() * 2, cudaMemcpyHostToDevice));
-            m.w = dq;
-            m.d = (const __half *) dd;
-            wbytes += q.size() + ds.size() * 2;
+            m.w = dput<uint8_t>(wq, qn, &S);
+            m.d = (const __half *) dput<uint16_t>(wm, mn / 2, &S);
         } else {
             throw std::runtime_error(name + ": unsupported quant type " + std::to_string(t.type));
         }
         return m;
     }
+    std::vector<std::vector<uint8_t>> own_keep; // want()'s copies, until the uploads are done (freed after the load)
 
 #if MK_WV
     // the matrices of the main layers (set while they load) of the wv types are re-laid-out on the host before the upload
@@ -5695,12 +5830,15 @@ struct MKEngine::Impl {
     bool wv_lay = false, wv_fd = false;
     int wv_n = 0;
     double wv_s = 0;
-    void wv_relay(Mat & m, std::vector<uint8_t> & w, std::vector<uint8_t> & meta) {
+    size_t wv_relay(Mat & m, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out, uint8_t * out_meta) {
         const auto t0 = std::chrono::steady_clock::now();
-        wv_relayout(m.type, m.N, m.K, m.rb, w, meta);
+        const size_t r = wv_relayout(m.type, m.N, m.K, m.rb, w, meta, meta_n, out, out_meta);
         m.fm = 1;
         wv_n++;
-        wv_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        wv_s += s;
+        lc.add("wv re-layout", s);
+        return r;
     }
 #endif
 
@@ -5727,14 +5865,36 @@ struct MKEngine::Impl {
     }
 
     int n_draft_max;
+    int n_draft_cap; // the depth given at construction (set_n_draft: at most this)
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
     Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
-        : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), kv_mode(kv_mode_) {
+        : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), n_draft_cap(ndraft_), kv_mode(kv_mode_) {
+        model_path = path;
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
         if (file.ints["qwen35.block_count"] != NLA || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+        // read-ahead of the tensor data from here on (loader.cuh Prefetch; MK_LOAD_IO threads, 0: off), 3 GiB ahead at most
+        if (const int nio = getenv("MK_LOAD_IO") ? atoi(getenv("MK_LOAD_IO")) : 8; nio > 0) pfx.reset(new Prefetch(file, nio, (size_t) 3 << 30));
         cudaDeviceProp prop;
-        CK(cudaGetDeviceProperties(&prop, 0));
+        {
+            auto _ = lc.scope("CUDA context");
+            CK(cudaGetDeviceProperties(&prop, 0));
+            CK(cudaFree(0));
+        }
+        upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
+        // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
+        // (MK_LOAD_PINBG=0: at its turn, as before)
+        const bool embd_dev = getenv("MK_EMBD_DEVICE") && getenv("MK_EMBD_DEVICE")[0] == '1';
+        Joiner embd_th;
+        cudaError_t embd_err = cudaSuccess;
+        double embd_pin_s = 0;
+        const size_t embd_nb = file.get("token_embd.weight").nbytes;
+        auto embd_alloc = [&] {
+            const auto t0 = lclk::now();
+            embd_err = cudaHostAlloc(&embd_host, embd_nb, cudaHostAllocMapped | cudaHostAllocWriteCombined);
+            embd_pin_s = lsec(t0);
+        };
+        if (!embd_dev && !(getenv("MK_LOAD_PINBG") && atoi(getenv("MK_LOAD_PINBG")) == 0)) embd_th.t = std::thread(embd_alloc);
         nsm = prop.multiProcessorCount;
         CK(cudaEventCreateWithFlags(&wd_ev, cudaEventDisableTiming));
         if (const char * w = getenv("MK_WATCHDOG")) wd_limit = atof(w);
@@ -5786,6 +5946,8 @@ struct MKEngine::Impl {
             else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
             else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
         }
+        rq_start();
+        wrec_on = true; // (MK_WDIGEST: the weight allocations from here to token_embd, without the draft ids)
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
@@ -5830,14 +5992,16 @@ struct MKEngine::Impl {
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
-                const auto & raw_a = file.get(blk(i, "ssm_alpha.weight"));
-                const auto & raw_b = file.get(blk(i, "ssm_beta.weight"));
+                const auto & raw_a = tget(blk(i, "ssm_alpha.weight"));
+                const auto & raw_b = tget(blk(i, "ssm_beta.weight"));
                 if (raw_a.type == gguf::Q8_0 && raw_b.type == gguf::Q8_0 && raw_a.ne[0] == D && raw_a.ne[1] == NVH &&
                     raw_b.ne[0] == D && raw_b.ne[1] == NVH && !getenv("MK_AB_F32")) {
                     // Q8_0 alpha / beta (UD) kept as int8 rows + fp16 block scales; the kernels form
                     // (q * d) * attn_norm on the fly, the same fp32 values as the folded rows below (MK_AB_F32=1)
-                    std::vector<int8_t> q((size_t) 2 * NVH * D);
-                    std::vector<uint16_t> ds((size_t) 2 * NVH * (D / 32));
+                    HSet & S = hset();
+                    const size_t nq = (size_t) 2 * NVH * D, nd = (size_t) 2 * NVH * (D / 32);
+                    int8_t * q = reinterpret_cast<int8_t *>(S.q.get(nq));
+                    uint16_t * ds = reinterpret_cast<uint16_t *>(S.m.get(nd * 2));
                     for (int w = 0; w < 2; w++) {
                         const uint8_t * src = (w ? raw_b : raw_a).data;
                         for (size_t blk_ = 0; blk_ < (size_t) NVH * (D / 32); blk_++) {
@@ -5845,25 +6009,22 @@ struct MKEngine::Impl {
                             memcpy(&q[((size_t) w * NVH * (D / 32) + blk_) * 32], src + blk_ * 34 + 2, 32);
                         }
                     }
-                    int8_t * dq = dalloc<int8_t>(q.size(), false);
-                    CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-                    uint16_t * dd = dalloc<uint16_t>(ds.size(), false);
-                    CK(cudaMemcpy(dd, ds.data(), ds.size() * 2, cudaMemcpyHostToDevice));
-                    L.abq = dq;
-                    L.abd = reinterpret_cast<const __half *>(dd);
+                    L.abq = dput<int8_t>(q, nq, &S);
+                    L.abd = reinterpret_cast<const __half *>(dput<uint16_t>(ds, nd, &S));
                     L.ab = nullptr;
-                    wbytes += q.size() + ds.size() * 2;
                 } else {
                 // alpha/beta projections in fp32 with the attn_norm weight folded in
                 const Src ta = want(blk(i, "ssm_alpha.weight"), T_F32);
                 const Src tb = want(blk(i, "ssm_beta.weight"), T_F32);
-                const auto & tn = file.get(blk(i, "attn_norm.weight"));
+                const auto & tn = tget(blk(i, "attn_norm.weight"));
                 // read below as raw floats, so anything but F32 would be reinterpreted silently
                 need(blk(i, "ssm_alpha.weight"), (int) ta.type, {T_F32});
                 need(blk(i, "ssm_beta.weight"), (int) tb.type, {T_F32});
                 if (ta.ne[0] != D || ta.ne[1] != NVH || tb.ne[0] != D || tb.ne[1] != NVH)
                     throw std::runtime_error(blk(i, "ssm_alpha/beta.weight") + " bad shape");
-                std::vector<float> ab((size_t) 2 * NVH * D);
+                HSet & S = hset();
+                const size_t nab = (size_t) 2 * NVH * D;
+                float * ab = reinterpret_cast<float *>(S.q.get(nab * 4));
                 const float * fa = (const float *) ta.data;
                 const float * fb = (const float *) tb.data;
                 const float * fn = (const float *) tn.data;
@@ -5872,12 +6033,9 @@ struct MKEngine::Impl {
                         ab[(size_t) h * D + e] = fa[(size_t) h * D + e] * fn[e];
                         ab[(size_t) (NVH + h) * D + e] = fb[(size_t) h * D + e] * fn[e];
                     }
-                float * d = dalloc<float>(ab.size(), false);
-                CK(cudaMemcpy(d, ab.data(), ab.size() * 4, cudaMemcpyHostToDevice));
-                L.ab = d;
+                L.ab = dput<float>(ab, nab, &S);
                 L.abq = nullptr;
                 L.abd = nullptr;
-                wbytes += ab.size() * 4;
                 }
             }
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
@@ -5931,6 +6089,7 @@ struct MKEngine::Impl {
         mem_mark("weights: eh, norms, lm_head");
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
+        wrec_on = false;
         if (!draft_vocab.empty()) {
             FILE * f = fopen(draft_vocab.c_str(), "rb");
             if (!f) throw std::runtime_error("cannot open draft vocab " + draft_vocab);
@@ -5959,26 +6118,35 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         }
         mem_mark("draft head copy");
+        wrec_on = true;
         {
-            const auto & t = file.get("token_embd.weight");
+            const auto & t = tget("token_embd.weight");
             if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
             // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
-            const char * ed = getenv("MK_EMBD_DEVICE");
-            if (!(ed && ed[0] == '1') &&
-                cudaHostAlloc(&embd_host, t.nbytes, cudaHostAllocMapped | cudaHostAllocWriteCombined) == cudaSuccess) {
-                memcpy(embd_host, t.data, t.nbytes);
+            auto _ = lc.scope("token_embd (pinned table)");
+            if (!embd_dev) {
+                if (embd_th.t.joinable()) embd_th.t.join();
+                else embd_alloc();
+            }
+            if (!embd_dev && embd_err == cudaSuccess) {
+                // (write-combined: several threads, 64 MiB pieces)
+                const size_t PC = (size_t) 64 << 20, np = (t.nbytes + PC - 1) / PC;
+                parallel_rows((int64_t) np, [&](int64_t i) {
+                    const size_t o = (size_t) i * PC;
+                    memcpy(static_cast<uint8_t *>(embd_host) + o, t.data + o, std::min(PC, (size_t) t.nbytes - o));
+                });
                 void * d = nullptr;
                 CK(cudaHostGetDevicePointer(&d, embd_host, 0));
                 hw.embd = (const uint8_t *) d;
-                fprintf(stderr, "[mk] token_embd in mapped host memory (%.2f GB)\n", t.nbytes / 1e9);
+                fprintf(stderr, "[mk] token_embd in mapped host memory (%.2f GB, pinned in %.2f s)\n", t.nbytes / 1e9, embd_pin_s);
             } else {
                 cudaGetLastError();
                 embd_host = nullptr;
-                uint8_t * d = dalloc<uint8_t>(t.nbytes, false);
-                CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
-                hw.embd = d;
+                hw.embd = dput<uint8_t>(t.data, t.nbytes);
+                wbytes -= t.nbytes; // (not counted as weights, as before)
             }
         }
+        wrec_on = false;
         mem_mark("token_embd");
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         mem_mark("cW symbol (module load)");
@@ -6188,10 +6356,87 @@ struct MKEngine::Impl {
                     prop.maxThreadsPerMultiProcessor);
         }
         // the DeltaNet checkpoint and the batched-prefill scratch are allocated here, not inside the first prompt's time
-        ck_alloc();
-        pf_init();
+        {
+            auto _ = lc.scope("checkpoint pool (pinned host)");
+            ck_alloc();
+        }
+        {
+            auto _ = lc.scope("prefill scratch");
+            pf_init();
+        }
         ck_make_plan();
+        {
+            auto _ = lc.scope("upload tail (wait)");
+            upl.finish();
+        }
+        own_keep.clear();
+        own_keep.shrink_to_fit();
+        for (HSet & S : hs) S = HSet{};
+        const double pf_wait = pfx ? pfx->wait_s : 0.0;
+        const size_t pf_bytes = pfx ? pfx->bytes() : 0;
+        pfx.reset();
+        load_report(pf_wait, pf_bytes);
+        if (getenv("MK_WDIGEST")) weights_digest();
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
+    }
+
+    // one line of load phases (MK_LOADLOG=1: every phase on its own line)
+    void load_report(double pf_wait, size_t pf_bytes) {
+        const double tot = lsec(t_load);
+        double known = pf_wait;
+        double rep = 0;
+        std::string rest;
+        for (const auto & p : lc.ph) {
+            known += p.second;
+            if (p.first.compare(0, 6, "repack") == 0) rep += p.second;
+        }
+        auto g = [&](const char * k) { return lc.get(k); };
+        fprintf(stderr, "[mk] load %.2f s: context %.2f, read-ahead wait %.2f (%.1f GB read), repack %.2f, wv re-layout %.2f, "
+                        "MTP requant wait %.2f (background %.2f), token_embd %.2f, ckpt pool %.2f, prefill scratch %.2f, upload tail %.2f, "
+                        "other %.2f | uploads %.2f GB, %.2f s in copies (%s)\n",
+                tot, g("CUDA context"), pf_wait, pf_bytes / 1e9, rep, g("wv re-layout"), g("MTP Q4_K requant (wait for the background thread)"),
+                rq_s, g("token_embd (pinned table)"), g("checkpoint pool (pinned host)"), g("prefill scratch"), g("upload tail (wait)"),
+                tot - known, upl.bytes / 1e9, upl.busy_s, getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0 ? "synchronous" : "worker thread");
+        if (getenv("MK_LOADLOG"))
+            for (const auto & p : lc.ph) fprintf(stderr, "[mk-load] %-52s %7.3f s\n", p.first.c_str(), p.second);
+    }
+
+    // MK_WDIGEST=1 (load gates): a 64-bit hash over every buffer allocated while the weights load (dalloc, in allocation
+    // order: size + device bytes) and the mapped token_embd table. Slow (reads ~17 GB back); test runs only.
+    bool wrec_on = false;
+    std::vector<std::pair<const void *, size_t>> wrec;
+    void weights_digest() {
+        CK(cudaDeviceSynchronize());
+        const auto t0 = lclk::now();
+        const size_t PC = (size_t) 64 << 20, NB = 32;
+        struct Pc { const uint8_t * p; size_t n; bool host; };
+        std::vector<Pc> pcs;
+        size_t tot = 0;
+        for (const auto & r : wrec) {
+            for (size_t o = 0; o < r.second; o += PC) pcs.push_back({static_cast<const uint8_t *>(r.first) + o, std::min(PC, r.second - o), false});
+            tot += r.second;
+        }
+        if (embd_host) {
+            const size_t n = file.get("token_embd.weight").nbytes;
+            for (size_t o = 0; o < n; o += PC) pcs.push_back({static_cast<const uint8_t *>(embd_host) + o, std::min(PC, n - o), true});
+            tot += n;
+        }
+        std::vector<unsigned long long> ph(pcs.size());
+        std::unique_ptr<uint8_t[]> buf(new uint8_t[NB * PC]);
+        for (size_t b = 0; b < pcs.size(); b += NB) {
+            const size_t k = std::min(NB, pcs.size() - b);
+            for (size_t j = 0; j < k; j++)
+                if (!pcs[b + j].host) CK(cudaMemcpy(buf.get() + j * PC, pcs[b + j].p, pcs[b + j].n, cudaMemcpyDeviceToHost));
+            parallel_rows((int64_t) k, [&](int64_t j) {
+                const Pc & q = pcs[b + j];
+                if (q.host) memcpy(buf.get() + j * PC, q.p, q.n); // (write-combined memory: copy first)
+                ph[b + j] = wd_hash(buf.get() + j * PC, q.n);
+            });
+        }
+        unsigned long long h = 0xcbf29ce484222325ULL;
+        for (const auto & r : wrec) h = wd_hash(reinterpret_cast<const uint8_t *>(&r.second), sizeof(size_t), h);
+        h = wd_hash(reinterpret_cast<const uint8_t *>(ph.data()), ph.size() * 8, h);
+        fprintf(stderr, "[mk] weights digest %016llx (%zu buffers + token_embd, %.2f GB, %.1f s)\n", h, wrec.size(), tot / 1e9, lsec(t0));
     }
 
 #if MK_SPEC_LOG
@@ -7144,6 +7389,211 @@ struct MKEngine::Impl {
         pcnt_dirty = false;
     }
 
+    // ---- post-prefill state files (MKEngine::prefill_state) ----
+    // A file holds what a batched prefill of positions 0 .. hend - 1 leaves for the megakernel launch of the prompt's last
+    // token: every attention slot's K / V rows < hend (values + scales, or fp16), the MK_KV_WIN rings, the DeltaNet states,
+    // conv rings and the h ring; nothing else of the sequence state is read before it is rewritten (the restore runs no
+    // checkpoint, and prefill() then sets ctl / seq / the draft vocabulary as after the batched part). Named by a hash of
+    // the key text (stored in the file and compared on load): the binary's bytes, the model file, ctx, the KV format, the
+    // prefill chunk cap and every MK_* variable not known to be decode-only or diagnostic.
+    std::string st_dir, model_path;
+    int st_how = 0;
+    double st_s = 0;
+    static unsigned long long file_hash(const std::string & path) {
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) return 0;
+        std::vector<uint8_t> b((size_t) 8 << 20);
+        unsigned long long h = 0xcbf29ce484222325ULL;
+        for (ssize_t r; (r = read(fd, b.data(), b.size())) > 0;) h = wd_hash(b.data(), (size_t) r, h);
+        close(fd);
+        return h;
+    }
+    // the object file holding this code (the CLI binary, or libqwen38mk.so under the server), from /proc/self/maps
+    static unsigned long long self_hash() {
+        static unsigned long long h = 0;
+        if (h) return h;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(&self_hash);
+        std::string path = "/proc/self/exe";
+        if (FILE * m = fopen("/proc/self/maps", "r")) {
+            char line[4096];
+            while (fgets(line, sizeof line, m)) {
+                unsigned long lo, hi;
+                if (sscanf(line, "%lx-%lx", &lo, &hi) != 2 || a < lo || a >= hi) continue;
+                const char * p = strchr(line, '/');
+                if (p) {
+                    path = p;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) path.pop_back();
+                }
+                break;
+            }
+            fclose(m);
+        }
+        h = file_hash(path);
+        if (!h) throw std::runtime_error("state files: cannot read " + path + " to identify the build");
+        return h;
+    }
+    static std::string hex64(unsigned long long v) {
+        char b[24];
+        snprintf(b, sizeof b, "%016llx", v);
+        return b;
+    }
+    void st_name(const std::vector<int> & head, std::string & path, std::string & key) {
+        std::ostringstream k;
+        k << "mkstate 1 bin " << hex64(self_hash());
+        struct stat st{};
+        char rp[PATH_MAX];
+        if (!realpath(model_path.c_str(), rp)) snprintf(rp, sizeof rp, "%s", model_path.c_str());
+        stat(rp, &st);
+        const size_t edge = std::min<size_t>(file.size, (size_t) 4 << 20);
+        unsigned long long mh = wd_hash(file.base, edge);
+        mh = wd_hash(file.base + file.size - edge, edge, mh);
+        k << " model " << rp << " " << (long long) st.st_size << " " << (long long) st.st_mtim.tv_sec << "." << (long long) st.st_mtim.tv_nsec
+          << " " << hex64(mh);
+        k << " ctx " << ctx << " kvq8 " << hb.kvq8 << " kvb";
+        for (int w = 0; w < 2; w++)
+            for (int s = 0; s < N_ATT_SLOTS; s++) k << " " << hb.kvb[w][s] << (w ? hb.kvrv[s] : hb.kvr[s]);
+        k << " win " << hb.kvwin << " " << hb.kvrc << " exact " << exact << " cap " << hp.cap << " slots " << N_ATT_SLOTS << " nkv " << NKV
+          << " hring " << H_RING << " conv " << CONV_RING;
+        // environment: every MK_* setting except those that only change decode, logging, timing or the load path
+        static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
+                                            "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT"};
+        std::vector<std::string> env;
+        for (char ** e = environ; *e; e++) {
+            if (strncmp(*e, "MK_", 3)) continue;
+            bool sk = false;
+            for (const char * s : skip) sk = sk || !strncmp(*e, s, strlen(s));
+            if (!sk) env.push_back(*e);
+        }
+        std::sort(env.begin(), env.end());
+        for (const auto & e : env) k << " env " << e;
+        k << " tokens " << head.size() << " " << hex64(wd_hash(reinterpret_cast<const uint8_t *>(head.data()), head.size() * sizeof(int)));
+        key = k.str();
+        path = st_dir + "/" + hex64(wd_hash(reinterpret_cast<const uint8_t *>(key.data()), key.size())) + ".mks";
+    }
+    // the device regions of the state after a batched prefill of 0 .. hend - 1 (pointer, bytes), in file order
+    std::vector<std::pair<char *, size_t>> st_regions(int hend) {
+        std::vector<std::pair<char *, size_t>> r;
+        const size_t cx = (size_t) ctx, n = (size_t) hend;
+        for (int s = 0; s < N_ATT_SLOTS; s++)
+            for (int w = 0; w < 2; w++)
+                for (int g = 0; g < NKV; g++) {
+                    if (hb.kvq8) {
+                        const size_t rb = (size_t) HD * hb.kvb[w][s] / 8;
+                        r.push_back({reinterpret_cast<char *>(hb.kvp[w][s]) + (size_t) g * cx * rb, n * rb});
+                        r.push_back({reinterpret_cast<char *>(hb.kvs[w][s] + (size_t) g * cx * (HD / 32)), n * (HD / 32) * sizeof(__half)});
+                    } else {
+                        __half * b = static_cast<__half *>(w ? hb.vc : hb.kc) + ((size_t) s * NKV + g) * cx * HD;
+                        r.push_back({reinterpret_cast<char *>(b), n * HD * sizeof(__half)});
+                    }
+                }
+        for (int s = 0; s < N_ATT_SLOTS; s++)
+            for (int w = 0; w < 2; w++)
+                if (hb.kvrp[w][s]) {
+                    r.push_back({reinterpret_cast<char *>(hb.kvrp[w][s]), (size_t) NKV * hb.kvrc * HD});
+                    r.push_back({reinterpret_cast<char *>(hb.kvrs[w][s]), (size_t) NKV * hb.kvrc * (HD / 32) * sizeof(__half)});
+                }
+        r.push_back({reinterpret_cast<char *>(hb.dstate), CK_NS * 4});
+        r.push_back({reinterpret_cast<char *>(hb.conv), CK_NC * 4});
+        r.push_back({reinterpret_cast<char *>(hb.h_hist), CK_NH * 4});
+        return r;
+    }
+    // file: magic "MKSTATE1" | u64 key bytes | key | u64 hend | u64 regions | u64 bytes of each region | the regions' bytes
+    void st_save(const std::string & path, const std::string & key, int hend) {
+        static const char magic[9] = "MKSTATE1";
+        const auto t0 = lclk::now();
+        CK(cudaDeviceSynchronize());
+        mkdir(st_dir.c_str(), 0755);
+        const auto R = st_regions(hend);
+        const std::string tmp = path + ".tmp" + std::to_string(getpid());
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "[mk] state file: cannot write %s (not saved)\n", tmp.c_str());
+            return;
+        }
+        bool ok = fwrite(magic, 8, 1, f) == 1;
+        auto w64 = [&](uint64_t v) { ok = ok && fwrite(&v, 8, 1, f) == 1; };
+        w64(key.size());
+        ok = ok && fwrite(key.data(), 1, key.size(), f) == key.size();
+        w64((uint64_t) hend);
+        w64(R.size());
+        size_t tot = 0;
+        for (const auto & r : R) w64(r.second), tot += r.second;
+        const size_t PC = (size_t) 64 << 20;
+        std::unique_ptr<uint8_t[]> buf(new uint8_t[PC]);
+        for (const auto & r : R)
+            for (size_t o = 0; ok && o < r.second; o += PC) {
+                const size_t n = std::min(PC, r.second - o);
+                CK(cudaMemcpy(buf.get(), r.first + o, n, cudaMemcpyDeviceToHost));
+                ok = fwrite(buf.get(), 1, n, f) == n;
+            }
+        ok = (fclose(f) == 0) && ok;
+        if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+            unlink(tmp.c_str());
+            fprintf(stderr, "[mk] state file: writing %s failed (not saved)\n", path.c_str());
+            return;
+        }
+        st_s = lsec(t0);
+        fprintf(stderr, "[mk] state file saved: %s (%.2f GB, %d positions) in %.2f s\n", path.c_str(), tot / 1e9, hend, st_s);
+    }
+    bool st_load(const std::string & path, const std::string & key, int hend) {
+        static const char magic[9] = "MKSTATE1";
+        const auto t0 = lclk::now();
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st{};
+        fstat(fd, &st);
+        const size_t fsz = (size_t) st.st_size;
+        void * mp = fsz ? mmap(nullptr, fsz, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+        close(fd);
+        if (mp == MAP_FAILED) return false;
+        const uint8_t * b = static_cast<const uint8_t *>(mp);
+        size_t pos = 0;
+        auto r64 = [&](uint64_t & v) {
+            if (pos + 8 > fsz) return false;
+            memcpy(&v, b + pos, 8);
+            pos += 8;
+            return true;
+        };
+        const auto R = st_regions(hend);
+        uint64_t kn = 0, h = 0, nr = 0, v = 0;
+        bool ok = fsz >= 8 && !memcmp(b, magic, 8);
+        pos = 8;
+        ok = ok && r64(kn) && pos + kn <= fsz && key.size() == kn && !memcmp(b + pos, key.data(), kn);
+        pos += kn;
+        ok = ok && r64(h) && h == (uint64_t) hend && r64(nr) && nr == R.size();
+        size_t tot = 0;
+        for (size_t i = 0; ok && i < R.size(); i++) ok = r64(v) && v == R[i].second, tot += R[i].second;
+        ok = ok && pos + tot == fsz;
+        if (!ok) {
+            munmap(mp, fsz);
+            fprintf(stderr, "[mk] state file %s does not match (rewriting it)\n", path.c_str());
+            return false;
+        }
+        CK(cudaDeviceSynchronize()); // (no copy of an earlier sequence still reading the state)
+        { // read the file in with several threads (cold: ~3 GB/s instead of ~0.2 GB/s for one thread's page faults)
+            const size_t PC = (size_t) 4 << 20, np = (fsz + PC - 1) / PC;
+            std::atomic<size_t> next{0};
+            std::atomic<unsigned> sink{0};
+            std::vector<std::thread> th;
+            for (int t = 0; t < 8; t++)
+                th.emplace_back([&] {
+                    unsigned s = 0;
+                    for (size_t i; (i = next++) < np;)
+                        for (size_t o = i * PC; o < std::min(fsz, (i + 1) * PC); o += 4096) s += b[o];
+                    sink += s;
+                });
+            for (auto & t : th) t.join();
+        }
+        for (const auto & r : R) {
+            CK(cudaMemcpy(r.first, b + pos, r.second, cudaMemcpyHostToDevice));
+            pos += r.second;
+        }
+        munmap(mp, fsz);
+        kv_top = std::max(kv_top, hend); // (as pf_run of 0 .. hend - 1)
+        st_s = lsec(t0);
+        fprintf(stderr, "[mk] state file restored: %s (%.2f GB, %d positions) in %.2f s\n", path.c_str(), tot / 1e9, hend, st_s);
+        return true;
+    }
     void reset() {
         ck_rs_slot = -1;   // (a restore not issued yet is moot)
         ck_wait_restore(); // (an issued one still writes the state)
@@ -7245,6 +7695,26 @@ void MKEngine::reset() {
 
 int MKEngine::position() const { return p_->hctl.n; }
 
+void MKEngine::set_n_draft(int n) {
+    if (n < 0 || n > p_->n_draft_cap)
+        throw std::runtime_error("set_n_draft: 0 .. " + std::to_string(p_->n_draft_cap) + " (the engine's construction depth)");
+    p_->n_draft_max = p_->ndraft = p_->nd_avail = n;
+    n_draft_ = n;
+}
+
+int MKEngine::prefill_state(const std::vector<int> & tokens, const std::string & dir, int * how) {
+    if (dir.empty()) throw std::runtime_error("prefill_state: no directory");
+    struct Clear {
+        Impl * p;
+        ~Clear() { p->st_dir.clear(); }
+    } clear{p_};
+    p_->st_dir = dir;
+    p_->st_how = 0;
+    const int r = prefill(tokens);
+    if (how) *how = p_->st_how;
+    return r;
+}
+
 int MKEngine::prefill(const std::vector<int> & tokens, int ck_at) {
     return prefill(tokens, ck_at >= 0 ? std::vector<int>{ck_at} : std::vector<int>{}, ck_at);
 }
@@ -7280,6 +7750,13 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         const std::vector<int> head(feed.begin(), feed.end() - 1);
         const int hend = n0 + (int) head.size(); // the batched part: positions n0 .. hend - 1
         end_save = !p_->exact && !(ck_exact > n0 && ck_exact < hend); // (MK_EXACT: no megakernel state in checkpoints)
+        // post-prefill state file (prefill_state): the batched part's result restored from the file, or computed and saved
+        const bool st = !p_->st_dir.empty() && n0 == 0 && cks.empty() && ck_exact < 0;
+        std::string st_path, st_key;
+        if (st) p_->st_name(head, st_path, st_key);
+        if (st && p_->st_load(st_path, st_key, hend)) {
+            p_->st_how = 1;
+        } else {
         if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
             if (!end_save) {
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr);
@@ -7311,6 +7788,11 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 for (const auto & q : snaps) fprintf(stderr, " %d", q.pos);
                 fprintf(stderr, " ) in %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             }
+        }
+        if (st) {
+            p_->st_save(st_path, st_key, hend);
+            p_->st_how = 2;
+        }
         }
         i = head.size();
         c.dn_c = hend;

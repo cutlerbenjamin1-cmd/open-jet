@@ -82,6 +82,17 @@ class MKEngine {
     // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
     bool exact() const;
 
+    // Draft depth for the following prefills and steps, 0 .. the n_draft given at construction (CLI batch mode: an engine
+    // built for the deepest job runs each job at its own depth; the same launches as an engine built for that depth).
+    void set_n_draft(int n);
+    // Post-prefill state files (test runs: decode A-B-As at long context without re-prefilling). prefill(tokens) on an
+    // empty sequence that first looks in dir for a state file of the same batched prefill (every prompt token but the
+    // last, which then goes through the megakernel as in prefill()) and restores it instead of running the prefill; on a
+    // miss it runs the prefill and saves the file. The key covers the binary (its file hash), the model file, the
+    // context, the KV format and every MK_* setting that is not known to be decode-only, so a restore leaves the state
+    // bit for bit as the prefill would. *how: 1 restored, 2 saved (0: not applicable, plain prefill).
+    int prefill_state(const std::vector<int> & tokens, const std::string & dir, int * how = nullptr);
+
     int position() const;
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after
     // tokens[0..i] (resets the sequence).
