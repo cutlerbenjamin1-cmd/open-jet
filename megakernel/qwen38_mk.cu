@@ -70,6 +70,18 @@
 #ifndef MK_WV_FMK
 #define MK_WV_FMK 1
 #endif
+// MK_WV_OUT (MK_MAXT > 5, default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
+// as ffn_down's) on the split MMAs at every T, instead of dp4a resid32 (padded to 8 rows at T 6-7). Changes those matrices'
+// summation order (wv vs dp4a): opt-in, KLD-gated (notes/agent_spill.md M3).
+#ifndef MK_WV_OUT
+#define MK_WV_OUT 0
+#endif
+// MK_WV_Q6F (MK_MAXT > 5, default 0): every main-layer Q6_K matrix fragment-ordered with its meta inline (wv.cuh "FM
+// Q6_K") and on wv at every T: out / ssm_out, gate / up, qkv / z, k / v leave dp4a (KLD-gated: new summation order),
+// ffn_down's Q6_K moves from tile-major to FM (bit-identical: the same integer chunk sums and float sequence).
+#ifndef MK_WV_Q6F
+#define MK_WV_Q6F 0
+#endif
 // MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
 // ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),
 // the conv ring has 16 slots, and the attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
@@ -78,6 +90,9 @@
 #endif
 #if MK_MAXT < 5 || MK_MAXT > 8 || (MK_MAXT > 5 && !MK_WV)
 #error "MK_MAXT must be 5, or 6..8 with MK_WV=1"
+#endif
+#if MK_WV_Q6F && MK_MAXT <= 5
+#error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
 #endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
@@ -495,6 +510,15 @@ __device__ __forceinline__ SX wv_sx() {
 
 __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
     uint8_t * const sm = smem; return reinterpret_cast<float *>(sm + SM_MISC); }
+
+// threadIdx.x read afresh (an S2R the compiler can neither hoist nor CSE): for values derived from the thread index that
+// would otherwise stay live across a long loop. At the 128-register cap ptxas parks such values in spill slots, and a
+// reload after a long gap misses L1 (the W48 item prologue's reload: ~0.3% of a 38k -d 7 cycle's stall samples, spill track)
+__device__ __forceinline__ int tid_x() {
+    int t;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(t));
+    return t;
+}
 
 __device__ __forceinline__ void cp_async16(void * smem_dst, const void * gsrc) {
     const unsigned d = (unsigned) __cvta_generic_to_shared(smem_dst);
@@ -3107,7 +3131,10 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
 // conversions take (xm / sub). The softmax warps take 12 rows each (two sub-passes). Per-row arithmetic is attn_core_t's
 // (the same S / softmax / P V code per row): the partials equal attn_core_q8_t's and attn_core_t's for every format.
 constexpr int SM_ATTN_W48 = 48 * (256 + 8) * 2 + 6 * AQ_STG + 2 * 48 * AQ_LDS * 4 + 2 * 48 * (ATP + 8) * 2;
-static_assert(SM_ATTN_W48 <= SM_TOTAL, "attn_core_w48 shared memory");
+static_assert(SM_ATTN_W48 + NW * 8 * 4 <= SM_TOTAL, "attn_core_w48 shared memory (+ MK_W48S's per-warp scalars)");
+#ifndef MK_W48S
+#define MK_W48S 1 // attn_core_w48's scalars (n, ws, CS, L_ctx, nch) from shared memory (0: registers / spill slots)
+#endif
 template <int T, bool MIX>
 __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
@@ -3123,7 +3150,28 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const int ws = mtp_ws(slot, n); // MK_MTP_WIN
     int nch, CS;
     attn_dims_w(L_ctx, ws, nch, CS);
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+    // the call's scalars in shared memory, one copy per warp (MK_W48S), read with volatile loads where used: kept in
+    // registers, ptxas spilled them and their reload at each item's start waited on local memory (L2) behind the K / V
+    // stream (~0.3% of a 38k -d 7 cycle's stall samples, notes/agent_spill.md)
+#if MK_W48S
+    if ((threadIdx.x & 31) < 5) {
+        const int l = threadIdx.x & 31;
+        reinterpret_cast<int *>(sm + SM_ATTN_W48)[8 * (threadIdx.x >> 5) + l] = l == 0 ? n : l == 1 ? ws : l == 2 ? CS : l == 3 ? L_ctx : nch;
+    }
+    __syncwarp();
+    auto w48s = [&](int i) -> int { return reinterpret_cast<volatile const int *>(sm + SM_ATTN_W48)[8 * (tid_x() >> 5) + i]; };
+#define W48_N w48s(0)
+#define W48_WS w48s(1)
+#define W48_CS w48s(2)
+#define W48_LC w48s(3)
+#define W48_NCH w48s(4)
+#else
+#define W48_N n
+#define W48_WS ws
+#define W48_CS CS
+#define W48_LC L_ctx
+#define W48_NCH nch
+#endif
     __half * sQ = reinterpret_cast<__half *>(sm);                 // [RP][LDH]
     uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + RP * LDH); // NSK stages
     uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
@@ -3138,10 +3186,13 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const int wsr = MIX ? kv_ws(L_ctx) : 0, wsm = MIX ? kv_wsm(wsr) : 0;
     const KvFmt kf = MIX ? kv_fmt(slot) : KvFmt{8, 8, 0, 0};
 
-    for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
-        const int g = item / nch, c = item % nch;
+    for (int item = blockIdx.x; item < NKV * W48_NCH; item += gridDim.x) {
+        // thread indices per item (tid_x): hoisted out of the item loop, their derived offsets were spilled and the
+        // prologue's reload missed L1
+        const int tid = tid_x(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+        const int nch_ = W48_NCH, g = item / nch_, c = item % nch_;
         int c0, c1;
-        attn_chunk(c, ws, CS, L_ctx, c0, c1);
+        attn_chunk(c, W48_WS, W48_CS, W48_LC, c0, c1);
         // ---- item prologue, attn_core_t's (q rows -> sQ, this cycle's K / V rows -> cache, m / l init)
         float qw[8];
         load8(W.qn + lane * 8, qw);
@@ -3153,7 +3204,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 float v[8];
                 load8(cB.qbuf + t * QG + head * 512 + lane * 8, v);
                 float2 rc[8];
-                const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+                const float2 * tab = cB.rope + (size_t) (W48_N + t) * 32 + (lane & 3) * 8;
 #pragma unroll
                 for (int k = 0; k < 8; k++) rc[k] = __ldg(tab + k);
                 float ss = 0.f;
@@ -3183,9 +3234,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 }
             }
         }
-        const int pn0 = max(c0, n), pn1 = min(c1, n + T);
+        const int nn = W48_N, pn0 = max(c0, nn), pn1 = min(c1, nn + T);
         for (int pp = pn0 + warp; pp < pn1; pp += NW) {
-            const int t = pp - n;
+            const int t = pp - nn;
             float v[8];
             load8(cB.kbuf + t * KVD + g * 256 + lane * 8, v);
             float ss = 0.f;
@@ -3375,7 +3426,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                     for (int sub = 0; sub < 2; sub++) {
                         if (32 * sub + 8 * (warp - 12) >= R) continue; // (warp-uniform)
                         const int r = 32 * sub + 8 * (warp - 12) + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
-                        const int lim = n + (r % T);
+                        const int lim = W48_N + (r % T);
                         const float * srow = sS + b * RP * LDS + r * LDS;
                         float sv[8];
 #pragma unroll
@@ -3425,6 +3476,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
         }
+        { // item epilogue: thread indices read afresh (not carried across the interval loop)
+        const int tid = tid_x(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+        (void) lane;
         if (warp >= 4 && warp < 12) {
             const int wn = warp - 4;
 #pragma unroll
@@ -3445,8 +3499,14 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
                 }
         }
         if (tid < R) cB.aml[item * AR + tid] = make_float2(sM(tid), sL(tid));
+        }
         __syncthreads();
     }
+#undef W48_N
+#undef W48_WS
+#undef W48_CS
+#undef W48_LC
+#undef W48_NCH
 }
 template <int T>
 __device__ __noinline__ void attn_core_w48q(const LayerW & W, int slot, int n) {
@@ -4120,7 +4180,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_ATTN_CORE);
             attn_combine<T>(n, 0, L / 4);
             gsync(epoch, PH_ATTN_COMB);
-            if (W.o.fm) resid_wv<T, false, VD>(W.o, cB.qo, W.post_norm, 0);
+            if (W.o.fm) resid_out_wv<T>(W.o, W.post_norm);
             else resid_dp<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
         } else {
@@ -4130,7 +4190,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
-            if (W.sout.fm) resid_wv<T, false, VD>(W.sout, cB.qo, W.post_norm, 0);
+            if (W.sout.fm) resid_out_wv<T>(W.sout, W.post_norm);
             else resid_dp<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_SOUT);
             dl++;
@@ -5500,14 +5560,18 @@ struct MKEngine::Impl {
                 }
             });
 #if MK_MAXT > 5
-            if (wv_lay && wv_fd) wv_relay(m, q, meta); // main-layer ffn_down: tile-major values and meta pairs
+            // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
+            // the meta inline (one stream: meta is emptied, m.d stays null)
+            if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_relay(m, q, meta);
 #endif
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
-            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
-            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
             m.w = dq;
-            m.d = reinterpret_cast<const __half *>(dm);
+            if (!meta.empty()) {
+                uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
+                CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
+                m.d = reinterpret_cast<const __half *>(dm);
+            }
             wbytes += q.size() + meta.size();
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
@@ -5736,7 +5800,13 @@ struct MKEngine::Impl {
                 L.q = up_mat(blk(i, "attn_q.weight"), D, QG);
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = true; // MK_WV_OUT: the offset types of out / ssm_out in the wv layout too
+#endif
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = false;
+#endif
                 needq(blk(i, "attn_q.weight"), L.q.type);
                 needq(blk(i, "attn_k.weight"), L.k.type);
                 needq(blk(i, "attn_v.weight"), L.v.type);
@@ -5746,7 +5816,13 @@ struct MKEngine::Impl {
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = true;
+#endif
                 L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
+#if MK_MAXT > 5 && MK_WV_OUT
+                wv_fd = false;
+#endif
                 needq(blk(i, "attn_qkv.weight"), L.qkv.type);
                 needq(blk(i, "attn_gate.weight"), L.gate.type);
                 needq(blk(i, "ssm_out.weight"), L.sout.type);
@@ -5822,7 +5898,11 @@ struct MKEngine::Impl {
 #if MK_WV
         wv_lay = false;
         fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (re-laid-out in %.1f s; %s), MAXT %d\n", wv_n, wv_s,
-                MAXT > 5 ? "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a" : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
+                MAXT > 5 ? (MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
+                                                   : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
+                            : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
+                                        : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
+                          : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
 #endif
         req_q4 = mtp_q4 != 0;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -6276,6 +6356,11 @@ struct MKEngine::Impl {
                 if (cnt[i])
                     fprintf(stderr, "  %-16s %8.3f ms  %8.2f us/call (fill %5.2f us)  x%d\n", names[i], tot[i] / 1e6,
                             tot[i] / cnt[i] / 1e3, fil[i] / cnt[i] / 1e3, cnt[i]);
+            if (getenv("MK_PROFILE_SEQ")) // every barrier position: its phase and min time (per-layer phase costs)
+                for (size_t k = 0; k < best_ns[T].size(); k++)
+                    if (best_tag[T][k] >= 0)
+                        fprintf(stderr, "[mk-seq] T=%d k=%zu %s %.2f fill %.2f\n", T, k, names[best_tag[T][k]],
+                                best_ns[T][k] / 1e3, best_fill[T][k] / 1e3);
         }
     }
 

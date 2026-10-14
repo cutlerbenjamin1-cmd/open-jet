@@ -16,6 +16,10 @@
 #include <cstdint>
 #include <type_traits>
 
+#ifndef MK_WV_Q6F
+#define MK_WV_Q6F 0 // (qwen38_mk.cu sets it; FM Q6_K units, see mmh's FM6)
+#endif
+
 namespace pf {
 
 constexpr int BM = 128, BN = 128, BK = 64;
@@ -147,6 +151,13 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     static_assert(!LAY || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4 || TYPE == TIQ4NL || TYPE == TQ80 || TYPE == TQ6K ||
                       TYPE == TQ3K || TYPE == TIQ3S, "wv layout types");
     constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
+    // FM6 (MK_WV_Q6F): Q6_K in wv.cuh's FM Q6_K units (3360 B per tile and super-block, meta inline). Stage layout (the
+    // weight part, 64 B x BM): qlo of tile t at F6L + 512 t (the unit's group-p block, whole), qhi at F6H + 256 t (likewise),
+    // per row 16 B at F6M + 16 r: sc[4p .. 4p + 3] | d of rows g / g + 8 | the fp16 scale pairs (scales). The unit's qlo / qhi
+    // order is the thread order of rawq (lane l = 4 g + t4: rows g / g + 8, elements 4 t4 .. + 3 of each 16-chunk), so rawq
+    // reads one 16-B and one 8-B word and builds the same wd words as from the row-major stage: exact.
+    constexpr bool FM6 = LAY && TYPE == TQ6K && MK_WV_Q6F;
+    constexpr int F6L = 0, F6H = 4096, F6M = 6144, F6U = 3360;
     static_assert(NB % 32 == 0 && NB <= BN, "token tile: a multiple of 32 (X-tile copy loop, n8-tile pairs)");
     static_assert(NB * (BM + 4) * 4 <= hm_smem<TYPE, NB>(), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256;
@@ -166,7 +177,8 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     constexpr int FNQ = TYPE == TQ5K ? 64 : 32, FCPT = FNQ + (TYPE == TIQ4 ? 8 : 16);
     static_assert(!FMT || FHO + BM * 16 <= SR * BM, "FMT stage layout fits the stage's weight part");
     constexpr int WCH = FMT ? BM / 16 * FCPT : BM * NCH, WIT = (WCH + 255) / 256;
-    constexpr int UB = 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
+    static_assert(!FM6 || (WCH == BM / 16 * 48 && F6M + 16 * BM == SR * BM), "FM6: 48 chunks per tile and stage");
+    constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     const uint8_t * wsrc[WIT];
     int winc[WIT];
     unsigned wdst[WIT];
@@ -201,6 +213,12 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                 wsrc[k] = ubt + o2;
                 winc[k] = i2;
                 wdst[k] = d2;
+            } else if constexpr (FM6) { // thread i -> (tile t, chunk cc): qlo chunks 0..31, qhi chunks 32..47 of group p
+                const int ii = i < WCH ? i : 0, t = ii / 48, cc = ii % 48;
+                const uint8_t * ubt = W.w + (size_t) (row0 / 16 + t) * (W.K >> 8) * UB;
+                wsrc[k] = ubt + (cc < 32 ? 288 + 16 * cc : 2336 + 16 * (cc - 32));
+                winc[k] = cc < 32 ? 512 : 256;
+                wdst[k] = cc < 32 ? F6L + 512 * t + 16 * cc : F6H + 256 * t + 16 * (cc - 32);
             } else {
                 wsrc[k] = ub + q16 * BLK + off;
                 winc[k] = inc;
@@ -211,7 +229,15 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             winc[k] = inc;
         }
         wq[k] = c != 0;
-        if constexpr (!FMT) wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
+        if constexpr (!FMT && !FM6) wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
+    }
+    // FM6: the thread's row (tid < BM) in its unit: sc at 32 g + 16 half (+ 4 p per stage), the d pair at 256 + 4 g
+    const uint8_t * f6src = nullptr, * f6d = nullptr;
+    if constexpr (FM6) {
+        const int r = tid & (BM - 1), q16 = r & 15;
+        const uint8_t * ur = W.w + (size_t) ((row0 + r) >> 4) * (W.K >> 8) * UB;
+        f6src = ur + 32 * (q16 & 7) + 16 * (q16 >> 3);
+        f6d = ur + 256 + 4 * (q16 & 7);
     }
     // LAY Q8_0: the thread's row of the tile-major scale stream (16 B per row and super-block)
     const uint8_t * dsrc8 = nullptr;
@@ -228,7 +254,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
     constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
-    if constexpr (LAY && (TYPE == TQ6K || TYPE == TQ3K || TYPE == TIQ3S)) {
+    if constexpr (LAY && !FM6 && (TYPE == TQ6K || TYPE == TQ3K || TYPE == TIQ3S)) {
         const int rowm = row0 + (tid & (BM - 1)), nb = W.K >> 8;
         esrc = reinterpret_cast<const uint8_t *>(W.d) + ((size_t) (rowm >> 4) * (TYPE == TIQ3S ? nb : nb / 2) * 16 + (rowm & 15)) *
                                                             (TYPE == TIQ3S ? 16 : 36);
@@ -257,7 +283,12 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                 else
                     cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
             }
-        if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
+        if constexpr (FM6) { // the row's meta slot: sc[4p..4p+3] | d of the tile's rows g / g + 8 (scales picks one)
+            if (tid < BM) {
+                cpa4(s + F6M + 16 * tid, f6src + (size_t) sb * UB + 4 * p);
+                cpa4(s + F6M + 16 * tid + 4, f6d + (size_t) sb * UB);
+            }
+        } else if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
             if (tid < BM) {
                 cpa4(s + edst, esrc + (sb >> 1) * EST + 16 * (sb & 1) + 4 * p);
                 cpa4(s + edst + 4, esrc + (sb >> 1) * EST + 32);
@@ -325,9 +356,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             const float d = __half2float(*reinterpret_cast<const __half *>(row + 28));
             a = b = __float2half2_rn(d * (float) (int) (1 + 2 * ((sc >> (8 * p + 4 * j)) & 0xfu)));
         } else if constexpr (TYPE == TQ6K) {
-            uint8_t * mrow = const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
+            uint8_t * mrow = FM6 ? const_cast<uint8_t *>(sm + (st % NSH) * STG + F6M + 16 * hr)
+                                 : const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
             const int2 meta = *reinterpret_cast<const int2 *>(mrow);
-            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) meta.y >> (16 * ((st >> 2) & 1)))));
+            const int dh = FM6 ? (hr >> 3) & 1 : (st >> 2) & 1; // FM6: rows g / g + 8 of the tile, else the pair's block
+            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) meta.y >> (16 * dh))));
             const unsigned sp = (unsigned) meta.x >> (16 * j);
             *reinterpret_cast<__half2 *>(mrow + 8 + 4 * j) =
                 __floats2half2_rn(d * (float) (int8_t) (sp & 0xff), d * (float) (int8_t) ((sp >> 8) & 0xff));
@@ -442,6 +475,18 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                         wd[j][kk][r] = 0x20202020u + (gv ^ m) - m;
                     }
                 }
+        } else if constexpr (FM6) { // the lane's 16 B of qlo (rows g, g + 8: words A, B) and 8 B of qhi (rows g, g + 8)
+            const uint4 q = *reinterpret_cast<const uint4 *>(sw + F6L + 512 * (rw >> 4) + 16 * (4 * g + t4));
+            const uint2 hq = *reinterpret_cast<const uint2 *>(sw + F6H + 256 * (rw >> 4) + 8 * (4 * g + t4));
+            constexpr unsigned M30 = 0x30303030u;
+            wd[0][0][0] = (q.x & M4) | (hq.x & M30);
+            wd[0][0][1] = (q.z & M4) | (hq.y & M30);
+            wd[0][1][0] = (q.y & M4) | ((hq.x << 4) & M30);
+            wd[0][1][1] = (q.w & M4) | ((hq.y << 4) & M30);
+            wd[1][0][0] = ((q.x >> 4) & M4) | ((hq.x >> 2) & M30);
+            wd[1][0][1] = ((q.z >> 4) & M4) | ((hq.y >> 2) & M30);
+            wd[1][1][0] = ((q.y >> 4) & M4) | ((hq.x << 2) & M30);
+            wd[1][1][1] = ((q.w >> 4) & M4) | ((hq.y << 2) & M30);
         } else if constexpr (TYPE == TQ6K) {
             const int z = (g >> 1) & 3; // rows g and g + 8 share the swizzle
             const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + 16 * z + 4 * t4);
@@ -504,10 +549,10 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             if constexpr (HT<TYPE>::SEP) {
                 sA = ws[j * BM + rw + (FMT ? 8 * (g & 1) : 0)]; // FMT: the lane's rows A / B (rawq)
                 sB = ws[j * BM + rw + (FMT ? 8 - 8 * (g & 1) : 8)];
-            } else { // Q6_K: (S_j0, S_j1) in the row -> broadcast pairs
+            } else { // Q6_K: (S_j0, S_j1) in the row -> broadcast pairs (FM6: in the row's meta slot)
                 const int z = (g >> 1) & 3;
-                const __half2 qa = *reinterpret_cast<const __half2 *>(ra + 16 * (3 ^ z) + 8 + 4 * j);
-                const __half2 qb = *reinterpret_cast<const __half2 *>(rb + 16 * (3 ^ z) + 8 + 4 * j);
+                const __half2 qa = *reinterpret_cast<const __half2 *>(FM6 ? sw + F6M + 16 * rw + 8 + 4 * j : ra + 16 * (3 ^ z) + 8 + 4 * j);
+                const __half2 qb = *reinterpret_cast<const __half2 *>(FM6 ? sw + F6M + 16 * (rw + 8) + 8 + 4 * j : rb + 16 * (3 ^ z) + 8 + 4 * j);
                 sA = make_uint2(h2u(__low2half2(qa)), h2u(__high2half2(qa)));
                 sB = make_uint2(h2u(__low2half2(qb)), h2u(__high2half2(qb)));
             }

@@ -234,6 +234,63 @@ template <> struct WV<T_Q6K> {
         w1 = ((r.q[k >> 1].y >> sh) & M4) | (int) (((hs >> (2 * j0 + 2)) & 0x03030303u) << 4);
     }
 };
+#if MK_WV_Q6F
+// ---- FM Q6_K (MK_WV_Q6F): every main-layer Q6_K matrix, fragment-ordered with the meta inline (wv_relayout) ----------
+// Unit (16-row tile, super-block) = 3360 B = 16 x (192 + 18):
+//   [0, 256)     sc: per g {row g sc[16] | row g + 8 sc[16]} (int8, natural 16-chunk order)
+//   [256, 288)   d: per g {row g fp16 | row g + 8 fp16}
+//   [288, 2336)  qlo: 4 groups p x 512 B, lane l = 4 g + tq: {row g | row g + 8} x {word A | word B}: A = the Q4_K-order nibble
+//                bytes 32 p + 4 tq .. + 3 (chunk 0 elements 4 tq .. + 3 of sub-block 2 p in the low nibbles, 2 p + 1 in the
+//                high ones), B = bytes 32 p + 16 + 4 tq .. + 3 (chunk 1)
+//   [2336, 3360) qhi: 4 groups p x 256 B, lane l: {row g H | row g + 8 H}; byte m of H = the high 2 bits of element 4 tq + m
+//                of (sub-block, chunk) (2p, 0) at bits 4-5, (2p + 1, 0) at 6-7, (2p, 1) at 0-1, (2p + 1, 1) at 2-3
+// Thread tq supplies elements 4 tq .. + 3 of both 16-chunks of each sub-block (11 coalesced loads per unit; the TM layout
+// took 26 loads of 4-8 B). Two MMA forms on it, bit-identical to each other and to the TM split path (the same exact integer
+// 16-chunk sums, the same float sequence per (row, token, chunk), chunk 0's and chunk 1's sums added last):
+//   X16 (ffn_down's q16 activations): split m16n8k32, chunk 0 in k-slots 0-15 and chunk 1 in 16-31, B column n = token n & 3
+//   of chunk n >> 2 (the split md / mx tables of the X16 fill);
+//   q32 phases: m16n8k16 per 16-chunk over 8 tokens: the non-split md table + the fill's per-chunk qsum table (mx4).
+// (Prefill: mmh's FM6 stage reads the same units, prefill_gemm.cuh.)
+constexpr int Q6F_UNIT = 3360, Q6F_D = 256, Q6F_LO = 288, Q6F_HI = 2336;
+struct Q6FRaw { int4 sc[2]; int dd; int2 q[2][4]; int hi[2][4]; };
+__device__ __forceinline__ void q6f_load(Q6FRaw & r, const Mat & m, int tile, int sb, int g, int tq) {
+    const uint8_t * u = m.w + ((size_t) tile * (m.K >> 8) + sb) * Q6F_UNIT;
+    const int l = 4 * g + tq;
+    r.sc[0] = ldw4(u + 32 * g);
+    r.sc[1] = ldw4(u + 32 * g + 16);
+    r.dd = ldw1(u + Q6F_D + 4 * g);
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        const int4 v = ldw4(u + Q6F_LO + 512 * p + 16 * l);
+        r.q[0][p] = make_int2(v.x, v.y);
+        r.q[1][p] = make_int2(v.z, v.w);
+        const int2 h = ldw2(u + Q6F_HI + 256 * p + 8 * l);
+        r.hi[0][p] = h.x;
+        r.hi[1][p] = h.y;
+    }
+}
+// the int8x4 operand (q + 32) of row rr (0: g, 1: g + 8), sub-block k, chunk c: elements 16 c + 4 tq .. + 3
+__device__ __forceinline__ int q6f_frag(const Q6FRaw & r, int rr, int k, int c) {
+    const int p = k >> 1, part = k & 1;
+    const unsigned base = c ? (unsigned) r.q[rr][p].y : (unsigned) r.q[rr][p].x;
+    const unsigned lo = (part ? base >> 4 : base) & 0x0f0f0f0fu;
+    const unsigned H = (unsigned) r.hi[rr][p];
+    const unsigned hp = c == 0 ? (part ? H >> 2 : H) : (part ? H << 2 : H << 4);
+    return (int) (lo | (hp & 0x30303030u));
+}
+// d sc[cn] of row rr, 16-chunk cn = 2 k + c, computed as WV<T_Q6K>::wsc2 (fmaf form: exact)
+__device__ __forceinline__ float q6f_fa(const Q6FRaw & r, float d, float nd, int rr, int cn) {
+    const int4 s = r.sc[rr];
+    const int w = (cn >> 2) == 0 ? s.x : (cn >> 2) == 1 ? s.y : (cn >> 2) == 2 ? s.z : s.w;
+    const int v = (int) (signed char) ((unsigned) w >> (8 * (cn & 3)));
+    return fmaf(d, __int_as_float(WV_MAGIC + v), nd);
+}
+__device__ __forceinline__ void mma16816(int (&d)[4], int a0, int a1, int b0, const int (&c)[4]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+}
+#endif
 // Q3_K values 96 B per block: unit u' = 2p + h: 2-bit lows at 8u' (A word | B word; byte m bits 2j = element 4j + m), highs
 // at 64 + 4u' (byte m: bit j = A element 4j + m, bit 4 + j = B); meta as Q6_K (sc - 32 as int8, d). Fed u3 + 28 (offset 32).
 template <> struct WV<T_Q3K> {
@@ -364,20 +421,25 @@ struct WvXS {
     int ld; // bytes per token row
     const float4 * md;
     const float2 * mx;
+#if MK_WV_Q6F
+    const float4 * mx4; // q6 fills: per (j, n, tq) the bits of MAGIC - 32 qsum of (token a, chunk 0), (b, 0), (a, 1), (b, 1)
+#endif
 };
 template <int NG> struct WvAcc { float v[NG][4]; };
 
 template <int US, int T, bool X16>
 __host__ __device__ constexpr int wv_smem() {
     using C = WvCfg<T, X16>;
-    return 2 * C::NTOKP * (US + 2) * 16 + T * (US + 2) * 8 + US * C::NG * 4 * 24;
+    // (MK_WV_Q6F: + the q32 fills' per-chunk qsum table mx4, 16 B per (j, n, tq))
+    return 2 * C::NTOKP * (US + 2) * 16 + T * (US + 2) * 8 + US * C::NG * 4 * (MK_WV_Q6F && !X16 ? 40 : 24);
 }
 
 // Fill units [u0, u0 + US) of T activation rows. norm: s_rs[t] = the RMS-norm scale of row t (as fill_xs).
 // Also returns the dp4a view of the same units (token stride US + 2: rows_* with XP = 2).
 // min2: mx = the MIN 2 accumulator inputs (bits of MAGIC - 32 qsum) instead of dx qsum (the matrix is an offset type)
+// q6 (MK_WV_Q6F, q32 fills): also the per-chunk qsum table mx4 of the FM Q6_K tiles' m16n8k16 form
 template <int T, bool X16, int US>
-__device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * sxo = nullptr, bool min2 = false) {
+__device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * sxo = nullptr, bool min2 = false, bool q6 = false) {
     using C = WvCfg<T, X16>;
     constexpr int LDU = US + 2;
     static_assert(wv_smem<US, T, X16>() <= SM_MISC, "wv activations");
@@ -447,6 +509,23 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
         md[i] = make_float4(v[0], v[1], v[2], v[3]);
         mx[i] = x2;
     }
+#if MK_WV_Q6F
+    float4 * const mx4 = reinterpret_cast<float4 *>(mx + US * C::NG * 4);
+    if (!X16 && q6)
+        for (int i = tid; i < US * C::NG * 4; i += NT) { // tokens 8 n + 2 tq + {0, 1} (the non-split md's), chunks 0 / 1
+            const int j = i / (C::NG * 4), n = (i / 4) % C::NG, tq = i & 3;
+            const int ub = j - (j & 7) + 2 * ((j & 7) >> 1), part = j & 1;
+            int qv[2][2];
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const int t = 8 * n + 2 * tq + k;
+#pragma unroll
+                for (int c = 0; c < 2; c++) qv[k][c] = t < T ? reinterpret_cast<const short *>(&xm[t * LDU + ub + c].y)[part] : 0;
+            }
+            mx4[i] = make_float4(__int_as_float(WV_MAGIC - 32 * qv[0][0]), __int_as_float(WV_MAGIC - 32 * qv[1][0]),
+                                 __int_as_float(WV_MAGIC - 32 * qv[0][1]), __int_as_float(WV_MAGIC - 32 * qv[1][1]));
+        }
+#endif
     __syncthreads();
     mark_fill();
     if (sxo) {
@@ -455,7 +534,11 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
         sxo->xm = xm;
         sxo->U = LDU;
     }
+#if MK_WV_Q6F
+    return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx, mx4};
+#else
     return WvXS{reinterpret_cast<const int8_t *>(xa), reinterpret_cast<const int8_t *>(xb), LDU * 16, md, mx};
+#endif
 }
 
 // one super-block (8 sub-blocks) of the tile from the thread's raw rows r0 (row g) and r1 (row g + 8); sbl = the
@@ -519,8 +602,104 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
 // Tile `tile` (rows 16 tile .. + 15) of m over super-blocks [sb0, sb0 + nsb) (the chunk in shared memory starts at sb0).
 // C fragment: v[n][c] = row 16 tile + g + 8 (c >> 1), token TPG n + 2 tq + (c & 1) (split: tokens 4 n + 2 tq & 3 + (c & 1),
 // valid in threads tq < 2). Out of line per (type, T, X16): each gets its own register allocation (128 cap).
-template <int TYPE, int T, bool X16>
+#if MK_WV_Q6F
+// FM Q6_K tile (see "FM Q6_K"): X16 = the split m16n8k32 form, else m16n8k16 per 16-chunk (xs from a q6 fill)
+template <int T, bool X16>
+__device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+    using C = WvCfg<T, X16>;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, h = tq >> 1;
+    WvAcc<C::NG> acc;
+    float acc1[X16 ? 1 : C::NG][4]; // k16 form: chunk 1's sums (acc: chunk 0's)
+#pragma unroll
+    for (int n = 0; n < C::NG; n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc.v[n][c] = 0.f;
+#pragma unroll
+    for (int n = 0; n < (X16 ? 1 : C::NG); n++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc1[n][c] = 0.f;
+    // B: k16 token 8 n + g, elements 16 c + 4 tq of the sub-block; split token 4 n + (g & 3), chunk g >> 2 only
+    const int tok = X16 ? (g & 3) : g, co = X16 ? 16 * (g >> 2) : 0;
+    const int8_t * xra = xs.xa + tok * xs.ld + co + 4 * tq;
+    const int8_t * xrb = xs.xb + tok * xs.ld + co + 4 * tq;
+#pragma unroll 1
+    for (int sb = 0; sb < nsb; sb++) {
+        Q6FRaw r;
+        q6f_load(r, m, tile, sb0 + sb, g, tq);
+        const float d0 = __half2float(__ushort_as_half((unsigned short) (r.dd & 0xffff)));
+        const float d1 = __half2float(__ushort_as_half((unsigned short) ((unsigned) r.dd >> 16)));
+        const float nd0 = -WV_FMAGIC * d0, nd1 = -WV_FMAGIC * d1;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int j = 8 * sb + k;
+            const int8_t * xr = ((k & 1) ? xrb : xra) + 128 * sb + 32 * (k >> 1);
+            const int w00 = q6f_frag(r, 0, k, 0), w10 = q6f_frag(r, 1, k, 0);
+            const int w01 = q6f_frag(r, 0, k, 1), w11 = q6f_frag(r, 1, k, 1);
+            if constexpr (!X16) {
+                const float f00 = q6f_fa(r, d0, nd0, 0, 2 * k), f10 = q6f_fa(r, d1, nd1, 1, 2 * k);
+                const float f01 = q6f_fa(r, d0, nd0, 0, 2 * k + 1), f11 = q6f_fa(r, d1, nd1, 1, 2 * k + 1);
+#pragma unroll
+                for (int n = 0; n < C::NG; n++) {
+                    const int b0 = *reinterpret_cast<const int *>(xr + 8 * n * xs.ld);
+                    const int b1 = *reinterpret_cast<const int *>(xr + 8 * n * xs.ld + 16);
+                    const float4 md = xs.md[(j * C::NG + n) * 4 + tq];
+                    const float4 mx = xs.mx4[(j * C::NG + n) * 4 + tq];
+                    const int ci0[4] = {__float_as_int(mx.x), __float_as_int(mx.y), __float_as_int(mx.x), __float_as_int(mx.y)};
+                    const int ci1[4] = {__float_as_int(mx.z), __float_as_int(mx.w), __float_as_int(mx.z), __float_as_int(mx.w)};
+                    int c0[4], c1[4];
+                    mma16816(c0, w00, w10, b0, ci0);
+                    mma16816(c1, w01, w11, b1, ci1);
+                    acc.v[n][0] = fmaf(f00, fmaf(md.x, __int_as_float(c0[0]), md.y), acc.v[n][0]);
+                    acc.v[n][1] = fmaf(f00, fmaf(md.z, __int_as_float(c0[1]), md.w), acc.v[n][1]);
+                    acc.v[n][2] = fmaf(f10, fmaf(md.x, __int_as_float(c0[2]), md.y), acc.v[n][2]);
+                    acc.v[n][3] = fmaf(f10, fmaf(md.z, __int_as_float(c0[3]), md.w), acc.v[n][3]);
+                    acc1[n][0] = fmaf(f01, fmaf(md.x, __int_as_float(c1[0]), md.y), acc1[n][0]);
+                    acc1[n][1] = fmaf(f01, fmaf(md.z, __int_as_float(c1[1]), md.w), acc1[n][1]);
+                    acc1[n][2] = fmaf(f11, fmaf(md.x, __int_as_float(c1[2]), md.y), acc1[n][2]);
+                    acc1[n][3] = fmaf(f11, fmaf(md.z, __int_as_float(c1[3]), md.w), acc1[n][3]);
+                }
+            } else {
+                const float fA0 = q6f_fa(r, d0, nd0, 0, 2 * k + h), fA1 = q6f_fa(r, d1, nd1, 1, 2 * k + h);
+                const int a[4] = {w00, w10, w01, w11};
+#pragma unroll
+                for (int n = 0; n < C::NG; n++) {
+                    const int x = *reinterpret_cast<const int *>(xr + 4 * n * xs.ld);
+                    const int b0 = (g >> 2) ? 0 : x, b1 = (g >> 2) ? x : 0;
+                    const float4 md = xs.md[(j * C::NG + n) * 4 + tq];
+                    const float2 mx = xs.mx[(j * C::NG + n) * 4 + tq];
+                    const int ci[4] = {__float_as_int(mx.x), __float_as_int(mx.y), __float_as_int(mx.x), __float_as_int(mx.y)};
+                    int cc[4];
+                    mma16832(cc, a, b0, b1, ci);
+                    acc.v[n][0] = fmaf(fA0, fmaf(md.x, __int_as_float(cc[0]), md.y), acc.v[n][0]);
+                    acc.v[n][1] = fmaf(fA0, fmaf(md.z, __int_as_float(cc[1]), md.w), acc.v[n][1]);
+                    acc.v[n][2] = fmaf(fA1, fmaf(md.x, __int_as_float(cc[2]), md.y), acc.v[n][2]);
+                    acc.v[n][3] = fmaf(fA1, fmaf(md.z, __int_as_float(cc[3]), md.w), acc.v[n][3]);
+                }
+            }
+        }
+    }
+    if constexpr (!X16) { // chunk 0 + chunk 1 (the split form's tq < 2 sum: own chunk-0 sum + the partner's chunk 1)
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc.v[n][c] += acc1[n][c];
+    } else {
+#pragma unroll
+        for (int n = 0; n < C::NG; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc.v[n][c] += __shfl_xor_sync(0xffffffffu, acc.v[n][c], 2);
+    }
+    return acc;
+}
+#endif
+
+template <int TYPE, int T, bool X16, int ROLE = 0> // ROLE: separate instances for MK_WV_OUT's out role (wv_tile_off)
 __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, int sb0, int nsb, const WvXS xs) {
+#if MK_WV_Q6F
+    if constexpr (TYPE == T_Q6K) {
+        return wv_tile_q6f<T, X16>(m, tile, sb0, nsb, xs);
+    } else {
+#endif
     static_assert(!wv_s16(TYPE) || X16, "per-16 weight scales need the split MMAs");
     using C = WvCfg<T, X16>;
     const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
@@ -546,10 +725,17 @@ __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, 
             for (int c = 0; c < 4; c++) acc.v[n][c] += __shfl_xor_sync(0xffffffffu, acc.v[n][c], 2);
     }
     return acc;
+#if MK_WV_Q6F
+    }
+#endif
 }
 
 template <int T, bool X16>
 __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+#if MK_WV_Q6F
+    if constexpr (!X16) // FM Q6_K in the q32 phases (m16n8k16 form; the phase's fill was q6)
+        if (m.type == T_Q6K) return wv_tile<T_Q6K, T, false>(m, tile, sb0, nsb, xs);
+#endif
 #if MK_MAXT > 5
     if constexpr (X16) { // ffn_down: the offset types too
         switch (m.type) {
@@ -568,6 +754,19 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
         default: return wv_tile<T_IQ4X, T, X16>(m, tile, sb0, nsb, xs);
     }
 }
+
+#if MK_MAXT > 5 && MK_WV_OUT
+// MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's made ptxas re-split the
+// registers around those calls: ffn_down's resid_wv<8, true> spilled 16 / 40 -> 60 / 228 B and ran slower (spill track)
+template <int T>
+__device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
+    switch (m.type) {
+        case T_Q6K: return wv_tile<T_Q6K, T, true, 1>(m, tile, sb0, nsb, xs);
+        case T_Q3K: return wv_tile<T_Q3K, T, true, 1>(m, tile, sb0, nsb, xs);
+        default: return wv_tile<T_IQ3S, T, true, 1>(m, tile, sb0, nsb, xs);
+    }
+}
+#endif
 
 // ---- phases ----------------------------------------------------------------------------------------------------------
 // Work split of a phase (bench k_wv): block b takes the tiles [ntile b / G, ntile (b + 1) / G) of the phase's tile space
@@ -640,7 +839,11 @@ __device__ __forceinline__ void wv_store(float * dst, int ld, int tile, const Wv
 template <int T>
 __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_c) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+#if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.qkv.type == T_Q6K || W.gate.type == T_Q6K);
+#else
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true);
+#endif
     const float * s_rs = misc(nullptr);
     float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int n_ab = AB_SPLIT * 2 * NVH;
@@ -736,7 +939,11 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
 template <int T>
 __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
     const int warp = threadIdx.x >> 5;
+#if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K);
+#else
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true);
+#endif
     const float * s_rs = misc(nullptr);
     int lo = 0;
     if (!W.q.fm) {
@@ -796,7 +1003,11 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T]) {
 template <int T>
 __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
+#if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
+    const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K);
+#else
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true);
+#endif
     const float * s_rs = misc(nullptr);
     constexpr int NJ = FF / 16;
     const int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
@@ -843,7 +1054,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
 // (G = gridDim / WV_S blocks per chunk). Each chunk's partial sums go to cB.wvpart; the last of the 2 WV_S (tile, chunk)
 // arrivals at a 32-row group adds the chunks in order 0 .. WV_S - 1 (fixed: T-invariant), adds the residual and
 // re-quantises it for the next RMS-normed consumer (weight wnext), like resid32's epilogue.
-template <int T, bool X16, int K>
+template <int T, bool X16, int K, bool OFF = false> // OFF: MK_WV_OUT's out role (wv_tile_off)
 __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float * wnext, int role) {
     constexpr int NSB = K / 256, CH = NSB / WV_S, US = 8 * CH;
     static_assert(NSB % WV_S == 0, "split-K chunks of whole super-blocks");
@@ -854,7 +1065,11 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     if (b >= WV_S * G) return;
     const int kc = b / G, bi = b - kc * G;
 #if MK_MAXT > 5
+#if MK_WV_Q6F
+    const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K);
+#else
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type));
+#endif
 #else
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false);
 #endif
@@ -863,7 +1078,13 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     unsigned * cnt = cB.wvcnt + role * (D / 32);
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
+#if MK_MAXT > 5 && MK_WV_OUT
+        WvAcc<C::NG> a;
+        if constexpr (OFF) a = wv_tile_off<T>(Wm, tile, CH * kc, CH, xs);
+        else a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
+#else
         const WvAcc<C::NG> a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
+#endif
         float * part = cB.wvpart + (size_t) kc * MAXT * D;
         if (!X16 || tq < 2) {
 #pragma unroll
@@ -894,4 +1115,18 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
             if (lane == 0) cnt[j] = 0;
         }
     }
+}
+
+// out / ssm_out (K = VD) in the wv layout, residual add into x, re-quantised for the next normed consumer (role 0).
+// MK_WV_OUT (MK_MAXT > 5): the offset types run the split MMAs (X16, min2 fill): their per-16 weight scales need them, and
+// the q32 activations fit the split view as they are (a block's two 16-chunks are units with the block's scale each)
+template <int T>
+__device__ __forceinline__ void resid_out_wv(const Mat & Wm, const float * wnext) {
+#if MK_MAXT > 5 && MK_WV_OUT
+    if (wv_min2(Wm.type) && !(MK_WV_Q6F && Wm.type == T_Q6K)) { // (MK_WV_Q6F: Q6_K runs the q32 FM tiles below)
+        resid_wv<T, true, VD, true>(Wm, cB.qo, wnext, 0);
+        return;
+    }
+#endif
+    resid_wv<T, false, VD>(Wm, cB.qo, wnext, 0);
 }
