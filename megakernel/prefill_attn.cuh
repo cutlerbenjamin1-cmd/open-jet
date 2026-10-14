@@ -679,16 +679,19 @@ __device__ __forceinline__ float a8_ld_ks(const __half * Ks, int kb, int np) {
 __device__ __forceinline__ void a8_st_ks(uint8_t * st, float v) {
     if (threadIdx.x < 8 * A2_K) reinterpret_cast<float *>(st + A8_KB)[(threadIdx.x & 7) * A2_K + (threadIdx.x >> 3)] = v;
 }
-// chunk k (of 3) of this thread: 8 V values of ring stage st -> fp16 in sV (a2_q8h / a2_q4h / a2_qnh, as pk_attn2)
+// chunk k (of 3) of this thread: 8 V values of ring stage st -> fp16 in sV (a2_q8h / a2_q4h / a2_qnh, as pk_attn2).
+// VB (4 .. 7): vbits is 8 or VB (the slot's low-bit V, known at compile time); 0: any
+template <int VB = 0>
 __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, int vbits) {
     const int i = threadIdx.x + A2_NT * k, p = i >> 5, c = i & 31;
     if (i < A2_K * 32) {
         const uint8_t * row = st + A8_KB + A8_KSB + p * HD;
         const __half d = reinterpret_cast<const __half *>(st + A8_KB + A8_KSB + A8_VB)[p * (HD / 32) + (c >> 2)];
         __half2 h[4];
+        const int vb = VB ? VB : vbits; // (when not 8)
         if (vbits == 8) a2_q8h(*reinterpret_cast<const uint2 *>(row + 8 * c), d, h);
-        else if (vbits == 4) a2_q4h(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
-        else a2_qnh(*reinterpret_cast<const unsigned *>(row + 4 * c), kv_hi(row + 128 + c * (vbits - 4), vbits - 4), d, vbits, h);
+        else if (vb == 4) a2_q4h(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
+        else a2_qnh(*reinterpret_cast<const unsigned *>(row + 4 * c), kv_hi(row + 128 + c * (vb - 4), vb - 4), d, vb, h);
         *reinterpret_cast<int4 *>(sV + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
     }
 }
@@ -696,7 +699,9 @@ __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, 
 // scores in log2 units: log2 e is folded into the Q scales, P = exp2(s - m)
 constexpr float A8_L2E = 1.4426950408889634f;
 // KLOW: the slot's K is low-bit (q4..q7): its tiles are expanded to int8 in the staging. The KLOW = false instantiation is the
-// plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot).
+// plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot). KB / VB (4 .. 7, 0 = read per slot):
+// the slot's main-buffer K / V bits at compile time (a tile is then KB / VB or 8, the q8 window ring): folds the expansion's
+// and the V conversion's format switches and a8_issue_k's chunk predicates (same arithmetic: the same bits as KB = VB = 0).
 // EXA (MK_EXACT): a row's result is a function of its position only, whatever the chunk / launch / split: its key range
 // is cut into absolute segments of segt tiles (segment k = tiles k segt ..), each computed from a fresh online softmax,
 // and folded in order: R <- ex_fold(R, s_k) (ex_ab / ex_f; max in log2 units). A unit computes either a whole item
@@ -709,9 +714,11 @@ __device__ __forceinline__ void ex_ab(float M, float m, float & Mn, float & a, f
 }
 __device__ __forceinline__ float ex_f(float a, float R, float b, float s) { return __fadd_rn(__fmul_rn(a, R), __fmul_rn(b, s)); }
 
-template <bool QROW, bool KLOW, bool EXA = false>
+template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
                                                      int segt = 0, int exh = 0) {
+    static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn8 KB");
+    static_assert(VB == 0 || (VB >= 4 && VB <= 7), "pk_attn8 VB");
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
@@ -766,13 +773,14 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     const int wsr = kv_ws(cP.wsrow ? pmax + 1 : n0 + T), wsm = kv_wsm(wsr); // (MK_EXACT: per query tile, see PBufs)
     const KvFmt kf = kv_fmt(slot); // per-slot formats once; per tile one compare of the tile index (kv_ring_tile)
     const int itr_k = kv_ring_tile(kf.kr, wsr, 0, A2_K), itr_v = kv_ring_tile(kf.vr, wsr, 0, A2_K);
-    auto kbt = [&](int it) { return it >= itr_k ? 8 : kf.kb; };
-    auto vbt = [&](int it) { return it >= itr_v ? 8 : kf.vb; };
+    const int kbs = KB ? KB : kf.kb, vbs = VB ? VB : kf.vb; // the main buffer's K / V bits
+    auto kbt = [&](int it) { return it >= itr_k ? 8 : kbs; };
+    auto vbt = [&](int it) { return it >= itr_v ? 8 : vbs; };
     auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
         const int8_t *tk, *tv;
         const __half *tks, *tvs;
-        kv_tile_src(0, slot, g, it * A2_K, wsr, wsm, kf.kb, it >= itr_k, tk, tks);
-        kv_tile_src(1, slot, g, it * A2_K, wsr, wsm, kf.vb, it >= itr_v, tv, tvs);
+        kv_tile_src(0, slot, g, it * A2_K, wsr, wsm, kbs, it >= itr_k, tk, tks);
+        kv_tile_src(1, slot, g, it * A2_K, wsr, wsm, vbs, it >= itr_v, tv, tvs);
         a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kbt(it) : 8, vbt(it));
         return a8_ld_ks(tks, 0, np);
     };
@@ -780,7 +788,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         if constexpr (KLOW) {
             // all A2_K rows: rows >= np were zeroed by a8_issue_k (finite values, masked by the causal test)
             const int kb_ = kbt(it);
-            if (kb_ != 8) kv_tile_expand<true>(asm_ + (it % A8_NS) * A8_STG, kb_, A2_K, r0, rs, A8_KLD);
+            if constexpr (KB != 0) {
+                if (kb_ != 8)
+                    for (int r = r0; r < A2_K; r += 3 * rs) kv_rows_expand<KB, true>(asm_ + (it % A8_NS) * A8_STG, A2_K, r, rs, A8_KLD);
+            } else if (kb_ != 8) kv_tile_expand<true>(asm_ + (it % A8_NS) * A8_STG, kb_, A2_K, r0, rs, A8_KLD);
         }
     };
     (void) kbt;
@@ -865,7 +876,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         __syncthreads();
         expand_k(it0, warp, A2_NT / 32);
 #pragma unroll
-        for (int k = 0; k < 3; k++) a8_cv_v(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbt(it0));
+        for (int k = 0; k < 3; k++) a8_cv_v<VB>(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, k, vbt(it0));
     }
     float o[16][4];
 #pragma unroll
@@ -1011,7 +1022,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
             // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
-            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v(stv, sVc, b >> 1, vbn);
+            if ((b == 1 || b == 3 || b == 5) && cvn) a8_cv_v<VB>(stv, sVc, b >> 1, vbn);
         }
         if constexpr (QROW) {
 #pragma unroll

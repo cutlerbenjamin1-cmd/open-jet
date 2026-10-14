@@ -6392,6 +6392,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn8<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         CK(cudaFuncSetAttribute(pk_attn8<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         CK(cudaFuncSetAttribute(pk_attn8<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true, false, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int dev = 0, nsm = 0, occ = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
@@ -6420,6 +6421,7 @@ struct MKEngine::Impl {
             if (const char * e = getenv("MK_EXACT_SPLIT")) ex_split = atoi(e) != 0;
             CK(cudaFuncSetAttribute(pk_attn8<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+            CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         }
         mem_mark("prefill kernel attributes");
         pf_ready = true;
@@ -6427,6 +6429,8 @@ struct MKEngine::Impl {
 
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
+    // the slot's main buffer holds K q6 / V q5 (the D / D-prime presets): pk_attn8's compile-time-format instantiation
+    bool kv_k6v5(int slot) const { return hb.kvb[0][slot] == 6 && hb.kvb[1][slot] == 5; }
     bool attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
     int ex_segt = 256; // MK_EXACT: key tiles per absolute attention segment (pk_attn8 EXA)
@@ -6507,7 +6511,8 @@ struct MKEngine::Impl {
             const ExPlan p = ex_plan(T, n, ex_cap(pcs));
             float * part = ex_part(pcs);
             const int grid = p.nfull + (N - p.nfull) * p.S;
-            if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
+            if (kv_k6v5(slot)) pk_attn8<false, true, true, 6, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
+            else if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
             else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
             if (N > p.nfull) pk_attn8_combx<<<N - p.nfull, 256>>>(T, n, p.nfull, p.S, ex_segt, p.h, r0, part);
             return;
@@ -6525,7 +6530,8 @@ struct MKEngine::Impl {
             const bool s8 = attn_pv16;
             const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
             if (s8 && attn_s8 == 1) {
-                if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+                if (kv_k6v5(slot)) pk_attn8<false, true, false, 6, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
+                else if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
                 else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
             } else if (s8 && attn_s8 == 2) {
                 if (kl) pk_attn8<true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1, r0);
