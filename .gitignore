@@ -51,3 +51,4 @@ testfile
 .claude/settings.local.json
 MEMORY.md
 llama.cpp/
+bench_data/
