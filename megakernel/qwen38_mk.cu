@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -6416,6 +6417,7 @@ struct MKEngine::Impl {
         if (exact) {
             attn_split = false;
             if (const char * e = getenv("MK_EXACT_SEG")) ex_segt = std::max(1, atoi(e) / A2_K);
+            if (const char * e = getenv("MK_EXACT_SPLIT")) ex_split = atoi(e) != 0;
             CK(cudaFuncSetAttribute(pk_attn8<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         }
@@ -6428,30 +6430,69 @@ struct MKEngine::Impl {
     bool attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
     int ex_segt = 256; // MK_EXACT: key tiles per absolute attention segment (pk_attn8 EXA)
-    // EXA partials: the ffn_down input scratch xh2 (idle until the FFN). Not y1 as for a2_plan: with KV window rings the
-    // chunk's attention runs in pieces, and a piece's partials in y1 would overwrite the k / v of the next piece's rows
-    float * ex_part() { return reinterpret_cast<float *>(hp.xh2); }
+    // EXA partials: y1 (k, v of the layer, dead after pk_attn_prep) as for a2_plan; but a slot with a KV window ring runs
+    // its chunk in pieces (pf_run), and a piece's partials in y1 would overwrite the k / v of the next piece's rows: there
+    // the ffn_down input scratch xh2 (idle until the FFN, half y1's size)
+    float * ex_part(bool pieces) { return pieces ? reinterpret_cast<float *>(hp.xh2) : hp.y1; }
+    size_t ex_cap(bool pieces) const { return (size_t) hp.cap * FF / (pieces ? 2 : 1) / A2_PART; } // (partial slots)
     // MK_EXACT work split (pk_attn8 EXA): numerically free (every split gives the same rows), so this only balances.
-    // Items that fill at most half a wave of resident CTAs (all items of a short chunk, or the last partial wave of a long
-    // one) are cut into S units of whole segments (sl partial slots each); otherwise items run whole.
-    void ex_plan(int T, int n0, int & nfull, int & S, int & sl) {
-        const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV, slots = std::max(1, a2_slots);
-        nfull = N;
-        S = 1;
-        sl = 0;
-        const int nsplit = N >= slots ? N % slots : N;
-        if (nsplit == 0 || 2 * nsplit > slots) return;
-        const int ntile = (n0 + T - 1) / A2_K + 1, nsg = (ntile + ex_segt - 1) / ex_segt; // (the longest item)
-        const size_t cap_slots = (size_t) hp.cap * FF / 2 / A2_PART; // ex_part (xh2)
-        for (int s = std::min(nsg, slots / nsplit); s > 1; s--) {
-            const int need = nsg - nsg / s + 1;
-            if ((size_t) need * nsplit <= cap_slots) {
-                S = s;
-                sl = need;
-                nfull = N - nsplit;
-                return;
+    // The last N - nfull items (blockIdx order) are split into a head unit (segments 0 .. h - 1, folded in registers ->
+    // partial slot 0) and single-segment units (segment h + u - 1 -> slot u), launched interleaved (every head, then
+    // every item's segment h, ..) so that the CTA scheduler fills the tail evenly; S = 1 + (most segments of a split item)
+    // - h units and partial slots per split item (ex_part). The plan minimises a list-scheduling estimate (a unit
+    // takes its key tiles + a per-CTA overhead; the CTAs start in blockIdx order on a2_slots resident slots) over
+    // nsplit in {the last partial wave, + one full wave} x h; memoised per (T, n0, capacity). MK_EXACT_SPLIT=0: whole
+    // items only.
+    struct ExPlan { int nfull, S, h; };
+    std::map<std::tuple<int, int, size_t>, ExPlan> ex_memo;
+    bool ex_split = true;
+    ExPlan ex_plan(int T, int n0, size_t cap_slots) {
+        const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV, P = std::max(1, a2_slots), segt = ex_segt;
+        if (!ex_split) return {N, 1, 0};
+        const auto key = std::make_tuple(T, n0, cap_slots);
+        const auto f = ex_memo.find(key);
+        if (f != ex_memo.end()) return f->second;
+        if (ex_memo.size() > 4096) ex_memo.clear();
+        const double c0 = 2.0; // per-CTA overhead (Q fragments, pipeline fill) in key tiles
+        std::vector<int> nt(N); // key tiles of each item
+        for (int i = 0; i < N; i++) {
+            const int t0 = i % nqt * A2_Q;
+            nt[i] = (n0 + t0 + std::min(A2_Q, T - t0) - 1) / A2_K + 1;
+        }
+        std::vector<double> fr; // the slots' busy-until times (min-heap)
+        auto sim = [&](int nfull, int S, int h) {
+            fr.assign(P, 0.0);
+            auto run = [&](double d) {
+                std::pop_heap(fr.begin(), fr.end(), std::greater<double>());
+                fr.back() += d;
+                std::push_heap(fr.begin(), fr.end(), std::greater<double>());
+            };
+            for (int i = 0; i < nfull; i++) run(nt[i] + c0);
+            const int ns = N - nfull;
+            for (int u = 0; u < (ns > 0 ? S : 0); u++)
+                for (int j = 0; j < ns; j++) {
+                    const int t = nt[nfull + j], k0 = u == 0 ? 0 : h + u - 1, k1 = u == 0 ? h : k0 + 1;
+                    run(k0 * segt < t ? std::min(t, k1 * segt) - k0 * segt + c0 : 0.1);
+                }
+            // + pk_attn8_combx: one more launch, reads S partial slots per split item
+            return *std::max_element(fr.begin(), fr.end()) + (ns > 0 ? c0 + 0.02 * ns * S : 0.0);
+        };
+        ExPlan best{N, 1, 0};
+        double bt = sim(N, 1, 0);
+        const int rem = N % P;
+        for (const int ns : {rem, rem + P}) {
+            if (ns <= 0 || ns > N) continue;
+            int mx = 0; // the most segments of a split item
+            for (int j = N - ns; j < N; j++) mx = std::max(mx, (nt[j] + segt - 1) / segt);
+            for (int h = 1; h < mx; h++) {
+                const int S = 1 + mx - h;
+                if ((size_t) S * ns > cap_slots) continue;
+                const double t = sim(N - ns, S, h);
+                if (t < bt) bt = t, best = {N - ns, S, h};
             }
         }
+        ex_memo[key] = best;
+        return best;
     }
     // (r0: the queries are chunk rows r0 .. r0 + T - 1 at positions n ..: MK_EXACT with KV window rings, see pf_run)
     void attn(int T, int n, int slot, int r0 = 0) {
@@ -6462,12 +6503,13 @@ struct MKEngine::Impl {
         }
         if (exact && hb.kvq8 && attn_pv16 && attn_s8 == 1) { // MK_EXACT: pk_attn8's EXA form
             const int N = (T + A2_Q - 1) / A2_Q * NKV;
-            int nfull, S, sl;
-            ex_plan(T, n, nfull, S, sl);
-            const int grid = nfull + (N - nfull) * S;
-            if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt, sl);
-            else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, ex_part(), r0, ex_segt, sl);
-            if (N > nfull) pk_attn8_combx<<<N - nfull, 256>>>(T, n, nfull, S, ex_segt, sl, r0, ex_part());
+            const bool pcs = hb.kvrp[0][slot] || hb.kvrp[1][slot]; // (the chunk runs in pieces: pf_run)
+            const ExPlan p = ex_plan(T, n, ex_cap(pcs));
+            float * part = ex_part(pcs);
+            const int grid = p.nfull + (N - p.nfull) * p.S;
+            if (hb.kvb[0][slot] != 8) pk_attn8<false, true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
+            else pk_attn8<false, false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, p.nfull, p.S, part, r0, ex_segt, p.h);
+            if (N > p.nfull) pk_attn8_combx<<<N - p.nfull, 256>>>(T, n, p.nfull, p.S, ex_segt, p.h, r0, part);
             return;
         }
         // y1 (k, v of the layer) is free between pk_attn_prep and the FFN: partials of split items
