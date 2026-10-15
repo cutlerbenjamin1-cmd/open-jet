@@ -114,6 +114,38 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
 #endif
+// MK_K7 (stock2 K7): the DeltaNet state layout of each head (64 KB, logical S[col][row], col = value, row = key dim).
+// 0: upstream [col][row]: dn_core's thread (col, quarter r) owns 32 contiguous floats, so a warp's float4 load / store hits
+// 32 lines 512 B apart (16 B of each 32-B sector: 50% sector efficiency). 1: permuted so that dn_core's warp w reads float4 i of
+// its 32 lanes as 512 contiguous bytes: float4 (8 w + i) 32 + lane holds rows 32 r + 4 i .. + 3 of col (lane = 4 (col & 7) + r,
+// w = col >> 3). dn_core and pk_dn_scan (prefill) address it through dn_sidx; every other user copies whole layers (layout
+// agnostic). Same arithmetic: bit-exact; state files are keyed by the binary, so a build never reads the other layout.
+#ifndef MK_K7
+#define MK_K7 1
+#endif
+// MK_K6_LD (stock2 K6, exact): the tile-major Q8_0 wv tile load. 0: eight 8-byte loads per row and super-block (lanes tq 0-1
+// and 2-3 each read half of a 32-B sector; the other half comes with the next k: every sector crosses L2 -> SM twice).
+// 1: four 16-byte loads (whole sectors per lane pair) and one shuffle exchange of 8 bytes per load: the same bytes reach
+// the same registers.
+#ifndef MK_K6_LD
+#define MK_K6_LD 1
+#endif
+// MK_K6_S (stock2 K6): K-split ways of the Q8_0 k / v tiles in attn_proj_wv when MK_K6 has bit 1 (not bitwise vs the
+// unsplit tile: the parts are summed in order 0 .. S - 1 by the last arrival; the same for every T)
+#ifndef MK_K6_S
+#define MK_K6_S 2
+#endif
+#ifndef MK_K6_DEF // MK_K6's default (env overrides)
+#define MK_K6_DEF 2
+#endif
+// MK_K8 (stock2 K8, prefill small kernels, exact; env bits, default MK_K8_DEF): 1 pk_ab on a second stream next to
+// gemm_dn_in, 2 pk_norm_quant keeps x in registers (one read), 4 pk_dn_prep_t: MK_K8_NT tokens per block, conv taps read once
+#ifndef MK_K8_DEF
+#define MK_K8_DEF 7
+#endif
+#ifndef MK_K8_NT
+#define MK_K8_NT 4
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -335,6 +367,9 @@ struct Bufs {
     // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
+    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 1 K-split the Q8_0 k / v tiles MK_K6_S ways
+    // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs
+    int k6;
 };
 
 __constant__ ModelW cW;
@@ -1603,6 +1638,15 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     }
 }
 
+// float index of state element (col, row) within a head's 128 x 128 block (MK_K7 layout; see there)
+__host__ __device__ __forceinline__ int dn_sidx(int col, int row) {
+#if MK_K7
+    return (((col >> 3) * 256 + ((row >> 2) & 7) * 32 + (col & 7) * 4 + (row >> 5)) << 2) + (row & 3);
+#else
+    return col * 128 + row;
+#endif
+}
+
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
 template <int T>
@@ -1624,10 +1668,16 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * s_gb = s_z + T * 128;                // [NE][2]
     float * s_raw = s_gb + 32;                   // [T][384] conv outputs (silu), 16-byte aligned
 
-    float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r;
+#if MK_K7 // S[i] (rows 32 r + 4 i .. + 3 of col) = float4 (8 warp + i) 32 + lane of the head (= dn_sidx)
+    float4 * const Sg = reinterpret_cast<float4 *>(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128) + warp * 256 + lane;
+    constexpr int SGS = 32; // float4 stride between S[i] and S[i + 1]
+#else
+    float4 * const Sg = reinterpret_cast<float4 *>(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r);
+    constexpr int SGS = 1;
+#endif
     float4 S[8];
 #pragma unroll
-    for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
+    for (int i = 0; i < 8; i++) S[i] = __ldcg(Sg + SGS * i);
 
     const int np = n - dn_c; // replayed (accepted, not yet committed) tokens
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
@@ -1733,7 +1783,7 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         }
         if (e == np + n_commit - 1) {
 #pragma unroll
-            for (int i = 0; i < 8; i++) reinterpret_cast<float4 *>(Sg)[i] = S[i];
+            for (int i = 0; i < 8; i++) Sg[SGS * i] = S[i];
         }
     }
     __syncthreads();
@@ -6604,6 +6654,14 @@ struct MKEngine::Impl {
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
         fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
+        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 1 K-split of the Q8_0 k / v tiles, NOT bitwise; 2 dealing
+        // across blocks, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
+        // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
+        hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
+        k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
+        if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
+        fprintf(stderr, "[mk] stock2: K6 %d (split %d, ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_S, MK_K6_LD, MK_K7, k8,
+                k8_nt);
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
@@ -6924,6 +6982,12 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] teardown: %s\n", e.what());
         }
         ck_free(); // (checkpoint copies may still read or write device buffers)
+        if (pf_s2) { // (stock2 K8a)
+            cudaStreamSynchronize(pf_s2);
+            cudaStreamDestroy(pf_s2);
+        }
+        for (cudaEvent_t e : {pf_e0, pf_e1})
+            if (e) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         cudaStreamSynchronize(0);
         if (embd_host) cudaFreeHost(embd_host);
@@ -7254,6 +7318,11 @@ struct MKEngine::Impl {
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         }
+        if (k8 & 1) { // stock2 K8a: pk_ab's stream (non-blocking: ordered only by pf_e0 / pf_e1)
+            CK(cudaStreamCreateWithFlags(&pf_s2, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&pf_e0, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&pf_e1, cudaEventDisableTiming));
+        }
         mem_mark("prefill kernel attributes");
         pf_ready = true;
     }
@@ -7553,6 +7622,24 @@ struct MKEngine::Impl {
     struct PfEv { const char * cat; cudaEvent_t a, b; };
     std::vector<PfEv> pf_ev;
     bool pf_prof = getenv("MK_PF_PROFILE") != nullptr;
+    // stock2 K8 (MK_K8 bits, read at init): 1 pk_ab on pf_s2 (after pf_e0 = the layer's pk_norm_quant; pk_dn_prep waits for
+    // pf_e1 = pk_ab), 2 pk_norm_quant1, 4 pk_dn_prep_t
+    int k8 = MK_K8_DEF;
+    cudaStream_t pf_s2 = nullptr;
+    cudaEvent_t pf_e0 = nullptr, pf_e1 = nullptr;
+    void pf_norm_quant(const float * src, const float * w, int T) {
+        if (k8 & 2) pk_norm_quant1<<<T, 256>>>(src, w);
+        else pk_norm_quant<<<T, 256>>>(src, w);
+    }
+    void pf_dn_prep(int T, int n, int dl, const LayerW & W) {
+        if (k8 & 4) {
+            if (k8_nt == 8) pk_dn_prep_t<8><<<(T + 7) / 8, 256>>>(T, n, dl, W.conv, W.dt, W.A);
+            else pk_dn_prep_t<4><<<(T + 3) / 4, 256>>>(T, n, dl, W.conv, W.dt, W.A);
+        } else {
+            pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A);
+        }
+    }
+    int k8_nt = MK_K8_NT; // (MK_K8_NT env: 4 or 8)
     template <class F> void pf_time(const char * cat, F f) {
         if (!pf_prof) { f(); return; }
         // MK_PF_PROFILE=2: idempotent kernels are timed alone (5 repeats, min)
@@ -7655,7 +7742,7 @@ struct MKEngine::Impl {
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
                 if (fault_now && L == NL / 2) fault_inject();
-                pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.attn_norm); });
+                pf_time("norm_quant", [&] { pf_norm_quant(hp.x, W.attn_norm, T); });
                 if (W.attn) {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
                     pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
@@ -7680,15 +7767,25 @@ struct MKEngine::Impl {
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(L / 4); });
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
+                    // stock2 K8a: pk_ab (reads x and rs, writes ab: only pk_dn_prep reads it) on pf_s2 next to the GEMMs, which
+                    // read xh; pk_dn_prep waits for it. (MK_PF_PROFILE: in order on stream 0, so it is timed alone.)
+                    const bool k8a = (k8 & 1) && pf_s2 && !pf_prof;
+                    if (k8a) {
+                        CK(cudaEventRecord(pf_e0, 0));
+                        CK(cudaStreamWaitEvent(pf_s2, pf_e0, 0));
+                        pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256, 0, pf_s2>>>(W.ab, W.abq, W.abd, W.attn_norm, T);
+                        CK(cudaEventRecord(pf_e1, pf_s2));
+                    }
                     pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
-                    pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
+                    if (k8a) CK(cudaStreamWaitEvent(0, pf_e1, 0));
+                    else pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, W.abq, W.abd, W.attn_norm, T); });
                     ck_wait_restore(dl); // this layer's conv ring / state may still be arriving from the checkpoint
                     int sg[STG_MAX], ta = -1; // staging slots of this layer's checkpoint pieces (+ a side scan's input)
                     for (int j = 0; j < sn; j++) sg[j] = stg_take();
                     for (int j = 0; j < sn; j++)
                         if ((sp[j] - n) % 32 && sp[j] - n > 32) ta = stg_take();
                     pf_time("dn_prep", [&] {
-                        pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A);
+                        pf_dn_prep(T, n, dl, W);
                         for (int j = 0; j < sn; j++) pk_ck_conv<<<CONV_RING, 256>>>(n, sp[j], dl, stg_conv(sg[j]));
                         pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl);
                     });
@@ -7723,7 +7820,7 @@ struct MKEngine::Impl {
                     pf_time("gemm_dn_out", [&] { gemm(W.sout, T, hp.x, D, pf::OUT_ADD); });
                     dl++;
                 }
-                pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.post_norm); });
+                pf_time("norm_quant", [&] { pf_norm_quant(hp.x, W.post_norm, T); });
                 // (profile: mixed-type fused gate / up pairs are reported as gemm_ffn_gum, pairs that run as two GEMMs +
                 // pk_glu as gemm_ffn_gu2)
                 pf_time(glu_fused(W.fg, W.fu) ? "gemm_ffn_gu" : glu_mix_on && glu_mix(W.fg, W.fu, 0) ? "gemm_ffn_gum" : "gemm_ffn_gu2",
@@ -7734,7 +7831,7 @@ struct MKEngine::Impl {
             wd_mode = MODE_PREFILL;
             wait_device("a prefill chunk", std::max(wd_limit, 120.0));
             if (pred || sink) {
-                pk_norm_quant<<<T, 256>>>(hp.x, hw.onorm);
+                pf_norm_quant(hp.x, hw.onorm, T);
                 std::vector<float> rows;
                 const int tile = std::min(128, cap * FF / VOCAB); // logits rows that fit in y0
                 for (int s = 0; s < T; s += tile) {
@@ -7774,7 +7871,7 @@ struct MKEngine::Impl {
                 pk_mtp_in<<<T, 256>>>();
                 gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
                 const LayerW & M = hw.L[NL];
-                pk_norm_quant<<<T, 256>>>(hp.xm, M.attn_norm);
+                pf_norm_quant(hp.xm, M.attn_norm, T);
                 gemm(M.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
                 gemm(M.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
                 if (rsnap) CK(cudaStreamWaitEvent(0, rs_ev[N_ATT_SLOTS - 1], 0));
@@ -8010,7 +8107,8 @@ struct MKEngine::Impl {
         // environment: every MK_* setting except those that only change decode, logging, timing or the load path
         static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
                                             "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
-                                            "MK_K1=", "MK_K2=", "MK_GSB"}; // (stockfix switches: decode only)
+                                            "MK_K1=", "MK_K2=", "MK_GSB", // (stockfix switches: decode only)
+                                            "MK_K6="};                    // (stock2 K6: decode only; MK_K8 = prefill: kept)
         std::vector<std::string> env;
         for (char ** e = environ; *e; e++) {
             if (strncmp(*e, "MK_", 3)) continue;

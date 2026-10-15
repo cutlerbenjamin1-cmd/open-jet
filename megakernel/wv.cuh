@@ -171,8 +171,23 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
         const uint8_t * rp = wv_tblk(m, tile, row, sb, 256);
         r.d = ldw4(wv_tmeta(m, tile, row, sb, 16));
+#if MK_K6_LD
+        // (stock2 K6_LD) q[k] = the 8 bytes at 32 (2 kk + (tq >> 1)) + 16 kb + 8 (tq & 1), k = 2 kk + kb. The lane pair tq = 2 h,
+        // 2 h + 1 shares the 32-B sector 2 kk + h: the even lane loads its bytes 0-15 (its kb 0 | the odd lane's kb 0), the odd
+        // lane 16-31 (the even lane's kb 1 | its kb 1); one exchange of 8 bytes completes both: whole sectors, half the loads.
+        const bool odd = tq & 1;
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            const int4 v = ldw4(rp + 32 * (2 * kk + (tq >> 1)) + 16 * (tq & 1));
+            const int s0 = __shfl_xor_sync(0xffffffffu, odd ? v.x : v.z, 1);
+            const int s1 = __shfl_xor_sync(0xffffffffu, odd ? v.y : v.w, 1);
+            r.q[2 * kk] = odd ? make_int2(s0, s1) : make_int2(v.x, v.y);
+            r.q[2 * kk + 1] = odd ? make_int2(v.z, v.w) : make_int2(s0, s1);
+        }
+#else
 #pragma unroll
         for (int k = 0; k < 8; k++) r.q[k] = ldw2(rp + 32 * (2 * (k >> 1) + (tq >> 1)) + 16 * (k & 1) + 8 * (tq & 1));
+#endif
     }
     static __device__ __forceinline__ void scales(const Raw & r, Sc & s) { s.d = r.d; }
     static __device__ __forceinline__ void wsc(const Sc & s, int k, float & fA, float & gA) {
@@ -950,6 +965,61 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
 }
 
+// the activations of xs from super-block sb on (a K-split part's tile reads its chunk-local super-blocks from 0)
+template <int T, bool X16>
+__device__ __forceinline__ WvXS wv_xs_at(const WvXS & xs, int sb) {
+    constexpr int NG = WvCfg<T, X16>::NG;
+    WvXS r = xs;
+    r.xa += 128 * sb;
+    r.xb += 128 * sb;
+    r.md += 8 * sb * NG * 4;
+    r.mx += 8 * sb * NG * 4;
+#if MK_WV_Q6F
+    r.mx4 += 8 * sb * NG * 4;
+#endif
+    return r;
+}
+
+// stock2 K6 (MK_K6 bit 1): part `part` of `ns` of k / v tile lt (w = 1 k, 2 v): super-blocks [NSB part / ns, NSB (part + 1) / ns).
+// The part's sums go to cB.wvpart (free in this phase: resid_wv uses it within its own phases) at [part][t][(w - 1) KVD + row];
+// the last of the ns arrivals at the tile (counter cB.wvcnt[(w - 1) 64 + lt], role 0's, idle here; reset to 0 by that
+// arrival) adds the parts in order 0 .. ns - 1 and stores (sum) * s_rs[t], as wv_store does for an unsplit tile. The split
+// depends only on the matrix type, never on T: every output is the same function of its row and token at every T.
+template <int T>
+__device__ __noinline__ void attn_kv_part(const Mat m, int w, int lt, int part, int ns, const WvXS xs) {
+    static_assert(MK_K6_S >= 1 && MK_K6_S <= WV_S && 2 * KVD <= D && 2 * (KVD / 16) <= D / 32, "K6 scratch: wvpart / wvcnt role 0");
+    constexpr int NSB = D / 256;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    const int sb0 = NSB * part / ns, sb1 = NSB * (part + 1) / ns;
+    const WvAcc<1> a = wv_tile_any<T, false>(m, lt, sb0, sb1 - sb0, wv_xs_at<T, false>(xs, sb0));
+    float * const pb = cB.wvpart + (w - 1) * KVD;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int t = 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
+        if (t < T) __stcg(pb + ((size_t) part * MAXT + t) * D + r, a.v[0][c]);
+    }
+    __threadfence();
+    __syncwarp();
+    unsigned * const cnt = cB.wvcnt + (w - 1) * (KVD / 16) + lt;
+    unsigned old = 0;
+    if (lane == 0) old = atomicAdd(cnt, 1u);
+    old = __shfl_sync(0xffffffffu, old, 0);
+    if (old != (unsigned) ns - 1) return;
+    __threadfence();
+    const float * s_rs = misc(nullptr);
+    float * const dst = w == 1 ? cB.kbuf : cB.vbuf;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int t = 2 * tq + (c & 1), r = 16 * lt + g + 8 * (c >> 1);
+        if (t < T) {
+            float s = __ldcg(pb + (size_t) t * D + r);
+            for (int p = 1; p < ns; p++) s += __ldcg(pb + ((size_t) p * MAXT + t) * D + r);
+            dst[t * KVD + r] = s * s_rs[t];
+        }
+    }
+    if (lane == 0) *cnt = 0;
+}
+
 // attention q / k / v projections (wv tiles of the wv-layout matrices, dp4a pairs of the hybrid's)
 template <int T>
 __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
@@ -970,11 +1040,31 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
         lo += KVD / 2;
     }
     if (!W.v.fm) gemv_pairs_dp<T, 5>(W.v, lo, lo + KVD / 2, PairOut{cB.vbuf, KVD, -1});
-    const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, ntile = nq + nk + (W.v.fm ? KVD / 16 : 0);
-    const int t0 = ntile * blockIdx.x / gridDim.x, t1 = ntile * (blockIdx.x + 1) / gridDim.x;
-    for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
-        const int w = tile < nq ? 0 : tile < nq + nk ? 1 : 2;
-        const int lt = tile - (w == 0 ? 0 : w == 1 ? nq : nq + nk);
+    const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
+    // stock2 K6: items = the q tiles, then the k tiles, then the v tiles; with bit 1 a Q8_0 k / v tile (87 KB vs 56 KB for a
+    // Q5_K q tile: the phase's tail in the 10 Q8_0-v layers) is MK_K6_S items (K parts, attn_kv_part). Dealing: contiguous
+    // runs per block (upstream), or with bit 2 item i -> block i % G (the heavy k / v items spread over the blocks)
+    const int k6 = cB.k6;
+    const int sk = (k6 & 1) && W.k.type == T_Q8_0 ? MK_K6_S : 1, sv = (k6 & 1) && W.v.type == T_Q8_0 ? MK_K6_S : 1;
+    const int nkk = nk * sk, ni = nq + nkk + nv * sv;
+    int i0, i1, istep;
+    if (k6 & 2) {
+        i0 = blockIdx.x + gridDim.x * (NW - 1 - warp);
+        i1 = ni;
+        istep = gridDim.x * NW;
+    } else {
+        i0 = ni * blockIdx.x / gridDim.x + (NW - 1 - warp);
+        i1 = ni * (blockIdx.x + 1) / gridDim.x;
+        istep = NW;
+    }
+    for (int it = i0; it < i1; it += istep) {
+        const int w = it < nq ? 0 : it < nq + nkk ? 1 : 2;
+        const int j = it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
+        const int lt = j / ns;
+        if (ns > 1) {
+            attn_kv_part<T>(w == 1 ? W.k : W.v, w, lt, j - lt * ns, ns, xs);
+            continue;
+        }
         const WvAcc<1> a = wv_tile_any<T, false>(w == 0 ? W.q : w == 1 ? W.k : W.v, lt, 0, D / 256, xs);
         wv_store<T>(w == 0 ? cB.qbuf : w == 1 ? cB.kbuf : cB.vbuf, w == 0 ? QG : KVD, lt, a, s_rs);
     }
