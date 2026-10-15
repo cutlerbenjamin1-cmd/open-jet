@@ -925,13 +925,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     // Warm L2 with what dn_core will read (as dn_proj)
     if (blockIdx.x < NVH) {
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
-#if MK_DN_SHADOW_K
-        const bool sh = s_k3[0] & 1; // K3: dn_core starts from the shadow, no replay
-        if (sh) dn_c = n;
-        pf_l2((sh ? cB.dshadow : cB.dstate) + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
-#else
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
-#endif
         if (tid == 0) {
             pf_l2(W.dt + (h & ~31));
             pf_l2(W.A + (h & ~31));

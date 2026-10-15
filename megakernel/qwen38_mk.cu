@@ -114,11 +114,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
 #endif
-// MK_DN_SHADOW_K (stockfix K3, default 0): compile the DeltaNet shadow state (replay skip after a fully accepted cycle; env
-// MK_DN_SHADOW=1 allocates it, +144 MiB). Compile-time because its code in dn_core cost 2-3 us per call even when off.
-#ifndef MK_DN_SHADOW_K
-#define MK_DN_SHADOW_K 0
-#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -280,11 +275,7 @@ struct Ctl {
     float dchain;
     int nd_prod, nd_stop;
     int dsmp; // the drafts in tok[1..] were sampled from q' (cB.dq; speculative sampling with sampled drafts)
-    // stockfix K3 (MK_DN_SHADOW=1): > 0 = the DeltaNet shadow state (Bufs::dshadow) holds the state of positions < dn_s
-    // (written by the last decode launch, which accepted every draft); 0 = no valid shadow. The device sets it in
-    // main_control; every host write of the ctl clears it (the shadow is not part of checkpoints, state files or digests).
-    int dn_s;
-    int pad[3];
+    int pad[4];
 };
 
 struct Bufs {
@@ -342,8 +333,6 @@ struct Bufs {
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
 #endif
     // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
-    float * dshadow; // K3, MK_DN_SHADOW=1: a second DeltaNet state [48][NVH][128][128] (+144 MiB), the state after a decode
-                     // launch's last real row; nullptr (default): not allocated, decode as before
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
 };
@@ -445,10 +434,6 @@ __device__ __forceinline__ unsigned long long gtimer() {
 }
 
 __shared__ unsigned s_bar_k; // index of the last grid barrier passed (profiling only)
-// stockfix K3 (MK_DN_SHADOW), set by main_forward (thread 0, before the embed barrier) and read by dn_proj / dn_core, so no
-// register carries it through the layer loop: [0] bit 0 = start from the shadow (dn_c := n, no replay), bit 1 = store the
-// shadow; [1] = the row (event - np) after which dn_core stores it (the launch's last real row), else 1 << 20
-__shared__ int s_k3[2];
 extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the persistent block
 
 // Grid barrier, thread 0 of each block (epoch: the arrival count that completes this generation, already advanced).
@@ -1593,13 +1578,7 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
-#if MK_DN_SHADOW_K
-        const bool sh = s_k3[0] & 1; // K3: dn_core starts from the shadow, no replay
-        if (sh) dn_c = n;
-        pf_l2((sh ? cB.dshadow : cB.dstate) + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
-#else
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
-#endif
         if (tid == 0) {
             pf_l2(W.dt + (h & ~31));
             pf_l2(W.A + (h & ~31));
@@ -1626,17 +1605,9 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
-// K3 (MK_DN_SHADOW, stockfix; s_k3): s_k3[0] bit 0 = start from the shadow state with dn_c := n (no replay); s_k3[1] = the
-// row after which the state is also stored to the shadow (the launch's last real row: P.T - 1 in a padded wide pass). The
-// committed state (event np + n_commit - 1) is stored as before; a launch that accepts every draft leaves the shadow equal
-// to what the next launch's replay would compute (same events, same code), so the next launch starts from it.
 template <int T>
 __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
-#if MK_DN_SHADOW_K
-    const bool sh_in = s_k3[0] & 1;
-    if (sh_in) dn_c = n;
-#endif
     const int h = blockIdx.x;
     if (h >= NVH) return;
     const int kh = h % NKH;
@@ -1654,22 +1625,9 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * s_raw = s_gb + 32;                   // [T][384] conv outputs (silu), 16-byte aligned
 
     float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r;
-    // K3: the head's shadow region (Sg - 32 tid + the buffers' constant distance: no extra live register) in a coalesced
-    // layout: S[i] of thread (warp, lane) at float4 (8 warp + i) 32 + lane, so a warp's store / load of S[i] is 512 contiguous
-    // bytes (the dstate layout, 16 B per lane at a 128 B stride, is shared with pk_dn_scan and stays; the shadow is dn_core's)
-    // (MK_DN_SHADOW_K=0, default: none of this is compiled; dn_core is upstream's)
     float4 S[8];
-#if MK_DN_SHADOW_K
-#define K3_SH() (reinterpret_cast<float4 *>(cB.dshadow + ((Sg - cB.dstate) - 32 * tid)) + warp * 256 + lane)
-    if (sh_in) {
 #pragma unroll
-        for (int i = 0; i < 8; i++) S[i] = __ldcg(K3_SH() + 32 * i);
-    } else
-#endif
-    {
-#pragma unroll
-        for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
-    }
+    for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
 
     const int np = n - dn_c; // replayed (accepted, not yet committed) tokens
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
@@ -1777,13 +1735,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
 #pragma unroll
             for (int i = 0; i < 8; i++) reinterpret_cast<float4 *>(Sg)[i] = S[i];
         }
-#if MK_DN_SHADOW_K
-        if (e - np == *static_cast<volatile int *>(&s_k3[1])) { // (volatile: re-read, not a loop-long register)
-#pragma unroll
-            for (int i = 0; i < 8; i++) K3_SH()[32 * i] = S[i];
-        }
-#undef K3_SH
-#endif
     }
     __syncthreads();
 
@@ -4317,13 +4268,9 @@ __device__ void main_control(int mode, int last, int T, const int * tgt, bool pe
         c->n_acc = a;
         bonus = tgt[a];
         c->dn_c = n + 1;
-        // K3: every draft accepted -> the shadow (stored after row T - 1 of this launch) is the state of positions < n + T,
-        // the next launch's n (P below)
-        c->dn_s = (cB.dshadow && T > 1 && a == T - 1) ? n + T : 0;
     } else {
         a = T - 1;
         c->dn_c = n + T;
-        c->dn_s = 0;
         c->n_acc = 0;
         if (last) {
             bonus = tgt[0];
@@ -4362,29 +4309,6 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     const int n = vc->n;
     const int dn_c = vc->dn_c;
     const int n_commit = P.mode == MODE_DECODE ? 1 : T;
-    // K3 (MK_DN_SHADOW): s_k3[0] bit 0: the previous decode launch accepted every draft and left the state of positions < n
-    // in the shadow: dn_core starts from it, no replay; bit 1 / s_k3[1]: store this launch's state after its last real row
-    // to the shadow (decode launches of more than one row). Visible to the block after the embed barrier.
-#if MK_DN_SHADOW_K // (compile-time opt-in: the code costs dn_core 2-3 us per call even when off)
-    if (threadIdx.x == 0) {
-        int f = 0, er = 1 << 20;
-        if (cB.dshadow && P.mode == MODE_DECODE) {
-#if MK_MAXT > 5
-            const int tr = T == MAXT ? P.T : T; // (Tr below)
-#else
-            constexpr int tr = T;
-#endif
-            if (vc->dn_s == n && n > dn_c) f = 1;
-            if (tr > 1) {
-                f |= 2;
-                er = tr - 1;
-            }
-        }
-        s_k3[0] = f;
-        s_k3[1] = er;
-    }
-
-#endif
     embed_prologue<T>();
     gsync(epoch, PH_EMBED);
     int dl = 0;
@@ -4756,13 +4680,6 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
             }
             return;
         }
-#if MK_DN_SHADOW_K
-        if (threadIdx.x == 0) { // (dn_proj reads the K3 flags)
-            s_k3[0] = 0;
-            s_k3[1] = 1 << 20;
-        }
-        __syncthreads();
-#endif
         switch (P.T) {
             case 1: bench_phase<1>(P.last, P.ndraft, sm, epoch); break;
             case 4: bench_phase<4>(P.last, P.ndraft, sm, epoch); break;
@@ -5603,7 +5520,6 @@ struct MKEngine::Impl {
         const CkSlot & s = ck[si];
         hctl = s.ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, s.pos);
-        hctl.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         seq.resize(s.pos);
         for (auto & o : ck) // later checkpoints belong to the abandoned continuation
@@ -6684,21 +6600,10 @@ struct MKEngine::Impl {
         mem_mark("decode act bufs, conv, kvgb");
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
         mem_mark("GDN recurrent state");
-        // stockfix switches (bit-exact; notes/agent_stockfix.md): K1 MK_K1 (default on), K2 MK_K2 (default on), K3
-        // MK_DN_SHADOW=1 (default off: +144 MiB for the shadow DeltaNet state; skips the replay after a fully accepted cycle)
+        // stockfix switches (bit-exact; notes/agent_stockfix.md): K1 MK_K1, K2 MK_K2 (both default on)
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
-        hb.dshadow = nullptr;
-        if (getenv("MK_DN_SHADOW") && atoi(getenv("MK_DN_SHADOW")) == 1) {
-#if MK_DN_SHADOW_K
-            hb.dshadow = dalloc<float>((size_t) 48 * NVH * 128 * 128);
-            mem_mark("GDN shadow state (MK_DN_SHADOW)");
-#else
-            fprintf(stderr, "[mk] MK_DN_SHADOW=1 ignored: this build has no shadow state (build with -DMK_DN_SHADOW_K=1)\n");
-#endif
-        }
-        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), K3 shadow %d, gsync form %d\n", hb.k1, hb.k2, MK_K2_TB,
-                hb.dshadow != nullptr, MK_GSYNC);
+        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
@@ -8105,7 +8010,7 @@ struct MKEngine::Impl {
         // environment: every MK_* setting except those that only change decode, logging, timing or the load path
         static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
                                             "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
-                                            "MK_K1=", "MK_K2=", "MK_DN_SHADOW=", "MK_GSB"}; // (stockfix switches: decode only)
+                                            "MK_K1=", "MK_K2=", "MK_GSB"}; // (stockfix switches: decode only)
         std::vector<std::string> env;
         for (char ** e = environ; *e; e++) {
             if (strncmp(*e, "MK_", 3)) continue;
@@ -8259,7 +8164,6 @@ struct MKEngine::Impl {
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
-        hctl.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         CK(cudaMemset(hb.cnt, 0, 16));
     }
@@ -8430,7 +8334,6 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr);
                 c.dn_c = ck_exact;
                 c.mtp_valid = c.dn_c;
-                c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
                 CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
                 const int si = p_->ck_assign({ck_exact}, ck_exact, (int) seq.size())[0];
                 if (si >= 0) p_->ck_save_end(si);
@@ -8472,7 +8375,6 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         const bool last = i + T == feed.size();
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
-        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->ndraft = p_->depth_top(c.n);
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
@@ -8549,7 +8451,6 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
         const int T = att_cap_T((int) i, (int) std::min<size_t>(MAXT_PF, tokens.size() - i));
         c.n = (int) i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
-        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->launch(MODE_PREFILL, T, 0, 1);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
@@ -8580,7 +8481,6 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 #endif
         c.n = i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
-        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->launch(MODE_PREFILL, T, 0, 2);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
