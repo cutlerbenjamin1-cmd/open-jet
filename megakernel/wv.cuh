@@ -847,7 +847,22 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     const float * s_rs = misc(nullptr);
     float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int n_ab = AB_SPLIT * 2 * NVH;
-    for (int it = gwarp(); it < n_ab; it += nwarps()) {
+    // alpha / beta items. Upstream's dealing (gwarp: warps 0-3 (+ 4) of every block) put them on warps that also take a
+    // qkv / z tile below (tiles start at warp NW - 1 going down): those warps finished ~10 us after the others (stockfix K1).
+    // K1 (cB.k1, every matrix of the phase in the wv layout): block b takes the items [n_ab b / G, n_ab (b + 1) / G) and
+    // deals them round-robin to its warps with one tile fewer than the others (warps 0 .. NW - 1 - nb % NW, nb = the block's
+    // tiles: at 82 blocks the 3-4 warps without a tile, <= 2 items each). Each item computes the same row / K-chunk as
+    // before: bit-exact.
+    int ab0 = gwarp(), ab1 = n_ab, astep = nwarps();
+    if (cB.k1 && W.qkv.fm && W.gate.fm) {
+        constexpr int NTL = QKV / 16 + VD / 16; // (the tile space below when both are FM)
+        const int nb = NTL * (blockIdx.x + 1) / gridDim.x - NTL * blockIdx.x / gridDim.x;
+        const int nl = NW - nb % NW; // warps 0 .. nl - 1 carry nb / NW tiles, the others one more
+        ab1 = n_ab * (blockIdx.x + 1) / gridDim.x;
+        ab0 = warp < nl ? n_ab * blockIdx.x / gridDim.x + warp : ab1;
+        astep = nl;
+    }
+    for (int it = ab0; it < ab1; it += astep) {
         const int row = it % (2 * NVH), ch = it / (2 * NVH);
         float acc[T];
 #pragma unroll
@@ -910,7 +925,13 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     // Warm L2 with what dn_core will read (as dn_proj)
     if (blockIdx.x < NVH) {
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
+#if MK_DN_SHADOW_K
+        const bool sh = s_k3[0] & 1; // K3: dn_core starts from the shadow, no replay
+        if (sh) dn_c = n;
+        pf_l2((sh ? cB.dshadow : cB.dstate) + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
+#else
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
+#endif
         if (tid == 0) {
             pf_l2(W.dt + (h & ~31));
             pf_l2(W.A + (h & ~31));
@@ -1103,14 +1124,44 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
         if (old == 2 * WV_S - 1) { // last arrival at this 32-row group
             __threadfence();
             const int j = tile >> 1, row = 32 * j + lane;
-#pragma unroll 1
-            for (int t = 0; t < T; t++) {
-                float s = __ldcg(cB.wvpart + (size_t) t * D + row);
+            if (cB.k2) {
+                // K2 (stockfix): the loop below made one dependent L2 round trip (+ q32_store's shuffle chains) per token,
+                // serially. Here a batch of TB tokens issues all its partial / residual loads first, then runs the tokens'
+                // epilogues (independent: their shuffle chains interleave). Same per-element order (((p0 + p1) + p2) + p3)
+                // + x: bit-exact.
+                constexpr int TB = MK_K2_TB < T ? MK_K2_TB : T;
+                const float wn = wnext[row];
+#pragma unroll // (T, TB compile-time: no runtime guards; x stores keep the batches apart)
+                for (int tb = 0; tb < T; tb += TB) {
+                    float p[TB][WV_S], xo[TB];
 #pragma unroll
-                for (int k = 1; k < WV_S; k++) s += __ldcg(cB.wvpart + ((size_t) k * MAXT + t) * D + row);
-                const float xv = s + __ldcg(x + t * D + row);
-                x[t * D + row] = xv;
-                q32_store(cB.qn, t, j, xv * wnext[row], xv * xv, true);
+                    for (int u = 0; u < TB; u++)
+                        if (tb + u < T) {
+#pragma unroll
+                            for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * MAXT + tb + u) * D + row);
+                            xo[u] = __ldcg(x + (tb + u) * D + row);
+                        }
+#pragma unroll
+                    for (int u = 0; u < TB; u++)
+                        if (tb + u < T) {
+                            float s = p[u][0];
+#pragma unroll
+                            for (int k = 1; k < WV_S; k++) s += p[u][k];
+                            const float xv = s + xo[u];
+                            x[(tb + u) * D + row] = xv;
+                            q32_store(cB.qn, tb + u, j, xv * wn, xv * xv, true);
+                        }
+                }
+            } else {
+#pragma unroll 1
+                for (int t = 0; t < T; t++) {
+                    float s = __ldcg(cB.wvpart + (size_t) t * D + row);
+#pragma unroll
+                    for (int k = 1; k < WV_S; k++) s += __ldcg(cB.wvpart + ((size_t) k * MAXT + t) * D + row);
+                    const float xv = s + __ldcg(x + t * D + row);
+                    x[t * D + row] = xv;
+                    q32_store(cB.qn, t, j, xv * wnext[row], xv * xv, true);
+                }
             }
             if (lane == 0) cnt[j] = 0;
         }

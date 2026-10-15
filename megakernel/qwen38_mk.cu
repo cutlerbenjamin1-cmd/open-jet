@@ -100,6 +100,25 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_WV_Q6F && MK_MAXT <= 5
 #error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
 #endif
+// MK_GSYNC (stockfix K4): the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
+// and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
+// the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
+// it with ld.acquire once it is reached). 2: flag broadcast, ld.acquire polling. 3: upstream's arrival, relaxed polling.
+// All forms keep release / acquire semantics between every block's writes before and every block's reads after the barrier.
+// The gsync bench (MK_GSB, bench mode) runs every form in any build.
+#ifndef MK_GSYNC
+#define MK_GSYNC 0
+#endif
+// MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
+// by 0.5-0.8 us per call at 38k, no new spills)
+#ifndef MK_K2_TB
+#define MK_K2_TB 8
+#endif
+// MK_DN_SHADOW_K (stockfix K3, default 0): compile the DeltaNet shadow state (replay skip after a fully accepted cycle; env
+// MK_DN_SHADOW=1 allocates it, +144 MiB). Compile-time because its code in dn_core cost 2-3 us per call even when off.
+#ifndef MK_DN_SHADOW_K
+#define MK_DN_SHADOW_K 0
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
@@ -261,7 +280,11 @@ struct Ctl {
     float dchain;
     int nd_prod, nd_stop;
     int dsmp; // the drafts in tok[1..] were sampled from q' (cB.dq; speculative sampling with sampled drafts)
-    int pad[4];
+    // stockfix K3 (MK_DN_SHADOW=1): > 0 = the DeltaNet shadow state (Bufs::dshadow) holds the state of positions < dn_s
+    // (written by the last decode launch, which accepted every draft); 0 = no valid shadow. The device sets it in
+    // main_control; every host write of the ctl clears it (the shadow is not part of checkpoints, state files or digests).
+    int dn_s;
+    int pad[3];
 };
 
 struct Bufs {
@@ -318,6 +341,11 @@ struct Bufs {
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
 #endif
+    // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
+    float * dshadow; // K3, MK_DN_SHADOW=1: a second DeltaNet state [48][NVH][128][128] (+144 MiB), the state after a decode
+                     // launch's last real row; nullptr (default): not allocated, decode as before
+    int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
+    int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
 };
 
 __constant__ ModelW cW;
@@ -417,9 +445,52 @@ __device__ __forceinline__ unsigned long long gtimer() {
 }
 
 __shared__ unsigned s_bar_k; // index of the last grid barrier passed (profiling only)
+// stockfix K3 (MK_DN_SHADOW), set by main_forward (thread 0, before the embed barrier) and read by dn_proj / dn_core, so no
+// register carries it through the layer loop: [0] bit 0 = start from the shadow (dn_c := n, no replay), bit 1 = store the
+// shadow; [1] = the row (event - np) after which dn_core stores it (the launch's last real row), else 1 << 20
+__shared__ int s_k3[2];
 extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the persistent block
 
-// Grid barrier: release-add on arrival, acquire-poll until every block of this generation arrived.
+// Grid barrier, thread 0 of each block (epoch: the arrival count that completes this generation, already advanced).
+// Form V (MK_GSYNC): 0 = release-add on arrival, acquire-poll the same word until every block of this generation arrived;
+// 1 / 2 = flag broadcast: acq_rel-add the count word, the last arriver release-writes the generation to the go word (its
+// own 128-byte line, cB.bar + GS_GO) and the others poll only go (1: relaxed polls, then one acquire re-read; 2: acquire
+// polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Both words start at 0 every launch.
+constexpr int GS_GO = 32;
+template <int V>
+__device__ __forceinline__ void gs_arrive_wait(unsigned epoch) {
+    unsigned v;
+    if constexpr (V == 0 || V == 3) {
+        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(cB.bar) : "memory");
+        if constexpr (V == 0) {
+            do {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
+            } while (v < epoch);
+        } else {
+            do {
+                asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
+            } while (v < epoch);
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
+        }
+    } else {
+        unsigned * const go = cB.bar + GS_GO;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(v) : "l"(cB.bar) : "memory");
+        if (v == epoch - 1) { // last arrival of this generation: every other block's writes are visible to this thread
+            asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(go), "r"(epoch) : "memory");
+        } else if constexpr (V == 2) {
+            do {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
+            } while (v < epoch);
+        } else {
+            do {
+                asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
+            } while (v < epoch);
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(go) : "memory");
+        }
+    }
+}
+
+// Grid barrier: every block's writes before it are visible to every block's reads after it.
 __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -428,11 +499,7 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
             if (k < 1024) cB.prof[4096 + k * 128 + blockIdx.x] = gtimer();
         }
         epoch += gridDim.x;
-        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(cB.bar) : "memory");
-        unsigned v;
-        do {
-            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.bar) : "memory");
-        } while (v < epoch);
+        gs_arrive_wait<MK_GSYNC>(epoch);
         if (cB.prof && blockIdx.x == 0) {
             const unsigned k = epoch / gridDim.x;
             s_bar_k = k;
@@ -1526,7 +1593,13 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
+#if MK_DN_SHADOW_K
+        const bool sh = s_k3[0] & 1; // K3: dn_core starts from the shadow, no replay
+        if (sh) dn_c = n;
+        pf_l2((sh ? cB.dshadow : cB.dstate) + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
+#else
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
+#endif
         if (tid == 0) {
             pf_l2(W.dt + (h & ~31));
             pf_l2(W.A + (h & ~31));
@@ -1553,9 +1626,17 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
+// K3 (MK_DN_SHADOW, stockfix; s_k3): s_k3[0] bit 0 = start from the shadow state with dn_c := n (no replay); s_k3[1] = the
+// row after which the state is also stored to the shadow (the launch's last real row: P.T - 1 in a padded wide pass). The
+// committed state (event np + n_commit - 1) is stored as before; a launch that accepts every draft leaves the shadow equal
+// to what the next launch's replay would compute (same events, same code), so the next launch starts from it.
 template <int T>
 __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
+#if MK_DN_SHADOW_K
+    const bool sh_in = s_k3[0] & 1;
+    if (sh_in) dn_c = n;
+#endif
     const int h = blockIdx.x;
     if (h >= NVH) return;
     const int kh = h % NKH;
@@ -1573,9 +1654,22 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * s_raw = s_gb + 32;                   // [T][384] conv outputs (silu), 16-byte aligned
 
     float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r;
+    // K3: the head's shadow region (Sg - 32 tid + the buffers' constant distance: no extra live register) in a coalesced
+    // layout: S[i] of thread (warp, lane) at float4 (8 warp + i) 32 + lane, so a warp's store / load of S[i] is 512 contiguous
+    // bytes (the dstate layout, 16 B per lane at a 128 B stride, is shared with pk_dn_scan and stays; the shadow is dn_core's)
+    // (MK_DN_SHADOW_K=0, default: none of this is compiled; dn_core is upstream's)
     float4 S[8];
+#if MK_DN_SHADOW_K
+#define K3_SH() (reinterpret_cast<float4 *>(cB.dshadow + ((Sg - cB.dstate) - 32 * tid)) + warp * 256 + lane)
+    if (sh_in) {
 #pragma unroll
-    for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
+        for (int i = 0; i < 8; i++) S[i] = __ldcg(K3_SH() + 32 * i);
+    } else
+#endif
+    {
+#pragma unroll
+        for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
+    }
 
     const int np = n - dn_c; // replayed (accepted, not yet committed) tokens
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
@@ -1683,6 +1777,13 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
 #pragma unroll
             for (int i = 0; i < 8; i++) reinterpret_cast<float4 *>(Sg)[i] = S[i];
         }
+#if MK_DN_SHADOW_K
+        if (e - np == *static_cast<volatile int *>(&s_k3[1])) { // (volatile: re-read, not a loop-long register)
+#pragma unroll
+            for (int i = 0; i < 8; i++) K3_SH()[32 * i] = S[i];
+        }
+#undef K3_SH
+#endif
     }
     __syncthreads();
 
@@ -4216,9 +4317,13 @@ __device__ void main_control(int mode, int last, int T, const int * tgt, bool pe
         c->n_acc = a;
         bonus = tgt[a];
         c->dn_c = n + 1;
+        // K3: every draft accepted -> the shadow (stored after row T - 1 of this launch) is the state of positions < n + T,
+        // the next launch's n (P below)
+        c->dn_s = (cB.dshadow && T > 1 && a == T - 1) ? n + T : 0;
     } else {
         a = T - 1;
         c->dn_c = n + T;
+        c->dn_s = 0;
         c->n_acc = 0;
         if (last) {
             bonus = tgt[0];
@@ -4257,7 +4362,29 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     const int n = vc->n;
     const int dn_c = vc->dn_c;
     const int n_commit = P.mode == MODE_DECODE ? 1 : T;
+    // K3 (MK_DN_SHADOW): s_k3[0] bit 0: the previous decode launch accepted every draft and left the state of positions < n
+    // in the shadow: dn_core starts from it, no replay; bit 1 / s_k3[1]: store this launch's state after its last real row
+    // to the shadow (decode launches of more than one row). Visible to the block after the embed barrier.
+#if MK_DN_SHADOW_K // (compile-time opt-in: the code costs dn_core 2-3 us per call even when off)
+    if (threadIdx.x == 0) {
+        int f = 0, er = 1 << 20;
+        if (cB.dshadow && P.mode == MODE_DECODE) {
+#if MK_MAXT > 5
+            const int tr = T == MAXT ? P.T : T; // (Tr below)
+#else
+            constexpr int tr = T;
+#endif
+            if (vc->dn_s == n && n > dn_c) f = 1;
+            if (tr > 1) {
+                f |= 2;
+                er = tr - 1;
+            }
+        }
+        s_k3[0] = f;
+        s_k3[1] = er;
+    }
 
+#endif
     embed_prologue<T>();
     gsync(epoch, PH_EMBED);
     int dl = 0;
@@ -4602,10 +4729,40 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
     }
 }
 
+// K4 (stockfix): n grid barriers of form V (gs_arrive_wait) with no work in between (bench mode, MK_GSB)
+template <int V>
+__device__ __noinline__ void gsync_bench(int n) {
+    unsigned epoch = 0;
+    for (int i = 0; i < n; i++) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            epoch += gridDim.x;
+            gs_arrive_wait<V>(epoch);
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     uint8_t * const sm = smem;
     unsigned epoch = 0;
     if (P.mode == MODE_BENCH) {
+        if (P.last == 3) { // gsync bench: P.ndraft barriers of form P.score
+            switch (P.score) {
+                case 1: gsync_bench<1>(P.ndraft); break;
+                case 2: gsync_bench<2>(P.ndraft); break;
+                case 3: gsync_bench<3>(P.ndraft); break;
+                default: gsync_bench<0>(P.ndraft); break;
+            }
+            return;
+        }
+#if MK_DN_SHADOW_K
+        if (threadIdx.x == 0) { // (dn_proj reads the K3 flags)
+            s_k3[0] = 0;
+            s_k3[1] = 1 << 20;
+        }
+        __syncthreads();
+#endif
         switch (P.T) {
             case 1: bench_phase<1>(P.last, P.ndraft, sm, epoch); break;
             case 4: bench_phase<4>(P.last, P.ndraft, sm, epoch); break;
@@ -5446,6 +5603,7 @@ struct MKEngine::Impl {
         const CkSlot & s = ck[si];
         hctl = s.ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, s.pos);
+        hctl.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         seq.resize(s.pos);
         for (auto & o : ck) // later checkpoints belong to the abandoned continuation
@@ -6526,6 +6684,21 @@ struct MKEngine::Impl {
         mem_mark("decode act bufs, conv, kvgb");
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
         mem_mark("GDN recurrent state");
+        // stockfix switches (bit-exact; notes/agent_stockfix.md): K1 MK_K1 (default on), K2 MK_K2 (default on), K3
+        // MK_DN_SHADOW=1 (default off: +144 MiB for the shadow DeltaNet state; skips the replay after a fully accepted cycle)
+        hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
+        hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
+        hb.dshadow = nullptr;
+        if (getenv("MK_DN_SHADOW") && atoi(getenv("MK_DN_SHADOW")) == 1) {
+#if MK_DN_SHADOW_K
+            hb.dshadow = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+            mem_mark("GDN shadow state (MK_DN_SHADOW)");
+#else
+            fprintf(stderr, "[mk] MK_DN_SHADOW=1 ignored: this build has no shadow state (build with -DMK_DN_SHADOW_K=1)\n");
+#endif
+        }
+        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), K3 shadow %d, gsync form %d\n", hb.k1, hb.k2, MK_K2_TB,
+                hb.dshadow != nullptr, MK_GSYNC);
         {
             const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
@@ -6672,7 +6845,7 @@ struct MKEngine::Impl {
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
         hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
-        hb.bar = dalloc<unsigned>(4);
+        hb.bar = dalloc<unsigned>(2 * GS_GO); // count word | go word (gsync form 1 / 2, the gsync bench) on its own line
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
         hb.ctx = ctx;
@@ -6880,7 +7053,7 @@ struct MKEngine::Impl {
         ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
         ck_guard_state();
         ring_snap_guard();
-        CK(cudaMemsetAsync(hb.bar, 0, 16));
+        CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
         wd_T = T;
@@ -6972,7 +7145,58 @@ struct MKEngine::Impl {
         }
     }
 
+    // K4 (stockfix): grid barrier cost. MK_GSB=N: launches of N barriers with no work (and of 0 barriers: the launch cost) for
+    // every gsync form (gs_arrive_wait) at nsm and nsm / 2 blocks, round-robin over the configurations so clock drift hits
+    // them alike; per barrier = (median t(N) - median t(0)) / N. MK_GSB_REPS (default 15) rounds; 1.5 s GPU warm-up first.
+    void gsync_bench_host(int N) {
+        const int reps = getenv("MK_GSB_REPS") ? std::max(3, atoi(getenv("MK_GSB_REPS"))) : 15;
+        st_warm<<<nsm * 4, 256>>>((unsigned long long) 1500 * 1000000ull);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        const int nbs[2] = {nsm, nsm / 2};
+        std::vector<float> t[2][4][2]; // [blocks][form][N or 0] ms
+        cudaEvent_t a, b;
+        CK(cudaEventCreate(&a));
+        CK(cudaEventCreate(&b));
+        for (int r = 0; r < reps; r++)
+            for (int bi = 0; bi < 2; bi++)
+                for (int f = 0; f < 4; f++)
+                    for (int z = 0; z < 2; z++) {
+                        Launch L{MODE_BENCH, 1, 3, z ? 0 : N, f};
+                        void * args[] = {&L};
+                        CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
+                        CK(cudaEventRecord(a));
+                        CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nbs[bi]), dim3(NT), args, SM_TOTAL, 0));
+                        CK(cudaEventRecord(b));
+                        CK(cudaEventSynchronize(b));
+                        float ms = 0.f;
+                        CK(cudaEventElapsedTime(&ms, a, b));
+                        t[bi][f][z].push_back(ms);
+                    }
+        CK(cudaEventDestroy(a));
+        CK(cudaEventDestroy(b));
+        auto med = [](std::vector<float> v) {
+            std::sort(v.begin(), v.end());
+            return (double) v[v.size() / 2];
+        };
+        static const char * fn[4] = {"0 upstream (red.release, acquire polls)", "1 flag broadcast, relaxed polls",
+                                     "2 flag broadcast, acquire polls", "3 upstream arrival, relaxed polls"};
+        for (int bi = 0; bi < 2; bi++)
+            for (int f = 0; f < 4; f++) {
+                const double mn = med(t[bi][f][0]), m0 = med(t[bi][f][1]);
+                const double best = *std::min_element(t[bi][f][0].begin(), t[bi][f][0].end());
+                const double b0 = *std::min_element(t[bi][f][1].begin(), t[bi][f][1].end());
+                fprintf(stderr, "[mk-gsb] blocks %2d form %s: %.3f us per barrier (median; min %.3f), N %d, launch %.1f us, %d reps\n",
+                        nbs[bi], fn[f], (mn - m0) * 1e3 / N, (best - b0) * 1e3 / N, N, m0 * 1e3, reps);
+            }
+        fprintf(stderr, "[mk-gsb] this build's gsync is form %d (MK_GSYNC)\n", MK_GSYNC);
+    }
+
     void bench() {
+        if (const char * g = getenv("MK_GSB")) {
+            gsync_bench_host(std::max(1, atoi(g)));
+            return;
+        }
         const char * names[3] = {"ffn_gu", "ffn_down", "dn_proj"};
         if (profiling) {
             // i-cache test: 4 back-to-back iterations of one phase inside one launch
@@ -6981,7 +7205,7 @@ struct MKEngine::Impl {
                 for (int rep = 0; rep < 60; rep++) {
                     Launch L{MODE_BENCH, 4, which, which == 2 ? 0 : 1, 0};
                     void * args[] = {&L};
-                    CK(cudaMemsetAsync(hb.bar, 0, 16));
+                    CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
                     CK(cudaMemsetAsync(hb.prof, 0, 4096 * 8));
                     CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
                     std::vector<unsigned long long> pr(8);
@@ -7003,7 +7227,7 @@ struct MKEngine::Impl {
                     cudaEventRecord(a);
                     Launch L{MODE_BENCH, T, which, which == 2 ? 0 : (rep % 16), 0};
                     void * args[] = {&L};
-                    CK(cudaMemsetAsync(hb.bar, 0, 16));
+                    CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
                     CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
                     cudaEventRecord(b);
                     CK(cudaEventSynchronize(b));
@@ -7880,7 +8104,8 @@ struct MKEngine::Impl {
           << " hring " << H_RING << " conv " << CONV_RING;
         // environment: every MK_* setting except those that only change decode, logging, timing or the load path
         static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
-                                            "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT"};
+                                            "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
+                                            "MK_K1=", "MK_K2=", "MK_DN_SHADOW=", "MK_GSB"}; // (stockfix switches: decode only)
         std::vector<std::string> env;
         for (char ** e = environ; *e; e++) {
             if (strncmp(*e, "MK_", 3)) continue;
@@ -8034,6 +8259,7 @@ struct MKEngine::Impl {
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
+        hctl.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         CK(cudaMemset(hb.cnt, 0, 16));
     }
@@ -8204,6 +8430,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr);
                 c.dn_c = ck_exact;
                 c.mtp_valid = c.dn_c;
+                c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
                 CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
                 const int si = p_->ck_assign({ck_exact}, ck_exact, (int) seq.size())[0];
                 if (si >= 0) p_->ck_save_end(si);
@@ -8245,6 +8472,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         const bool last = i + T == feed.size();
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
+        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->ndraft = p_->depth_top(c.n);
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
@@ -8321,6 +8549,7 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
         const int T = att_cap_T((int) i, (int) std::min<size_t>(MAXT_PF, tokens.size() - i));
         c.n = (int) i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
+        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->launch(MODE_PREFILL, T, 0, 1);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
@@ -8351,6 +8580,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 #endif
         c.n = i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
+        c.dn_s = 0; // (K3: a host write of the ctl invalidates the shadow)
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
         p_->launch(MODE_PREFILL, T, 0, 2);
         CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
