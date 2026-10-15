@@ -1,0 +1,13 @@
+[gpu_lock] waiting for the GPU lock (bash ./notes/main/final/ctx_probe.sh)
+[gpu_lock] a timing run is waiting for the GPU: yielding to it (bash ./notes/main/final/ctx_probe.sh)
+[gpu_lock] waiting for the GPU lock (bash ./notes/main/final/ctx_probe.sh)
+[gpu_lock] waiting for the GPU lock (bash ./notes/main/final/ctx_probe.sh)
+[gpu_lock] waiting for the GPU lock (bash ./notes/main/final/ctx_probe.sh)
+[gpu_lock] waiting for the GPU lock (bash ./notes/main/final/ctx_probe.sh)
+UD-Q4_K_XL ctx 262144: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 7.13 GB for 262144 positions | peak 24180 MiB | 
+UD-Q4_K_XL ctx 250000: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 6.80 GB for 250000 positions | peak 23892 MiB | 
+UD-Q4_K_XL ctx 230000: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 6.27 GB for 230000 positions | peak 23380 MiB | 
+Q4_K_M ctx 262144: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 7.13 GB for 262144 positions | peak 23828 MiB | 
+Q4_K_M ctx 250000: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 6.80 GB for 250000 positions | peak 23508 MiB | 
+Q4_K_M ctx 230000: rc 0 | [mk] KV cache q8_0 + q4 (MK_KV), 6.27 GB for 230000 positions | peak 22996 MiB | 
+PROBE_DONE 17:23:55

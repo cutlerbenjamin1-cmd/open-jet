@@ -1,0 +1,4 @@
+positions 13299 in 13 sequences
+PPL  UD-Q4_K_XL 2.8099 | plain Q4_K_M 2.8148
+mean NLL diff (UD - KM) -0.00174 nats/token, SE by sequence 0.00156 (13 seqs); per-seq UD better in 9 / 13
+top-1 agreement UD vs KM 96.1877%; KL(UD || KM) mean 0.01035 (top-256 + tail, lower bound)

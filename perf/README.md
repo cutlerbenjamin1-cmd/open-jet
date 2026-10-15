@@ -7,7 +7,8 @@ timing on the same card). One engine source, `megakernel/qwen38_mk.cu`, serves b
 unsloth's UD-Q4_K_XL.
 
 - [BUILD.md](BUILD.md): how to build and run the configuration we measure, and how to check it.
-- [RESULTS.md](RESULTS.md): the benchmark results (added when the current run finishes).
+- [RESULTS.md](RESULTS.md): the benchmark results (one session, 2026-10-14), with charts; [PR_TABLES.md](PR_TABLES.md) has
+  the same numbers as compact tables; raw data in [data/](data/).
 - [pr-drafts/](pr-drafts/SUMMARY.md): the work grouped into 7 reviewable changes, each with a description, the numbers,
   a README section and a porting map onto upstream's current two-engine layout (origin/master 4d4db90).
 - The benchmark harness is on the separate branch `bench-suite` (based on upstream master; new files only, under
