@@ -138,10 +138,11 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
 #define MK_K6_DEF 4
 #endif
-// MK_K8 (stock2 K8, prefill small kernels, exact; env bits, default MK_K8_DEF): 1 pk_ab on a second stream next to
+// MK_K8 (stock2 K8, prefill small kernels, exact; env bits, default MK_K8_DEF = 6: bit 1 is unmeasured, opt-in): 1 pk_ab on a
+// second stream next to
 // gemm_dn_in, 2 pk_norm_quant keeps x in registers (one read), 4 pk_dn_prep_t: MK_K8_NT tokens per block, conv taps read once
 #ifndef MK_K8_DEF
-#define MK_K8_DEF 7
+#define MK_K8_DEF 6
 #endif
 #ifndef MK_K8_NT
 #define MK_K8_NT 4
