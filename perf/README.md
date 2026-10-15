@@ -9,6 +9,8 @@ unsloth's UD-Q4_K_XL.
 - [BUILD.md](BUILD.md): how to build and run the configuration we measure, and how to check it.
 - [RESULTS.md](RESULTS.md): the benchmark results (one session, 2026-10-14), with charts; [PR_TABLES.md](PR_TABLES.md) has
   the same numbers as compact tables; raw data in [data/](data/).
+- [UPDATES.md](UPDATES.md): exact engine changes after that benchmark (2026-10-15: ~+3.3% decode at 38k, ~+3.8% at 101.6k),
+  with their gates and A-B-A numbers.
 - [pr-drafts/](pr-drafts/SUMMARY.md): the work grouped into 7 reviewable changes, each with a description, the numbers,
   a README section and a porting map onto upstream's current two-engine layout (origin/master 4d4db90).
 - The benchmark harness is on the separate branch `bench-suite` (based on upstream master; new files only, under
