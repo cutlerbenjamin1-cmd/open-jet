@@ -90,6 +90,30 @@ __global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const fl
     }
 }
 
+// stock2 K8b: pk_norm_quant with x read once. Thread tid reads e = tid + 256 i (i = 0 .. D / 256 - 1) in the sum of squares
+// and, as warp w = tid >> 5 / lane, writes the 32-blocks j = w + 8 i (e = 32 j + lane = the same e): the values stay in
+// registers. Same sums in the same order, same products: bit-identical to pk_norm_quant.
+__global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const float * w) {
+    __shared__ float red[8];
+    constexpr int NE = D / 256;
+    static_assert(D % 256 == 0, "pk_norm_quant1");
+    const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const float * x = src + (size_t) t * D;
+    float v[NE];
+#pragma unroll
+    for (int i = 0; i < NE; i++) v[i] = __ldg(x + threadIdx.x + 256 * i);
+    float ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < NE; i++) ss += v[i] * v[i];
+    const float rs = rsqrtf(block_sum256(ss, red) / (float) D + EPS);
+    if (threadIdx.x == 0) cP.rs[t] = rs;
+#pragma unroll
+    for (int i = 0; i < NE; i++) {
+        const int j = warp + 8 * i, e = 32 * j + lane;
+        hstore32(v[i] * rs * __ldg(w + e), cP.xh + (size_t) t * D + 32 * j);
+    }
+}
+
 // delta-net alpha / beta: ab[c][t][r] = rs[t] * sum_{k in split c} Wab[r][k] x[t][k] (attn_norm folded
 // into Wab).  Block = 64 tokens x 96 rows x one of AB_SPLITS K-splits; thread = 4 tokens x 6 rows.
 constexpr int AB_SPLITS = 8, AB_KS = D / AB_SPLITS;
@@ -197,6 +221,72 @@ __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const f
     }
 }
 
+// stock2 K8c: pk_dn_prep for NT tokens per block (t0 = NT blockIdx.x ..): each thread loads the NT + 3 conv inputs of a
+// channel once (pk_dn_prep's blocks re-read every input row 4 times through L2) and forms the NT outputs with the same
+// expressions (same products, sums and order per element): bit-identical to pk_dn_prep.
+template <int NT>
+__global__ void __launch_bounds__(256) pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt,
+                                                    const float * A) {
+    const int t0 = blockIdx.x * NT, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nt = min(NT, T - t0);
+    const float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
+    auto raw = [&](int tt, int c) -> float { // input of chunk row tt (position n0 + tt; tt < 0: the conv ring)
+        const int p = n0 + tt;
+        if (tt >= 0) return __ldg(cP.y0 + (size_t) tt * QKV + c);
+        if (p >= 0) return __ldg(ring + (size_t) (p % CONV_RING) * QKV + c);
+        return 0.f;
+    };
+    // conv outputs of channel c for rows t0 .. t0 + NT - 1 (rows >= T: inputs 0, outputs unused)
+    auto conv = [&](int c, float (&o)[NT]) {
+        const float4 w = __ldg(reinterpret_cast<const float4 *>(convw + c * 4));
+        float r[NT + 3];
+#pragma unroll
+        for (int k = 0; k < NT + 3; k++) r[k] = k - 3 < nt ? raw(t0 - 3 + k, c) : 0.f;
+#pragma unroll
+        for (int u = 0; u < NT; u++) o[u] = silu(w.x * r[u] + w.y * r[u + 1] + w.z * r[u + 2] + w.w * r[u + 3]);
+    };
+    for (int hh = warp; hh < 2 * NKH; hh += 8) { // q heads then k heads
+        float v[4][NT];
+#pragma unroll
+        for (int i = 0; i < 4; i++) conv(hh * 128 + lane + 32 * i, v[i]);
+#pragma unroll
+        for (int u = 0; u < NT; u++) {
+            if (u >= nt) break;
+            float ss = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; i++) ss += v[i][u] * v[i][u];
+            float sc = rsqrtf(fmaxf(wsum(ss), EPS * EPS));
+            if (hh < NKH) sc *= 0.08838834764831845f; // 1/sqrt(128)
+            __half * out = cP.dq + (size_t) (t0 + u) * QKV;
+#pragma unroll
+            for (int i = 0; i < 4; i++) out[hh * 128 + lane + 32 * i] = __float2half_rn(v[i][u] * sc);
+        }
+    }
+    for (int c = 2 * NKH * 128 + threadIdx.x; c < QKV; c += 256) {
+        float o[NT];
+        conv(c, o);
+#pragma unroll
+        for (int u = 0; u < NT; u++)
+            if (u < nt) cP.dq[(size_t) (t0 + u) * QKV + c] = __float2half_rn(o[u]);
+    }
+    if (threadIdx.x < NVH) {
+        const int h = threadIdx.x;
+        for (int u = 0; u < nt; u++) {
+            const int t = t0 + u;
+            float al = 0.f, be = 0.f;
+#pragma unroll
+            for (int c = 0; c < AB_SPLITS; c++) {
+                al += __ldg(cP.ab + ((size_t) c * cP.cap + t) * 96 + h);
+                be += __ldg(cP.ab + ((size_t) c * cP.cap + t) * 96 + NVH + h);
+            }
+            float sp = al + __ldg(dt + h);
+            sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
+            cP.gb[(size_t) t * 96 + h] = sp * __ldg(A + h); // log g: finite even when g underflows
+            cP.gb[(size_t) t * 96 + NVH + h] = 1.0f / (1.0f + expf(-be));
+        }
+    }
+}
+
 // raw qkv rows of the chunk's last positions -> conv ring (after pk_dn_prep consumed the old ones)
 __global__ void pk_conv_ring(int T, int n0, int dl) {
     float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
@@ -273,15 +363,15 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
     __shared__ float sa[DC], sb[DC], sg[DC], sd[DC];
     const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int col0 = blockIdx.y * 64 + 8 * w; // this warp's 8 value columns
-    const float * Si = st_in + (size_t) h * 128 * 128; // [col][row]
+    const float * Si = st_in + (size_t) h * 128 * 128; // element (col, row) at dn_sidx(col, row) (MK_K7)
     float S[8][4];                                    // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
-        const float * p = Si + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
-        S[mt][0] = __ldcg(p);
-        S[mt][1] = __ldcg(p + 128);
-        S[mt][2] = __ldcg(p + 8);
-        S[mt][3] = __ldcg(p + 136);
+        const int c = col0 + 2 * t4, rw = 16 * mt + g;
+        S[mt][0] = __ldcg(Si + dn_sidx(c, rw));
+        S[mt][1] = __ldcg(Si + dn_sidx(c + 1, rw));
+        S[mt][2] = __ldcg(Si + dn_sidx(c, rw + 8));
+        S[mt][3] = __ldcg(Si + dn_sidx(c + 1, rw + 8));
     }
 
     uint4 pqk[4], pv;
@@ -464,11 +554,12 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
     }
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
-        float * p = st_out + (size_t) h * 128 * 128 + (size_t) (col0 + 2 * t4) * 128 + 16 * mt + g;
-        p[0] = S[mt][0];
-        p[128] = S[mt][1];
-        p[8] = S[mt][2];
-        p[136] = S[mt][3];
+        float * p = st_out + (size_t) h * 128 * 128;
+        const int c = col0 + 2 * t4, rw = 16 * mt + g;
+        p[dn_sidx(c, rw)] = S[mt][0];
+        p[dn_sidx(c + 1, rw)] = S[mt][1];
+        p[dn_sidx(c, rw + 8)] = S[mt][2];
+        p[dn_sidx(c + 1, rw + 8)] = S[mt][3];
     }
 }
 
