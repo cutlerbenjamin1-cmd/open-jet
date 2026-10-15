@@ -1020,6 +1020,35 @@ __device__ __noinline__ void attn_kv_part(const Mat m, int w, int lt, int part, 
     if (lane == 0) *cnt = 0;
 }
 
+// stock2 K6 (MK_K6 bit 4, EXACT): rows 16 lt + 8 rh .. + 7 of Q8_0 k / v tile lt (w = 1 k, 2 v), the whole K. The thread
+// loads only its row g + 8 rh (half the tile's bytes per warp) and feeds it as both MMA rows (g and g + 8): an MMA row's
+// int32 sums and its scale use only that row's data, so the C values of the first row (c < 2) are bit-identical to the
+// whole tile's values of that row; the duplicates (c >= 2) are dropped. Same store as wv_store.
+template <int T>
+__device__ __noinline__ void attn_kv_rh(const Mat m, int w, int lt, int rh, const WvXS xs) {
+    using C = WvCfg<T, false>;
+    static_assert(C::NG == 1, "K6 row halves: one token group");
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    WvAcc<1> acc;
+#pragma unroll
+    for (int c = 0; c < 4; c++) acc.v[0][c] = 0.f;
+    const int8_t * xra = xs.xa + g * xs.ld + 8 * tq;
+    const int8_t * xrb = xs.xb + g * xs.ld + 8 * tq;
+#pragma unroll 1
+    for (int sb = 0; sb < D / 256; sb++) {
+        typename WV<T_Q8_0>::Raw r0;
+        WV<T_Q8_0>::load(r0, m, lt, g + 8 * rh, sb, tq);
+        wv_sb<T_Q8_0, T, false>(r0, r0, sb, xs, xra, xrb, true, acc.v);
+    }
+    const float * s_rs = misc(nullptr);
+    float * const dst = w == 1 ? cB.kbuf : cB.vbuf;
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const int t = 2 * tq + c;
+        if (t < T) dst[t * KVD + 16 * lt + g + 8 * rh] = acc.v[0][c] * s_rs[t];
+    }
+}
+
 // attention q / k / v projections (wv tiles of the wv-layout matrices, dp4a pairs of the hybrid's)
 template <int T>
 __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
@@ -1044,8 +1073,9 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
     // stock2 K6: items = the q tiles, then the k tiles, then the v tiles; with bit 1 a Q8_0 k / v tile (87 KB vs 56 KB for a
     // Q5_K q tile: the phase's tail in the 10 Q8_0-v layers) is MK_K6_S items (K parts, attn_kv_part). Dealing: contiguous
     // runs per block (upstream), or with bit 2 item i -> block i % G (the heavy k / v items spread over the blocks)
-    const int k6 = cB.k6;
-    const int sk = (k6 & 1) && W.k.type == T_Q8_0 ? MK_K6_S : 1, sv = (k6 & 1) && W.v.type == T_Q8_0 ? MK_K6_S : 1;
+    // (bit 4, exact, takes precedence over bit 1: a Q8_0 k / v tile is 2 items of 8 rows each, attn_kv_rh)
+    const int k6 = cB.k6, ks = (k6 & 4) ? 2 : (k6 & 1) ? MK_K6_S : 1;
+    const int sk = W.k.type == T_Q8_0 ? ks : 1, sv = W.v.type == T_Q8_0 ? ks : 1;
     const int nkk = nk * sk, ni = nq + nkk + nv * sv;
     int i0, i1, istep;
     if (k6 & 2) {
@@ -1062,7 +1092,8 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n) {
         const int j = it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
         const int lt = j / ns;
         if (ns > 1) {
-            attn_kv_part<T>(w == 1 ? W.k : W.v, w, lt, j - lt * ns, ns, xs);
+            if (k6 & 4) attn_kv_rh<T>(w == 1 ? W.k : W.v, w, lt, j - lt * ns, xs);
+            else attn_kv_part<T>(w == 1 ? W.k : W.v, w, lt, j - lt * ns, ns, xs);
             continue;
         }
         const WvAcc<1> a = wv_tile_any<T, false>(w == 0 ? W.q : w == 1 ? W.k : W.v, lt, 0, D / 256, xs);

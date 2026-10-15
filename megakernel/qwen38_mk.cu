@@ -136,7 +136,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #define MK_K6_S 2
 #endif
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
-#define MK_K6_DEF 2
+#define MK_K6_DEF 4
 #endif
 // MK_K8 (stock2 K8, prefill small kernels, exact; env bits, default MK_K8_DEF): 1 pk_ab on a second stream next to
 // gemm_dn_in, 2 pk_norm_quant keeps x in registers (one read), 4 pk_dn_prep_t: MK_K8_NT tokens per block, conv taps read once
@@ -368,7 +368,8 @@ struct Bufs {
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
     // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 1 K-split the Q8_0 k / v tiles MK_K6_S ways
-    // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs
+    // (NOT bitwise), 2 deal the phase's items across the blocks (item i -> block i % G) instead of in contiguous runs, 4 split
+    // each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT; takes precedence over 1)
     int k6;
 };
 
@@ -6655,7 +6656,8 @@ struct MKEngine::Impl {
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
         fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
         // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 1 K-split of the Q8_0 k / v tiles, NOT bitwise; 2 dealing
-        // across blocks, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
+        // across blocks, exact; 4 8-row halves of the Q8_0 k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second
+        // stream, 2 pk_norm_quant reads x once,
         // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
         hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
