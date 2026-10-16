@@ -44,7 +44,7 @@ static std::string slurp(const std::string & p) {
 int main(int argc, char ** argv) {
     std::string model, mmproj, prompt, cont, ref_out, img_out;
     std::vector<std::string> images;
-    int ngl = -1, threads = 0, max_tok = -1;
+    int ngl = -1, threads = 0, max_tok = -1, tb = 512;
     bool kv_q8 = true;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -60,6 +60,7 @@ int main(int argc, char ** argv) {
         else if (a == "-ngl") ngl = atoi(next().c_str());
         else if (a == "-t") threads = atoi(next().c_str());
         else if (a == "--image-max-tokens") max_tok = atoi(next().c_str());
+        else if (a == "--text-batch") tb = atoi(next().c_str()); // (diagnostics: text decoded in batches of tb)
         else usage();
     }
     if (model.empty() || mmproj.empty() || prompt.empty() || images.empty() || ref_out.empty() || img_out.empty()) usage();
@@ -140,8 +141,8 @@ int main(int argc, char ** argv) {
         if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
             size_t m;
             const llama_token * t = mtmd_input_chunk_get_tokens_text(ch, &m);
-            for (size_t o = 0; o < m; o += nb) {
-                const int n = (int) std::min<size_t>(nb, m - o), i0 = i + (int) o;
+            for (size_t o = 0; o < m;) {
+                const int n = (int) std::min<size_t>(std::min(nb, tb), m - o), i0 = i + (int) o;
                 const int lo = std::max(i0, first), hi = std::min(i0 + n, N - 1);
                 batch.n_tokens = n;
                 for (int k = 0; k < n; k++) {
@@ -153,6 +154,7 @@ int main(int argc, char ** argv) {
                 }
                 if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "llama_decode failed\n"); return 1; }
                 if (lo < hi) ses.rows(0, lo, hi - lo, llama_get_logits(ctx));
+                o += n;
             }
             i += (int) m;
             n_past += (llama_pos) m;
