@@ -12,6 +12,11 @@ to upstream's current layout yet. Upstream is at 4d4db90 (two engines, #21 sampl
 | 5 | megakernel: prompt reuse across edits (DeltaNet checkpoint pool), faster chat turns, optional bitwise-exact reuse (MK_EXACT) | 3, 4 (for 5b exact) | 05-prompt-reuse/ |
 | 6 | megakernel: fast model load, CLI --batch and state files, native Q3_K / IQ3_S / IQ4_NL, penalties, watchdog, MEMLOG | 1, 4, 5 (state keys) | 06-load-memory/ |
 | 7 | bench: head-to-head, quality and long-context benchmark suite (megakernel/bench/suite) | - | 07-bench-suite/ + branch bench-suite |
+| 8 | megakernel: image input (Qwen-VL vision), encoded on the CPU, no extra VRAM (added 2026-10-16) | - | upstream PR [#23](https://github.com/L-Forster/open-jet/pull/23) |
+
+Row 8 is not a draft: it was written directly against upstream master 72ba4a7 (both engines, the vision library, server,
+open-jet hook, tests) and opened upstream; its description and results are on the PR. On this branch it is the
+2026-10-16 entry of ../UPDATES.md.
 
 Each code PR folder: PR.md (description, results with sources, correctness, commits, reviewer notes), README.md (section for
 upstream's current megakernel/README.md), PORT.md (where each change lands in qwen38_mk.cu / qwen38_mixed.cu, collisions,
