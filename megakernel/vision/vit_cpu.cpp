@@ -96,12 +96,15 @@ int physical_cores() {
     return cores.empty() ? (int) std::max(1u, std::thread::hardware_concurrency()) : (int) cores.size();
 }
 
+// The caller of run() works too: n - 1 workers, pinned to the CPUs after the first one in cpu_order(), which stays free
+// for the (unpinned) caller, so that the n threads never outnumber the CPUs (a spinning worker on the caller's CPU
+// would delay every parallel region's start).
 class Pool {
   public:
     Pool(int n, bool pin) {
         const std::vector<int> order = pin ? cpu_order() : std::vector<int>{};
-        for (int i = 0; i < n; i++) {
-            th_.emplace_back([this, i] { loop(); });
+        for (int i = 1; i < n; i++) {
+            th_.emplace_back([this] { loop(); });
             if (!order.empty()) {
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
@@ -119,7 +122,7 @@ class Pool {
         cv_.notify_all();
         for (auto & t : th_) t.join();
     }
-    int size() const { return (int) th_.size(); }
+    int size() const { return (int) th_.size() + 1; }
     void run(int ntask, const std::function<void(int)> & f) {
         if (ntask <= 0) return;
         {
@@ -130,9 +133,14 @@ class Pool {
             busy_.store((int) th_.size(), std::memory_order_relaxed);
             gen_.fetch_add(1, std::memory_order_release);
         }
-        cv_.notify_all();
-        std::unique_lock<std::mutex> lk(m_);
-        done_.wait(lk, [&] { return busy_.load(std::memory_order_acquire) == 0; });
+        cv_.notify_all(); // (wakes only the workers that went to sleep)
+        for (int t; (t = next_.fetch_add(1, std::memory_order_relaxed)) < ntask;) f(t);
+        // the workers' last tasks: spin, then sleep
+        for (int s = 0; s < 200000 && busy_.load(std::memory_order_acquire) != 0; s++) _mm_pause();
+        if (busy_.load(std::memory_order_acquire) != 0) {
+            std::unique_lock<std::mutex> lk(m_);
+            done_.wait(lk, [&] { return busy_.load(std::memory_order_acquire) == 0; });
+        }
     }
 
   private:
