@@ -5,6 +5,7 @@
 //
 //   vision_ref -m model.gguf --mmproj mmproj.gguf --prompt-file p.txt --image a.png [--image b.jpg ...]
 //              [--cont-file answer.txt] --ref-out ref --images-out imgs [--kv q8|f16] [-ngl n] [-t threads]
+//              [--rows-in imgs]   (the images' rows from an images file instead of libmtmd's encoder)
 //   qwen38_mk -m model.gguf --kld ref --kld-images imgs [--score-path prefill|mixed]
 //
 // p.txt: a rendered chat prompt with one <__media__> marker per --image (the image goes there, between
@@ -45,6 +46,7 @@ int main(int argc, char ** argv) {
     std::string model, mmproj, prompt, cont, ref_out, img_out;
     std::vector<std::string> images;
     int ngl = -1, threads = 0, max_tok = -1, tb = 512;
+    std::string rows_file;
     bool kv_q8 = true;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -61,10 +63,34 @@ int main(int argc, char ** argv) {
         else if (a == "-t") threads = atoi(next().c_str());
         else if (a == "--image-max-tokens") max_tok = atoi(next().c_str());
         else if (a == "--text-batch") tb = atoi(next().c_str()); // (diagnostics: text decoded in batches of tb)
+        else if (a == "--rows-in") rows_file = next(); // the images' rows from an images file (MKIMG01), not the encoder
         else usage();
     }
     if (model.empty() || mmproj.empty() || prompt.empty() || images.empty() || ref_out.empty() || img_out.empty()) usage();
 
+    std::vector<std::vector<float>> rows_in;
+    if (!rows_file.empty()) {
+        FILE * f = fopen(rows_file.c_str(), "rb");
+        char magic[8];
+        int hdr[2];
+        if (!f || fread(magic, 1, 8, f) != 8 || memcmp(magic, "MKIMG01", 8) || fread(hdr, sizeof(hdr), 1, f) != 1) {
+            fprintf(stderr, "bad --rows-in\n");
+            return 1;
+        }
+        for (int k = 0; k < hdr[1]; k++) {
+            int v[4];
+            bool ok = fread(v, sizeof(v), 1, f) == 1;
+            if (ok) {
+                rows_in.emplace_back((size_t) v[2] * v[3] * hdr[0]);
+                ok = fread(rows_in.back().data(), sizeof(float), rows_in.back().size(), f) == rows_in.back().size();
+            }
+            if (!ok) {
+                fprintf(stderr, "truncated --rows-in\n");
+                return 1;
+            }
+        }
+        fclose(f);
+    }
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
@@ -159,10 +185,16 @@ int main(int argc, char ** argv) {
             i += (int) m;
             n_past += (llama_pos) m;
         } else {
-            if (mtmd_encode_chunk(mt, ch) != 0) { fprintf(stderr, "encode failed\n"); return 1; }
-            float * e = mtmd_get_output_embd(mt);
             Img & im = imgs[k_img++];
             const size_t n = (size_t) im.nx * im.ny, ne = (size_t) llama_model_n_embd_inp(lm);
+            float * e;
+            if (!rows_in.empty()) { // given rows (e.g. an fp64 forward's) instead of libmtmd's encoder
+                if (k_img > (int) rows_in.size() || rows_in[k_img - 1].size() != n * ne) { fprintf(stderr, "--rows-in: image %d does not match\n", k_img - 1); return 1; }
+                e = rows_in[k_img - 1].data();
+            } else {
+                if (mtmd_encode_chunk(mt, ch) != 0) { fprintf(stderr, "encode failed\n"); return 1; }
+                e = mtmd_get_output_embd(mt);
+            }
             im.rows.assign(e, e + n * ne);
             llama_pos np = 0;
             if (mtmd_helper_decode_image_chunk(mt, ctx, ch, e, n_past, 0, nb, &np, nullptr, nullptr) != 0) {

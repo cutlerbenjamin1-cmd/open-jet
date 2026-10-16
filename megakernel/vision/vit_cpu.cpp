@@ -274,25 +274,14 @@ void pack_w(Pool & pool, const std::vector<float> & W, int N, int K, PW & out) {
     });
 }
 
-// A rows (lda) -> panels of 6 (rows >= M zero)
-void pack_a(Pool & pool, const float * A, int M, int K, int lda, float * ap) {
-    const int mp = (M + MR - 1) / MR;
-    pool.run(mp, [&](int ip) {
-        float * d = ap + (size_t) ip * K * MR;
-        for (int r = 0; r < MR; r++) {
-            const int row = ip * MR + r;
-            if (row < M) {
-                const float * s = A + (size_t) row * lda;
-                for (int k = 0; k < K; k++) d[(size_t) k * MR + r] = s[k];
-            } else {
-                for (int k = 0; k < K; k++) d[(size_t) k * MR + r] = 0.f;
-            }
-        }
-    });
-}
+// The packed A layout of an M x K matrix: element (r, k) at pa(r, k, K); rows past M up to a multiple of 6 are zero.
+// The producers of GEMM inputs (LayerNorm, im2col, attention, a GELU epilogue) write it directly.
+inline size_t pa(int r, int k, int K) { return ((size_t) (r / MR) * K + k) * MR + r % MR; }
 
-void gemm(Pool & pool, const float * ap, int M, const PW & W, float * C, int ldc, Epi epi) {
-    const int K = W.K, mp = (M + MR - 1) / MR, np = W.N / NR;
+// C = A W^T + bias with epilogue epi into C (row-major, ldc); with `next` (STORE / GELU only) into next instead, packed
+// as the A of a GEMM with K = W.N (rows >= M zero)
+void gemm(Pool & pool, const float * ap, int M, const PW & W, float * C, int ldc, Epi epi, float * next = nullptr) {
+    const int K = W.K, N = W.N, mp = (M + MR - 1) / MR, np = N / NR;
     const int tm = (mp + MBP - 1) / MBP, tn = (np + NBP - 1) / NBP;
     pool.run(tm * tn, [&](int t) {
         alignas(64) static thread_local float ct[MBP * MR * LDT];
@@ -305,11 +294,28 @@ void gemm(Pool & pool, const float * ap, int M, const PW & W, float * C, int ldc
                 for (int i = i0; i < i1; i++) ukr(ap + ((size_t) i * K + k0) * MR, b, kc, ct + (i - i0) * MR * LDT + (j - j0) * NR, k0 > 0);
             }
         }
-        const int r1 = std::min(M, i1 * MR), c0 = j0 * NR, nc = (j1 - j0) * NR;
+        const int c0 = j0 * NR, nc = (j1 - j0) * NR;
+        const float * bias = W.b.data() + c0;
+        if (next) {
+            for (int i = i0; i < i1; i++)
+                for (int c = 0; c < nc; c += 8) {
+                    alignas(32) float v[MR][8];
+                    for (int rr = 0; rr < MR; rr++) {
+                        __m256 x = _mm256_add_ps(_mm256_load_ps(ct + ((i - i0) * MR + rr) * LDT + c), _mm256_loadu_ps(bias + c));
+                        if (epi == GELU) x = gelu8(x);
+                        if (i * MR + rr >= M) x = _mm256_setzero_ps();
+                        _mm256_store_ps(v[rr], x);
+                    }
+                    float * d = next + ((size_t) i * N + c0 + c) * MR;
+                    for (int cc = 0; cc < 8; cc++)
+                        for (int rr = 0; rr < MR; rr++) d[cc * MR + rr] = v[rr][cc];
+                }
+            return;
+        }
+        const int r1 = std::min(M, i1 * MR);
         for (int r = i0 * MR; r < r1; r++) {
             const float * s = ct + (r - i0 * MR) * LDT;
             float * d = C + (size_t) r * ldc + c0;
-            const float * bias = W.b.data() + c0;
             for (int c = 0; c < nc; c += 8) {
                 const __m256 v = _mm256_add_ps(_mm256_load_ps(s + c), _mm256_loadu_ps(bias + c));
                 if (epi == STORE) _mm256_storeu_ps(d + c, v);
@@ -320,43 +326,49 @@ void gemm(Pool & pool, const float * ap, int M, const PW & W, float * C, int ldc
     });
 }
 
-// LayerNorm of rows of x (ld = D) into y (ld = D), weight w, bias b
-void layer_norm(Pool & pool, const float * x, float * y, int M, int D, const float * w, const float * b, float eps) {
-    const int rows_per = 8;
-    pool.run((M + rows_per - 1) / rows_per, [&](int t) {
-        for (int r = t * rows_per; r < std::min(M, (t + 1) * rows_per); r++) {
-            const float * xr = x + (size_t) r * D;
-            float * yr = y + (size_t) r * D;
-            __m256 s = _mm256_setzero_ps();
-            for (int e = 0; e < D; e += 8) s = _mm256_add_ps(s, _mm256_loadu_ps(xr + e));
-            const float mean = hsum(s) / D;
-            const __m256 vm = _mm256_set1_ps(mean);
-            __m256 q = _mm256_setzero_ps();
-            for (int e = 0; e < D; e += 8) {
-                const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(xr + e), vm);
-                q = _mm256_fmadd_ps(d, d, q);
+// LayerNorm of the M rows of x (ld D) written packed (pa) as the A of a GEMM: G consecutive rows form one row of
+// K = G * D (G = 1: the blocks; G = 4: the merger's 2x2 groups); output rows past M / G zero
+void layer_norm_packed(Pool & pool, const float * x, float * ap, int M, int D, int G, const float * w, const float * b, float eps) {
+    const int Mo = M / G, K = G * D, panels = (Mo + MR - 1) / MR;
+    pool.run(panels, [&](int p) {
+        for (int ro = p * MR; ro < (p + 1) * MR; ro++) {
+            float * d0 = ap + ((size_t) p * K) * MR + ro % MR;
+            if (ro >= Mo) {
+                for (int k = 0; k < K; k++) d0[(size_t) k * MR] = 0.f;
+                continue;
             }
-            const __m256 rs = _mm256_set1_ps(1.0f / std::sqrt(hsum(q) / D + eps));
-            for (int e = 0; e < D; e += 8) {
-                const __m256 d = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(xr + e), vm), rs);
-                _mm256_storeu_ps(yr + e, _mm256_fmadd_ps(d, _mm256_loadu_ps(w + e), _mm256_loadu_ps(b + e)));
+            for (int g = 0; g < G; g++) {
+                const float * xr = x + (size_t) (ro * G + g) * D;
+                __m256 s = _mm256_setzero_ps();
+                for (int e = 0; e < D; e += 8) s = _mm256_add_ps(s, _mm256_loadu_ps(xr + e));
+                const __m256 vm = _mm256_set1_ps(hsum(s) / D);
+                __m256 q = _mm256_setzero_ps();
+                for (int e = 0; e < D; e += 8) {
+                    const __m256 dd = _mm256_sub_ps(_mm256_loadu_ps(xr + e), vm);
+                    q = _mm256_fmadd_ps(dd, dd, q);
+                }
+                const __m256 rs = _mm256_set1_ps(1.0f / std::sqrt(hsum(q) / D + eps));
+                float * d = d0 + (size_t) g * D * MR;
+                for (int e = 0; e < D; e += 8) {
+                    const __m256 dd = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(xr + e), vm), rs);
+                    alignas(32) float v[8];
+                    _mm256_store_ps(v, _mm256_fmadd_ps(dd, _mm256_loadu_ps(w + e), _mm256_loadu_ps(b + e)));
+                    for (int i = 0; i < 8; i++) d[(size_t) (e + i) * MR] = v[i];
+                }
             }
         }
     });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// attention, one head, 4 query rows: online softmax over key blocks of 64. q: 4 rows (ld 72, pre-scaled and
-// rotated); kp: the head's keys transposed in panels of 16, [ceil(M / 16)][72][16]; vp: its values [M][72];
-// o: 4 output rows (ld ldo); rows: valid query rows (<= 4)
 
 constexpr int HD = 72, KB = 64, QG = 8; // head size, keys per block, groups of 4 query rows per task
 
 // attention, one head, up to 4 * QG query rows (groups of 4): online softmax over key blocks of KB, each K / V block
 // (36 KB) read once for all the groups while it sits in L1 / L2. q: the rows (ld HD, pre-scaled and rotated, zero past
 // `rows` up to a multiple of 4); kp: the head's keys transposed in panels of 16, [ceil(M / 16)][HD][16]; vp: its
-// values [M][HD]; o: the output rows (ld ldo)
-void attn_rows(const float * q, int rows, const float * kp, const float * vp, int M, float * o, int ldo) {
+// values [M][HD]; out: rows r0 .. of the output-projection GEMM's packed A (pa, K), columns col0 .. col0 + HD - 1
+void attn_rows(const float * q, int rows, const float * kp, const float * vp, int M, float * out, int r0, int col0, int K) {
     const int ng = (rows + 3) / 4;
     alignas(32) float S[4][KB];
     alignas(32) float O[QG * 4][HD];
@@ -433,7 +445,8 @@ void attn_rows(const float * q, int rows, const float * kp, const float * vp, in
     }
     for (int r = 0; r < rows; r++) {
         const float inv = 1.0f / l[r];
-        for (int d = 0; d < HD; d++) o[(size_t) r * ldo + d] = O[r][d] * inv;
+        float * d = out + pa(r0 + r, col0, K);
+        for (int e = 0; e < HD; e++) d[(size_t) e * MR] = O[r][e] * inv;
     }
 }
 
@@ -454,7 +467,7 @@ struct Vit::Impl {
     PW patch_w, mm0, mm2;
     std::vector<float> pos_embd, post_w, post_b;
     // scratch
-    Buf x, h, qkv, att, ff, ap, kp, vp, rope, mrg;
+    Buf x, qkv, ap0, ap1, kp, vp, rope;
 
     explicit Impl(int n, bool pin) : pool(n, pin) {}
 };
@@ -656,12 +669,11 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
     const int D = I.D, FF = I.FF, nH = I.nH, ps = I.patch;
     if (tw % 32 || th % 32 || tw <= 0 || th <= 0) throw std::runtime_error("vit: image size must be a positive multiple of 32");
     const int pw = tw / ps, ph = th / ps, M = pw * ph, Mp = (M + 11) / 12 * 12, nk16 = (M + 15) / 16;
-    float * x = I.x.get((size_t) Mp * D);
-    float * h = I.h.get((size_t) Mp * std::max(D, 768));
+    float * x = I.x.get((size_t) Mp * D);           // residual stream
     float * qkv = I.qkv.get((size_t) Mp * 3 * D);
-    float * att = I.att.get((size_t) Mp * D);
-    float * ff = I.ff.get((size_t) Mp * FF);
-    float * ap = I.ap.get((size_t) Mp * std::max(FF, 4 * D));
+    const size_t apn = (size_t) Mp * std::max(std::max(FF, 4 * D), 768);
+    float * ap0 = I.ap0.get(apn); // packed GEMM inputs: im2col, LayerNorm outputs, attention output, merger input
+    float * ap1 = I.ap1.get(apn); // packed GEMM inputs written by a GELU epilogue (MLP hidden, merger hidden)
     float * kp = I.kp.get((size_t) nH * nk16 * 16 * HD);
     float * vp = I.vp.get((size_t) nH * Mp * HD);
     float * rope = I.rope.get((size_t) M * HD); // per patch: 36 cos, then 36 sin
@@ -700,19 +712,26 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
             }
         });
     }
-    // patch embedding (+ bias) added to it: im2col rows [c][ky][kx] of each 16 x 16 patch
-    pool.run(M, [&](int t) {
-        int px, py;
-        patch_xy(t, px, py);
-        float * r = h + (size_t) t * 768;
-        for (int c = 0; c < 3; c++)
-            for (int ky = 0; ky < ps; ky++)
-                for (int kx = 0; kx < ps; kx++) r[c * 256 + ky * 16 + kx] = img[((size_t) (py * ps + ky) * tw + (px * ps + kx)) * 3 + c];
+    // patch embedding (+ bias) added to it: im2col rows [c][ky][kx] of each 16 x 16 patch, packed
+    pool.run((M + MR - 1) / MR, [&](int p) {
+        for (int rr = 0; rr < MR; rr++) {
+            const int t = p * MR + rr;
+            float * d = ap0 + (size_t) p * 768 * MR + rr;
+            if (t >= M) {
+                for (int j = 0; j < 768; j++) d[(size_t) j * MR] = 0.f;
+                continue;
+            }
+            int px, py;
+            patch_xy(t, px, py);
+            for (int c = 0; c < 3; c++)
+                for (int ky = 0; ky < ps; ky++)
+                    for (int kx = 0; kx < ps; kx++)
+                        d[(size_t) (c * 256 + ky * 16 + kx) * MR] = img[((size_t) (py * ps + ky) * tw + (px * ps + kx)) * 3 + c];
+        }
     });
-    pack_a(pool, h, M, 768, 768, ap);
-    gemm(pool, ap, M, I.patch_w, x, D, ADD);
+    gemm(pool, ap0, M, I.patch_w, x, D, ADD);
     const double t1 = now_ms();
-    double t_att = 0, t_pack = 0, t_ln = 0, t_gemm = 0;
+    double t_att = 0, t_ln = 0, t_gemm = 0;
     auto timed = [](double & acc, auto && f) {
         const double a0 = now_ms();
         f();
@@ -721,9 +740,8 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
     const float kq_scale = 1.0f / std::sqrt((float) HD);
     for (int l = 0; l < I.nL; l++) {
         const Impl::Layer & y = I.L[l];
-        timed(t_ln, [&] { layer_norm(pool, x, h, M, D, y.ln1w.data(), y.ln1b.data(), I.eps); });
-        timed(t_pack, [&] { pack_a(pool, h, M, D, D, ap); });
-        timed(t_gemm, [&] { gemm(pool, ap, M, y.qkv, qkv, 3 * D, STORE); });
+        timed(t_ln, [&] { layer_norm_packed(pool, x, ap0, M, D, 1, y.ln1w.data(), y.ln1b.data(), I.eps); });
+        timed(t_gemm, [&] { gemm(pool, ap0, M, y.qkv, qkv, 3 * D, STORE); });
         const double ta = now_ms();
         // RoPE on q and k (q also scaled), then per head: k transposed into panels of 16 keys, v contiguous
         pool.run(nH * nk16, [&](int t) {
@@ -749,7 +767,10 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
                 memcpy(vp + ((size_t) hh * Mp + k) * HD, vr, HD * sizeof(float));
             }
         });
-        // queries in blocks of 4 * QG rows: q copied to a contiguous block (this head's rotated rows)
+        // queries in blocks of 4 * QG rows: q copied to a contiguous block (this head's rotated rows); the output goes
+        // packed into ap0 (its rows past M, if any, zeroed here)
+        for (int r = M; r < (M + MR - 1) / MR * MR; r++)
+            for (int j = 0; j < D; j++) ap0[pa(r, j, D)] = 0.f;
         const int qb = 4 * QG, nqb = (M + qb - 1) / qb;
         pool.run(nH * nqb, [&](int t) {
             const int hh = t / nqb, r0 = (t % nqb) * qb, rows = std::min(qb, M - r0);
@@ -758,26 +779,20 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
                 if (r < rows) memcpy(q + r * HD, qkv + (size_t) (r0 + r) * 3 * D + hh * HD, HD * sizeof(float));
                 else memset(q + r * HD, 0, HD * sizeof(float));
             }
-            attn_rows(q, rows, kp + (size_t) hh * nk16 * 16 * HD, vp + (size_t) hh * Mp * HD, M, att + (size_t) r0 * D + hh * HD, D);
+            attn_rows(q, rows, kp + (size_t) hh * nk16 * 16 * HD, vp + (size_t) hh * Mp * HD, M, ap0, r0, hh * HD, D);
         });
         t_att += now_ms() - ta;
-        timed(t_pack, [&] { pack_a(pool, att, M, D, D, ap); });
-        timed(t_gemm, [&] { gemm(pool, ap, M, y.out, x, D, ADD); });
-        timed(t_ln, [&] { layer_norm(pool, x, h, M, D, y.ln2w.data(), y.ln2b.data(), I.eps); });
-        timed(t_pack, [&] { pack_a(pool, h, M, D, D, ap); });
-        timed(t_gemm, [&] { gemm(pool, ap, M, y.up, ff, FF, GELU); });
-        timed(t_pack, [&] { pack_a(pool, ff, M, FF, FF, ap); });
-        timed(t_gemm, [&] { gemm(pool, ap, M, y.down, x, D, ADD); });
+        timed(t_gemm, [&] { gemm(pool, ap0, M, y.out, x, D, ADD); });
+        timed(t_ln, [&] { layer_norm_packed(pool, x, ap0, M, D, 1, y.ln2w.data(), y.ln2b.data(), I.eps); });
+        timed(t_gemm, [&] { gemm(pool, ap0, M, y.up, nullptr, 0, GELU, ap1); });
+        timed(t_gemm, [&] { gemm(pool, ap1, M, y.down, x, D, ADD); });
     }
     const double t2 = now_ms();
     // post-LN, then the merger on each 2x2 group (4 consecutive rows = one 4D row): fc1, GELU, fc2
-    layer_norm(pool, x, h, M, D, I.post_w.data(), I.post_b.data(), I.eps);
     const int G = M / 4;
-    float * mrg = I.mrg.get((size_t) (G + 6) * 4 * D);
-    pack_a(pool, h, G, 4 * D, 4 * D, ap);
-    gemm(pool, ap, G, I.mm0, mrg, 4 * D, GELU);
-    pack_a(pool, mrg, G, 4 * D, 4 * D, ap);
-    gemm(pool, ap, G, I.mm2, out, I.n_embd, STORE);
+    layer_norm_packed(pool, x, ap0, M, D, 4, I.post_w.data(), I.post_b.data(), I.eps);
+    gemm(pool, ap0, G, I.mm0, nullptr, 0, GELU, ap1);
+    gemm(pool, ap1, G, I.mm2, out, I.n_embd, STORE);
     const double t3 = now_ms();
     ms[0] = t1 - t0;
     ms[1] = t2 - t1 - t_att;
@@ -787,8 +802,8 @@ void Vit::encode(const float * img, int tw, int th, float * out) {
     if (getenv("VIT_PROF")) {
         const double gf = 2.0 * M * ((double) D * 3 * D + (double) D * D + 2.0 * D * FF) * I.nL / 1e9;
         const double af = 4.0 * M * (double) M * HD * nH * I.nL / 1e9;
-        fprintf(stderr, "[vit] %d patches: blocks gemm %.0f ms (%.0f GFLOP/s), pack %.0f, ln %.0f, attention %.0f ms (%.0f GFLOP/s), "
-                        "patch %.0f, merger %.0f, total %.0f ms" "\n", M, t_gemm, gf / t_gemm * 1e3, t_pack, t_ln, t_att,
+        fprintf(stderr, "[vit] %d patches: blocks gemm %.0f ms (%.0f GFLOP/s), ln %.0f, attention %.0f ms (%.0f GFLOP/s), "
+                        "patch %.0f, merger %.0f, total %.0f ms\n", M, t_gemm, gf / t_gemm * 1e3, t_ln, t_att,
                 af / t_att * 1e3, ms[0], ms[3], ms[4]);
     }
 }
