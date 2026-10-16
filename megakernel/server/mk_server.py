@@ -24,10 +24,12 @@ import json
 import os
 import random
 import re
+import struct
 import sys
 import threading
 import time
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jinja2
@@ -274,6 +276,21 @@ class Vision:
             old.free()
         return im
 
+    def warm_up(self):
+        """one encode of a 64 x 64 grey PNG (not cached): the first encode after the engine's load pays ~0.5 s once
+        (every weight streamed in again, the workers' scratch), here at startup instead of in the first image request"""
+        w = h = 64
+        raw = b"".join(bytes([0]) + bytes([128, 128, 128]) * w for _ in range(h))
+
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        png = (bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        hd = self.L.mkv_image_load(self.ctx, png, len(png))
+        if not hd or self.L.mkv_image_encode(self.ctx, hd) != 0:
+            raise RuntimeError(f"vision warm-up: {self.L.mkv_last_error().decode()}")
+        self.L.mkv_image_free(hd)
+
 
 def image_bytes(url):
     """the file bytes of an OpenAI image_url (a data: URL, as llama-server takes them by default)"""
@@ -454,6 +471,9 @@ class OutputParser:
 
 
 class Server:
+    vision = None   # Vision (--mmproj), else text only
+    img_spans = ()  # the images of the engine's sequence: (pos, n, key); replaced, never mutated
+
     def __init__(self, args):
         self.args = args
         t0 = time.time()
@@ -462,8 +482,6 @@ class Server:
         self.template = make_template(self.eng.chat_template())
         im = self.eng.tokenize("<|im_start|>")
         self.im_start = im[0] if len(im) == 1 else None  # checkpoint at the start of the generation prompt
-        self.vision = None
-        self.img_spans = []  # the images of the engine's sequence: (pos, n, key)
         if args.mmproj:
             if not self.eng.images:
                 raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
@@ -497,6 +515,8 @@ class Server:
         self.eng.prefill(toks)
         self.eng.step()
         self.eng.reset()
+        if self.vision:
+            self.vision.warm_up()
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -577,8 +597,11 @@ class Server:
         for p, _, _ in set(spans) ^ set(self.img_spans):
             lcp = min(lcp, p)
 
-        def fed(start):  # the images a prefill from `start` overlaps, encoded now (each once: Vision's cache)
-            return [(p, im.nx, im.ny, im.rows()) for p, im in images if p + im.n > start]
+        def feed(start):  # prefill toks[start:] with the images it overlaps (encoded now, each once: Vision's cache)
+            imgs = [(p, im.nx, im.ny, im.rows()) for p, im in images if p + im.n > start]
+            if imgs:
+                return eng.prefill(toks[start:], gen, self.ck_positions(toks, start), imgs), start
+            return eng.prefill(toks[start:], gen, self.ck_positions(toks, start)), start
 
         self.img_spans = []  # (until the prefill succeeds)
         # exact reuse (an MK_EXACT engine, --exact-reuse): never append to the sequence. Its last prompt row and the
@@ -587,15 +610,15 @@ class Server:
         # absolute 32-token scan grid) and prefilling from there computes what a prefill from 0 computes, bit for bit.
         if seq and lcp >= eng.committed() and not eng.exact:
             eng.truncate(lcp)
-            r = eng.prefill(toks[lcp:], gen, self.ck_positions(toks, lcp), fed(lcp)), lcp
+            r = feed(lcp)
         else:
             # the last checkpoint at or before the divergence (one inside a kept image: the image is fed again)
             ck = max((p for p in eng.checkpoints() if 0 < p <= lcp), default=0)
             if ck and eng.rewind_to(ck):
-                r = eng.prefill(toks[ck:], gen, self.ck_positions(toks, ck), fed(ck)), ck
+                r = feed(ck)
             else:
                 eng.reset()
-                r = eng.prefill(toks, gen, self.ck_positions(toks, 0), fed(0)), 0
+                r = feed(0)
         self.img_spans = spans
         return r
 
