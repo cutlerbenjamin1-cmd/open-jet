@@ -1,9 +1,14 @@
-// CPU vision encoder over libmtmd (see mk_vision.h).
+// CPU vision encoder (see mk_vision.h). Two backends:
+// - cpu (vit_cpu.cpp, x86-64 with AVX2 + FMA): llama.cpp's preprocessing bit for bit, then the tower in fp32 with
+//   hand-written kernels; faster than libmtmd's and ~1000x closer to an fp64 forward of the checkpoint
+// - mtmd: libmtmd's own encoder (any CPU llama.cpp builds for)
 #include "mk_vision.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -13,6 +18,16 @@
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
+
+#ifndef MKV_NO_VIT
+#include "vit_cpu.h"
+#endif
+
+// image decoding: the stb_image that llama.cpp vendors and libmtmd decodes with (mtmd_helper_bitmap_init_from_buf:
+// stbi_load_from_memory, 3 channels), compiled here as private static functions
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
 
 namespace {
 thread_local std::string g_err;
@@ -25,18 +40,33 @@ void log_filtered(ggml_log_level level, const char * text, void *) {
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+bool cpu_has_avx2_fma() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
 } // namespace
 
 struct mkv_ctx {
-    llama_model * vocab = nullptr; // the text model, vocabulary only (mtmd reads its special tokens and RoPE type)
-    mtmd_context * mt = nullptr;
+    int backend = 0; // MKV_BACKEND_CPU or MKV_BACKEND_MTMD
     int n_embd = 0;
     int n_threads = 0;
+    // mtmd
+    llama_model * vocab = nullptr; // the text model, vocabulary only (mtmd reads its special tokens and RoPE type)
+    mtmd_context * mt = nullptr;
+#ifndef MKV_NO_VIT
+    std::unique_ptr<mkv::Vit> vit;
+#endif
 };
 
 struct mkv_image {
-    mtmd_input_chunk * chunk = nullptr; // the image chunk of mtmd_tokenize (owned copy)
     int nx = 0, ny = 0, n = 0;
+    mtmd_input_chunk * chunk = nullptr; // mtmd: the image chunk of mtmd_tokenize (owned copy)
+    std::vector<float> pix;             // cpu: the preprocessed image (HWC)
+    int tw = 0, th = 0;
     std::vector<float> rows;
     double encode_ms = 0;
 };
@@ -50,6 +80,7 @@ struct mkv_params mkv_params_default(void) {
     p.max_tokens = 0;
     p.flash_attn = -1;
     p.verbose = 0;
+    p.backend = MKV_BACKEND_AUTO;
     return p;
 }
 
@@ -60,6 +91,34 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
     auto * c = new mkv_ctx;
     try {
         g_verbose = params.verbose != 0;
+        const int threads = params.n_threads > 0 ? params.n_threads : (int) std::max(1u, std::thread::hardware_concurrency());
+        std::string why_not_cpu;
+#ifndef MKV_NO_VIT
+        if (params.backend != MKV_BACKEND_MTMD) {
+            if (!cpu_has_avx2_fma()) {
+                why_not_cpu = "the CPU has no AVX2 + FMA";
+            } else {
+                try {
+                    mkv::Vit::Params vp;
+                    vp.n_threads = threads; // (one per logical CPU: SMT siblings hide the kernels' latencies)
+                    vp.min_tokens = params.min_tokens;
+                    vp.max_tokens = params.max_tokens;
+                    c->vit.reset(new mkv::Vit(mmproj, vp));
+                    c->backend = MKV_BACKEND_CPU;
+                    c->n_embd = c->vit->n_embd();
+                    c->n_threads = c->vit->n_threads();
+                    return c;
+                } catch (const std::exception & e) {
+                    why_not_cpu = e.what();
+                }
+            }
+            if (params.backend == MKV_BACKEND_CPU) throw std::runtime_error("cpu backend: " + why_not_cpu);
+            fprintf(stderr, "mk_vision: cpu backend unavailable (%s), using libmtmd\n", why_not_cpu.c_str());
+        }
+#else
+        if (params.backend == MKV_BACKEND_CPU) throw std::runtime_error("built without the cpu backend (MKV_NO_VIT)");
+#endif
+        c->backend = MKV_BACKEND_MTMD;
         mtmd_helper_log_set(log_filtered, nullptr);
         llama_log_set(log_filtered, nullptr);
         llama_backend_init();
@@ -71,8 +130,8 @@ mkv_ctx * mkv_new(const char * mmproj, const char * text_model, struct mkv_param
         mtmd_context_params cp = mtmd_context_params_default();
         cp.use_gpu = false;
         cp.print_timings = params.verbose != 0;
-        c->n_threads = params.n_threads > 0 ? params.n_threads : (int) std::max(1u, std::thread::hardware_concurrency());
-        cp.n_threads = c->n_threads;
+        c->n_threads = threads;
+        cp.n_threads = threads;
         cp.flash_attn_type = params.flash_attn < 0 ? LLAMA_FLASH_ATTN_TYPE_AUTO
                              : params.flash_attn  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
                                                   : LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -109,9 +168,34 @@ void mkv_free(mkv_ctx * c) {
 
 int mkv_n_embd(const mkv_ctx * c) { return c->n_embd; }
 int mkv_n_threads(const mkv_ctx * c) { return c->n_threads; }
+int mkv_backend(const mkv_ctx * c) { return c->backend; }
 
 mkv_image * mkv_image_load(mkv_ctx * c, const unsigned char * data, size_t len) {
     g_err.clear();
+#ifndef MKV_NO_VIT
+    if (c->backend == MKV_BACKEND_CPU) {
+        int nx, ny, nc;
+        unsigned char * rgb = stbi_load_from_memory(data, (int) len, &nx, &ny, &nc, 3);
+        if (!rgb) {
+            g_err = "cannot decode the image";
+            return nullptr;
+        }
+        auto * im = new mkv_image;
+        try {
+            c->vit->preprocess(rgb, nx, ny, im->pix, im->tw, im->th);
+        } catch (const std::exception & e) {
+            g_err = e.what();
+            stbi_image_free(rgb);
+            delete im;
+            return nullptr;
+        }
+        stbi_image_free(rgb);
+        im->nx = im->tw / 32;
+        im->ny = im->th / 32;
+        im->n = im->nx * im->ny;
+        return im;
+    }
+#endif
     mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_buf(c->mt, data, len, false);
     if (!bw.bitmap) {
         g_err = "cannot decode the image";
@@ -161,6 +245,21 @@ int mkv_image_encode(mkv_ctx * c, mkv_image * im) {
     g_err.clear();
     if (!im->rows.empty()) return 0;
     const double t0 = now_ms();
+#ifndef MKV_NO_VIT
+    if (c->backend == MKV_BACKEND_CPU) {
+        try {
+            im->rows.resize((size_t) im->n * c->n_embd);
+            c->vit->encode(im->pix.data(), im->tw, im->th, im->rows.data());
+        } catch (const std::exception & e) {
+            im->rows.clear();
+            g_err = e.what();
+            return -1;
+        }
+        std::vector<float>().swap(im->pix); // (not needed again)
+        im->encode_ms = now_ms() - t0;
+        return 0;
+    }
+#endif
     if (mtmd_encode_chunk(c->mt, im->chunk) != 0) {
         g_err = "image encode failed";
         return -1;

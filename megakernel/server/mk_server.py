@@ -231,27 +231,31 @@ class Vision:
 
     class Params(ctypes.Structure):
         _fields_ = [("n_threads", ctypes.c_int), ("min_tokens", ctypes.c_int), ("max_tokens", ctypes.c_int),
-                    ("flash_attn", ctypes.c_int), ("verbose", ctypes.c_int)]
+                    ("flash_attn", ctypes.c_int), ("verbose", ctypes.c_int), ("backend", ctypes.c_int)]
 
-    def __init__(self, lib, mmproj, model, threads=0, min_tokens=0, max_tokens=0, cache=8):
+    BACKENDS = {"auto": 0, "mtmd": 1, "cpu": 2}
+
+    def __init__(self, lib, mmproj, model, threads=0, min_tokens=0, max_tokens=0, cache=8, backend="auto"):
         L = self.L = ctypes.CDLL(lib)
         vp, cp = ctypes.c_void_p, ctypes.c_char_p
         for name, res, args in (
                 ("mkv_params_default", Vision.Params, []), ("mkv_new", vp, [cp, cp, Vision.Params]),
                 ("mkv_free", None, [vp]), ("mkv_last_error", cp, []), ("mkv_n_embd", ctypes.c_int, [vp]),
-                ("mkv_n_threads", ctypes.c_int, [vp]), ("mkv_image_load", vp, [vp, cp, ctypes.c_size_t]),
+                ("mkv_n_threads", ctypes.c_int, [vp]), ("mkv_backend", ctypes.c_int, [vp]),
+                ("mkv_image_load", vp, [vp, cp, ctypes.c_size_t]),
                 ("mkv_image_grid", ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]),
                 ("mkv_image_encode", ctypes.c_int, [vp, vp]), ("mkv_image_rows", vp, [vp]),
                 ("mkv_image_encode_ms", ctypes.c_double, [vp]), ("mkv_image_free", None, [vp])):
             f = getattr(L, name)
             f.restype, f.argtypes = res, args
         p = L.mkv_params_default()
-        p.n_threads, p.min_tokens, p.max_tokens = threads, min_tokens, max_tokens
+        p.n_threads, p.min_tokens, p.max_tokens, p.backend = threads, min_tokens, max_tokens, Vision.BACKENDS[backend]
         self.ctx = L.mkv_new(mmproj.encode(), model.encode(), p)
         if not self.ctx:
             raise RuntimeError(f"vision: {L.mkv_last_error().decode()}")
         self.n_embd = L.mkv_n_embd(self.ctx)
         self.n_threads = L.mkv_n_threads(self.ctx)
+        self.backend = {1: "libmtmd", 2: "vit_cpu"}.get(L.mkv_backend(self.ctx), "?")
         self.cache = {}  # key -> Image, least recently used first
         self.cache_max = max(1, cache)
 
@@ -464,7 +468,7 @@ class Server:
             if not self.eng.images:
                 raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
             self.vision = Vision(args.vision_lib, args.mmproj, args.model, args.vision_threads, args.image_min_tokens,
-                                 args.image_max_tokens, args.image_cache)
+                                 args.image_max_tokens, args.image_cache, args.vision_backend)
             if self.vision.n_embd != self.eng.L.mk_n_embd():
                 raise RuntimeError(f"mmproj rows of {self.vision.n_embd} for a model of {self.eng.L.mk_n_embd()}")
             ids = [self.eng.tokenize(t) for t in ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")]
@@ -475,7 +479,8 @@ class Server:
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
         self.warned = set()
-        vis = f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.n_threads} threads)" if self.vision else ""
+        vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
+               if self.vision else "")
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
 
     def warm_up(self):
@@ -812,6 +817,8 @@ def main():
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), "libqwen38vision.so"))
     ap.add_argument("--vision-threads", type=int, default=0, help="CPU threads of the image encoder (0: all)")
+    ap.add_argument("--vision-backend", choices=["auto", "cpu", "mtmd"], default="auto",
+                    help="image encoder: cpu (AVX2 / FMA fp32 kernels), mtmd (llama.cpp's), auto (cpu if the CPU has AVX2 + FMA)")
     ap.add_argument("--image-min-tokens", type=int, default=0, help="minimum tokens per image (0: the mmproj's default)")
     ap.add_argument("--image-max-tokens", type=int, default=0,
                     help="maximum tokens per image (0: the mmproj's default, 4096 for Qwen3.x; fewer encode faster)")

@@ -1,6 +1,6 @@
 // mk_vision command line: encode images on the CPU, report the grid and time, optionally save the rows.
 //   mkv_cli -m model.gguf --mmproj mmproj.gguf [-t threads] [--min-tokens N] [--max-tokens N] [--fa -1|0|1] [-r reps]
-//           [-o out_prefix] image...
+//           [--backend auto|cpu|mtmd] [-o out_prefix] image...
 // -o: rows of image i -> <out_prefix>.<i>.f32 ([nx * ny][n_embd] little-endian fp32, raster order)
 #include <cmath>
 #include <cstdio>
@@ -46,10 +46,15 @@ int main(int argc, char ** argv) {
         else if (a == "-r") reps = atoi(next());
         else if (a == "-o") out = next();
         else if (a == "-v") p.verbose = 1;
+        else if (a == "--backend") {
+            const std::string b = next();
+            p.backend = b == "cpu" ? MKV_BACKEND_CPU : b == "mtmd" ? MKV_BACKEND_MTMD : MKV_BACKEND_AUTO;
+        }
         else imgs.push_back(argv[i]);
     }
     if (!model || !mmproj || imgs.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf --mmproj mmproj.gguf [-t N] [--min-tokens N] [--max-tokens N] [--fa -1|0|1] [-r reps] [-o prefix] image...\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf --mmproj mmproj.gguf [-t N] [--min-tokens N] [--max-tokens N] [--fa -1|0|1] "
+                        "[--backend auto|cpu|mtmd] [-r reps] [-o prefix] image...\n", argv[0]);
         return 1;
     }
     mkv_ctx * c = mkv_new(mmproj, model, p);
@@ -58,7 +63,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const int ne = mkv_n_embd(c);
-    printf("mmproj %s: %d threads, rows of %d\n", mmproj, mkv_n_threads(c), ne);
+    printf("mmproj %s: %s backend, %d threads, rows of %d\n", mmproj, mkv_backend(c) == MKV_BACKEND_CPU ? "cpu" : "mtmd",
+           mkv_n_threads(c), ne);
     for (size_t k = 0; k < imgs.size(); k++) {
         const std::vector<unsigned char> b = read_file(imgs[k]);
         if (b.empty()) {

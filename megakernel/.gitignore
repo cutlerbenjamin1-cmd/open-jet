@@ -3,6 +3,8 @@
 qwen38_mk
 libqwen38mk.so
 libqwen38vision.so
+vision/*.o
+tools/vit_check
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref
