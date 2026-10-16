@@ -142,6 +142,20 @@ int mk_prefill_cks(void * hp, const int * toks, int n, const int * cks, int ncks
     });
 }
 
+// mk_prefill_cks with nimg images: image i covers the absolute positions pos[i] .. pos[i] + nx[i] * ny[i] - 1 with the
+// rows embd[i] ([nx[i] * ny[i]][mk_n_embd()] fp32); MKEngine::prefill(tokens, cks, ck_exact, images)
+int mk_prefill_img(void * hp, const int * toks, int n, const int * cks, int ncks, int ck_exact, const int * pos,
+                   const int * nx, const int * ny, const float * const * embd, int nimg) {
+    return guarded(hp, [&](MKEngine * e) {
+        std::vector<MKImage> im;
+        for (int i = 0; i < nimg; i++) im.push_back({pos[i], nx[i], ny[i], embd[i]});
+        return e->prefill(std::vector<int>(toks, toks + n), std::vector<int>(cks, cks + std::max(ncks, 0)), ck_exact, im);
+    });
+}
+
+// width of an image row (the model's embedding size)
+int mk_n_embd() { return MKEngine::n_embd(); }
+
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {
     return guarded(hp, [&](MKEngine * e) {

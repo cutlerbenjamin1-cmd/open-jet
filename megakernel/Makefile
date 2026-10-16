@@ -5,7 +5,23 @@ ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC
 
-all: qwen38_mk libqwen38mk.so tools/vocab_freq tools/llama_ref
+all: qwen38_mk libqwen38mk.so tools/vocab_freq tools/llama_ref $(if $(wildcard $(LLAMA)/build/bin/libmtmd.so),vision)
+
+# CPU vision encoder (no CUDA, no GPU memory): libmtmd of the pinned llama.cpp, for server/mk_server.py --mmproj.
+# Built when llama.cpp's build has libmtmd (LLAMA_BUILD_TOOLS, its default); `make vision` builds it explicitly.
+vision: libqwen38vision.so tools/mkv_cli tools/vision_ref
+VISION_INC = -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/tools/mtmd
+VISION_LIBS = -L$(LLAMA)/build/bin -lmtmd -lllama -lggml -lggml-base -Wl,-rpath,$(abspath $(LLAMA)/build/bin)
+
+libqwen38vision.so: vision/mk_vision.cpp vision/mk_vision.h
+	g++ -O2 -std=c++17 -shared -fPIC $(VISION_INC) $< $(VISION_LIBS) -o $@
+
+tools/mkv_cli: vision/mkv_cli.cpp vision/mk_vision.h libqwen38vision.so
+	g++ -O2 -std=c++17 -Ivision $< -L. -lqwen38vision -Wl,-rpath,'$$ORIGIN/..' $(VISION_LIBS) -o $@
+
+# llama.cpp's next-token distributions for an image prompt + the image rows it fed (qwen38_mk --kld ... --kld-images)
+tools/vision_ref: tools/vision_ref.cpp logit_stats.h
+	g++ -O2 -std=c++17 -pthread $(VISION_INC) $< $(VISION_LIBS) -o $@
 
 # ptxas register / spill report for every phase function goes to ptxas.log
 qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh
@@ -30,4 +46,6 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
 
 clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref
+
+.PHONY: all vision clean
